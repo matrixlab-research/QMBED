@@ -8,8 +8,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use qmbed::basis::{
     Basis, BasisProjector, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap,
-    PackedBasis, ReductionImage, SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D,
-    SpinlessFermionBasis1D, SymmetryReducer, SymmetrySector,
+    LocalOccupationConstraint, PackedBasis, ReductionImage, SpinBasis1D, SpinNormalization,
+    SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetryReducer, SymmetrySector,
 };
 use qmbed::interop::{OperatorAction, PackedEdModel};
 use qmbed::operator::{
@@ -181,6 +181,7 @@ enum BasisRequest {
         #[serde(default = "default_spin_twice")]
         spin_twice: u16,
         up: Option<usize>,
+        up_sectors: Option<Vec<usize>>,
         momentum: Option<i32>,
         parity: Option<i8>,
         #[serde(default)]
@@ -194,6 +195,7 @@ enum BasisRequest {
     Boson {
         sites: usize,
         particles: Option<usize>,
+        particle_sectors: Option<Vec<usize>>,
         states_per_site: usize,
         #[serde(default)]
         symmetries: Vec<SymmetryRequest>,
@@ -203,6 +205,7 @@ enum BasisRequest {
     SpinlessFermion {
         sites: usize,
         particles: Option<usize>,
+        particle_sectors: Option<Vec<usize>>,
         momentum: Option<i32>,
         #[serde(default)]
         symmetries: Vec<SymmetryRequest>,
@@ -213,6 +216,8 @@ enum BasisRequest {
         sites: usize,
         particles_up: Option<usize>,
         particles_down: Option<usize>,
+        particle_sectors: Option<Vec<[usize; 2]>>,
+        allowed_local_occupancies: Option<Vec<usize>>,
         #[serde(default)]
         symmetries: Vec<SymmetryRequest>,
         #[serde(default)]
@@ -697,6 +702,7 @@ fn build_spin_basis(
         sites,
         spin_twice,
         up,
+        up_sectors,
         momentum,
         parity,
         pauli,
@@ -717,8 +723,15 @@ fn build_spin_basis(
         Some(normalization) => builder.normalization((*normalization).into()),
         None => builder.pauli(*pauli),
     };
+    if up.is_some() && up_sectors.is_some() {
+        return Err(QmbedError::InvalidOptions(
+            "spin basis accepts either up or up_sectors, not both".into(),
+        ));
+    }
     if let Some(up) = up {
         builder = builder.up(*up);
+    } else if let Some(sectors) = up_sectors {
+        builder = builder.particle_sectors(sectors.iter().copied());
     }
     if let Some(momentum) = momentum {
         builder = builder.momentum(*momentum);
@@ -754,6 +767,7 @@ fn build_boson_basis(
     let BasisRequest::Boson {
         sites,
         particles,
+        particle_sectors,
         states_per_site,
         symmetries,
         reverse,
@@ -762,8 +776,15 @@ fn build_boson_basis(
         unreachable!("build_boson_basis requires a boson request");
     };
     let mut builder = BosonBasis1D::builder(*sites, *states_per_site);
+    if particles.is_some() && particle_sectors.is_some() {
+        return Err(QmbedError::InvalidOptions(
+            "boson basis accepts either particles or particle_sectors, not both".into(),
+        ));
+    }
     if let Some(particles) = particles {
         builder = builder.particles(*particles);
+    } else if let Some(sectors) = particle_sectors {
+        builder = builder.particle_sectors(sectors.iter().copied());
     }
     let basis = builder.build()?;
     let packed = if symmetries.is_empty() {
@@ -793,6 +814,7 @@ fn build_spinless_basis(
     let BasisRequest::SpinlessFermion {
         sites,
         particles,
+        particle_sectors,
         momentum,
         symmetries,
         reverse,
@@ -806,8 +828,15 @@ fn build_spinless_basis(
         ));
     }
     let mut builder = SpinlessFermionBasis1D::builder(*sites);
+    if particles.is_some() && particle_sectors.is_some() {
+        return Err(QmbedError::InvalidOptions(
+            "spinless basis accepts either particles or particle_sectors, not both".into(),
+        ));
+    }
     if let Some(particles) = particles {
         builder = builder.particles(*particles);
+    } else if let Some(sectors) = particle_sectors {
+        builder = builder.particle_sectors(sectors.iter().copied());
     }
     if let Some(momentum) = momentum {
         builder = builder.momentum(*momentum);
@@ -838,6 +867,8 @@ fn build_spinful_basis(
         sites,
         particles_up,
         particles_down,
+        particle_sectors,
+        allowed_local_occupancies,
         symmetries,
         reverse,
     } = request
@@ -845,11 +876,26 @@ fn build_spinful_basis(
         unreachable!("build_spinful_basis requires a spinful request");
     };
     let mut builder = SpinfulFermionBasis1D::builder(*sites);
-    if let Some(particles) = particles_up {
-        builder = builder.particles_up(*particles);
+    if particle_sectors.is_some() && (particles_up.is_some() || particles_down.is_some()) {
+        return Err(QmbedError::InvalidOptions(
+            "spinful basis accepts fixed particles or particle_sectors, not both".into(),
+        ));
     }
-    if let Some(particles) = particles_down {
-        builder = builder.particles_down(*particles);
+    if let Some(sectors) = particle_sectors {
+        builder = builder.particle_sectors(sectors.iter().map(|sector| (sector[0], sector[1])));
+    } else {
+        if let Some(particles) = particles_up {
+            builder = builder.particles_up(*particles);
+        }
+        if let Some(particles) = particles_down {
+            builder = builder.particles_down(*particles);
+        }
+    }
+    if let Some(allowed) = allowed_local_occupancies {
+        builder = builder.local_occupation_constraint(LocalOccupationConstraint::new(
+            2,
+            allowed.iter().copied(),
+        )?);
     }
     let basis = builder.build()?;
     let packed = if symmetries.is_empty() {
@@ -1875,6 +1921,78 @@ mod tests {
         let invalid: Value = serde_json::from_str(&invalid).unwrap();
         assert_eq!(invalid["status"], "error");
         assert!(invalid["error"].as_str().unwrap().contains("expected 3"));
+    }
+
+    #[test]
+    fn basis_requests_materialize_single_and_multicomponent_sector_unions() {
+        let cases = [
+            (
+                r#"{
+                    "operation":"describe_basis",
+                    "basis":{
+                        "kind":"spin",
+                        "sites":4,
+                        "up_sectors":[0,2],
+                        "symmetries":[{"destinations":[1,2,3,0],"sector":0}]
+                    }
+                }"#,
+                None,
+            ),
+            (
+                r#"{
+                    "operation":"describe_basis",
+                    "basis":{
+                        "kind":"boson",
+                        "sites":4,
+                        "states_per_site":5,
+                        "particle_sectors":[0,2]
+                    }
+                }"#,
+                Some(11),
+            ),
+            (
+                r#"{
+                    "operation":"describe_basis",
+                    "basis":{
+                        "kind":"spinless_fermion",
+                        "sites":4,
+                        "particle_sectors":[0,2]
+                    }
+                }"#,
+                Some(7),
+            ),
+            (
+                r#"{
+                    "operation":"describe_basis",
+                    "basis":{
+                        "kind":"spinful_fermion",
+                        "sites":3,
+                        "particle_sectors":[[0,0],[0,2],[2,0],[2,2]]
+                    }
+                }"#,
+                Some(16),
+            ),
+            (
+                r#"{
+                    "operation":"describe_basis",
+                    "basis":{
+                        "kind":"spinful_fermion",
+                        "sites":3,
+                        "particles_up":2,
+                        "particles_down":1,
+                        "allowed_local_occupancies":[0,1,2]
+                    }
+                }"#,
+                Some(3),
+            ),
+        ];
+        for (request, expected_dimension) in cases {
+            let response: Value = serde_json::from_str(&run_command_json(request)).unwrap();
+            assert_eq!(response["status"], "ok");
+            if let Some(expected_dimension) = expected_dimension {
+                assert_eq!(response["result"]["dimension"], expected_dimension);
+            }
+        }
     }
 
     #[test]

@@ -48,6 +48,42 @@ def _spin_normalization(pauli: bool | int, spin_twice: int) -> str:
     }[value]
 
 
+def _single_species_sectors(value, name: str) -> tuple[int | None, list[int] | None]:
+    if value is None:
+        return None, None
+    if isinstance(value, (int, np.integer)):
+        return int(value), None
+    try:
+        sectors = [int(sector) for sector in value]
+    except TypeError as error:
+        raise TypeError(f"{name} must be an integer or an iterable of integers") from error
+    if not sectors:
+        raise ValueError(f"{name} sector union must be nonempty")
+    return None, sectors
+
+
+def _spinful_sectors(
+    value,
+) -> tuple[tuple[int, int] | None, list[list[int]] | None]:
+    if value is None:
+        return None, None
+    if (
+        isinstance(value, (tuple, list))
+        and len(value) == 2
+        and all(isinstance(count, (int, np.integer)) for count in value)
+    ):
+        return (int(value[0]), int(value[1])), None
+    try:
+        sectors = [[int(up), int(down)] for up, down in value]
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "Nf must be a pair or an iterable of (N_up, N_down) pairs"
+        ) from error
+    if not sectors:
+        raise ValueError("Nf sector union must be nonempty")
+    return None, sectors
+
+
 def _rust_site_map(site_map, sites: int) -> tuple[list[int], list[bool]]:
     values = [int(value) for value in np.asarray(site_map).reshape(-1)]
     if len(values) != sites:
@@ -302,16 +338,21 @@ class _PackedBasis:
             request["parity"] = None
             if not pcon:
                 request["up"] = None
+                request["up_sectors"] = None
         elif request["kind"] == "boson":
             if not pcon:
                 request["particles"] = None
+                request["particle_sectors"] = None
         elif request["kind"] == "spinless_fermion":
             request["momentum"] = None
             if not pcon:
                 request["particles"] = None
+                request["particle_sectors"] = None
         elif request["kind"] == "spinful_fermion" and not pcon:
             request["particles_up"] = None
             request["particles_down"] = None
+            request["particle_sectors"] = None
+            request["allowed_local_occupancies"] = None
         return request
 
     @cached_property
@@ -749,6 +790,7 @@ class spin_basis_1d(_PackedBasis):
             if Nup is not None:
                 raise ValueError("Nup and m cannot both be specified")
             Nup = round((float(m) + spin_twice / 2) * L)
+        fixed_up, up_sectors = _single_species_sectors(Nup, "Nup")
         self.N = int(L)
         a = int(a)
         if a <= 0 or self.N % a:
@@ -820,7 +862,8 @@ class spin_basis_1d(_PackedBasis):
             "kind": "spin",
             "sites": self.N,
             "spin_twice": spin_twice,
-            "up": Nup,
+            "up": fixed_up,
+            "up_sectors": up_sectors,
             "momentum": None,
             "parity": None,
             "normalization": _spin_normalization(pauli, spin_twice),
@@ -837,29 +880,55 @@ class boson_basis_1d(_PackedBasis):
         sps: int | None = None,
         kblock: int | None = None,
         pblock: int | None = None,
+        cblock: int | None = None,
         a: int = 1,
         **blocks,
     ):
         _reject_options("boson_basis_1d", blocks)
         self.N = int(L)
+        fixed_particles, particle_sectors = _single_species_sectors(Nb, "Nb")
         a = int(a)
         if a <= 0 or self.N % a:
             raise ValueError("a must be a positive divisor of L")
         states_per_site = int(
-            sps if sps is not None else (Nb + 1 if Nb is not None else 2)
+            sps
+            if sps is not None
+            else (
+                fixed_particles + 1
+                if fixed_particles is not None
+                else max(particle_sectors or [1]) + 1
+            )
         )
+        symmetries = _one_dimensional_symmetries(
+            self.N,
+            states_per_site=states_per_site,
+            momentum=kblock,
+            parity=pblock,
+            translation_step=a,
+        )
+        if cblock is not None:
+            if cblock not in (-1, 1):
+                raise ValueError("cblock must be either -1 or +1")
+            particle_hole = -(np.arange(self.N) + 1)
+            symmetries.extend(
+                _general_symmetries(
+                    {
+                        "particle_hole": (
+                            particle_hole,
+                            0 if cblock == 1 else 1,
+                        )
+                    },
+                    sites=self.N,
+                    states_per_site=states_per_site,
+                )
+            )
         self._request = {
             "kind": "boson",
             "sites": self.N,
-            "particles": Nb,
+            "particles": fixed_particles,
+            "particle_sectors": particle_sectors,
             "states_per_site": states_per_site,
-            "symmetries": _one_dimensional_symmetries(
-                self.N,
-                states_per_site=states_per_site,
-                momentum=kblock,
-                parity=pblock,
-                translation_step=a,
-            ),
+            "symmetries": symmetries,
             "reverse": True,
         }
 
@@ -881,6 +950,7 @@ class spinless_fermion_basis_1d(_PackedBasis):
     ):
         _reject_options("spinless_fermion_basis_1d", blocks)
         self.N = int(L)
+        fixed_particles, particle_sectors = _single_species_sectors(Nf, "Nf")
         a = int(a)
         if a <= 0 or self.N % a:
             raise ValueError("a must be a positive divisor of L")
@@ -895,7 +965,8 @@ class spinless_fermion_basis_1d(_PackedBasis):
         self._request = {
             "kind": "spinless_fermion",
             "sites": self.N,
-            "particles": Nf,
+            "particles": fixed_particles,
+            "particle_sectors": particle_sectors,
             "momentum": None,
             "symmetries": symmetries,
             "reverse": True,
@@ -907,16 +978,49 @@ class spinful_fermion_basis_1d(_PackedBasis):
         self,
         L: int,
         Nf: tuple[int, int] | None = None,
+        kblock: int | None = None,
+        pblock: int | None = None,
+        a: int = 1,
+        double_occupancy: bool = True,
         **blocks,
     ):
         _reject_options("spinful_fermion_basis_1d", blocks)
         self.N = int(L)
-        particles_up, particles_down = (None, None) if Nf is None else Nf
+        a = int(a)
+        if a <= 0 or self.N % a:
+            raise ValueError("a must be a positive divisor of L")
+        fixed_particles, particle_sectors = _spinful_sectors(Nf)
+        particles_up, particles_down = (
+            (None, None) if fixed_particles is None else fixed_particles
+        )
+        spatial_symmetries = _one_dimensional_symmetries(
+            self.N,
+            states_per_site=2,
+            momentum=kblock,
+            parity=pblock,
+            fermionic=True,
+            translation_step=a,
+        )
+        symmetries = []
+        for symmetry in spatial_symmetries:
+            destinations = symmetry["destinations"]
+            symmetries.append(
+                {
+                    **symmetry,
+                    "destinations": destinations
+                    + [self.N + destination for destination in destinations],
+                }
+            )
         self._request = {
             "kind": "spinful_fermion",
             "sites": self.N,
             "particles_up": particles_up,
             "particles_down": particles_down,
+            "particle_sectors": particle_sectors,
+            "allowed_local_occupancies": None
+            if bool(double_occupancy)
+            else [0, 1, 2],
+            "symmetries": symmetries,
             "reverse": True,
         }
 
@@ -946,14 +1050,14 @@ class spin_basis_general(_PackedBasis):
             if Nup is not None:
                 raise ValueError("Nup and m cannot both be specified")
             Nup = round((float(m) + spin_twice / 2) * N)
-        if Nup is not None and not isinstance(Nup, (int, np.integer)):
-            raise NotImplementedError("unions of spin particle sectors are not implemented")
+        fixed_up, up_sectors = _single_species_sectors(Nup, "Nup")
         self.N = int(N)
         self._request = {
             "kind": "spin",
             "sites": self.N,
             "spin_twice": spin_twice,
-            "up": None if Nup is None else int(Nup),
+            "up": fixed_up,
+            "up_sectors": up_sectors,
             "momentum": None,
             "parity": None,
             "normalization": _spin_normalization(pauli, spin_twice),
@@ -986,13 +1090,21 @@ class boson_basis_general(_PackedBasis):
             ordered.update(blocks)
             blocks = ordered
         self.N = int(N)
+        fixed_particles, particle_sectors = _single_species_sectors(Nb, "Nb")
         states_per_site = int(
-            sps if sps is not None else (Nb + 1 if Nb is not None else 2)
+            sps
+            if sps is not None
+            else (
+                fixed_particles + 1
+                if fixed_particles is not None
+                else max(particle_sectors or [1]) + 1
+            )
         )
         self._request = {
             "kind": "boson",
             "sites": self.N,
-            "particles": Nb,
+            "particles": fixed_particles,
+            "particle_sectors": particle_sectors,
             "states_per_site": states_per_site,
             "symmetries": _general_symmetries(
                 blocks,
@@ -1021,13 +1133,13 @@ class spinless_fermion_basis_general(_PackedBasis):
             }
             ordered.update(blocks)
             blocks = ordered
-        if Nf is not None and not isinstance(Nf, (int, np.integer)):
-            raise NotImplementedError("unions of fermion particle sectors are not implemented")
+        fixed_particles, particle_sectors = _single_species_sectors(Nf, "Nf")
         self.N = int(N)
         self._request = {
             "kind": "spinless_fermion",
             "sites": self.N,
-            "particles": None if Nf is None else int(Nf),
+            "particles": fixed_particles,
+            "particle_sectors": particle_sectors,
             "momentum": None,
             "symmetries": _general_symmetries(
                 blocks,
@@ -1045,6 +1157,7 @@ class spinful_fermion_basis_general(_PackedBasis):
         self,
         N: int,
         Nf: tuple[int, int] | None = None,
+        double_occupancy: bool = True,
         make_basis: bool = True,
         block_order=None,
         **blocks,
@@ -1058,7 +1171,10 @@ class spinful_fermion_basis_general(_PackedBasis):
             ordered.update(blocks)
             blocks = ordered
         self.N = int(N)
-        particles_up, particles_down = (None, None) if Nf is None else Nf
+        fixed_particles, particle_sectors = _spinful_sectors(Nf)
+        particles_up, particles_down = (
+            (None, None) if fixed_particles is None else fixed_particles
+        )
         spatial_symmetries = _general_symmetries(
             blocks,
             sites=self.N,
@@ -1080,6 +1196,10 @@ class spinful_fermion_basis_general(_PackedBasis):
             "sites": self.N,
             "particles_up": None if particles_up is None else int(particles_up),
             "particles_down": None if particles_down is None else int(particles_down),
+            "particle_sectors": particle_sectors,
+            "allowed_local_occupancies": None
+            if bool(double_occupancy)
+            else [0, 1, 2],
             "symmetries": symmetries,
             "reverse": True,
         }

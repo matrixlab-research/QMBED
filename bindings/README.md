@@ -47,6 +47,14 @@ representative, orbit, phase, and normalized coefficient. Projector
 construction consumes the same core reduction contract, so Python
 `representative`, `normalization`, `get_amp`, and `get_proj` cannot drift.
 
+Additive quantum-number selections are also boundary data rather than frontend
+enumeration. `up_sectors` and `particle_sectors` select validated unions for
+spin, boson, spinless-fermion, and spinful-fermion bases. Site-local exclusions
+use `allowed_local_occupancies`; Rust's reusable `LocalOccupationConstraint`
+filters packed binary-species states before the same symmetry and operator
+paths run. Python `double_occupancy=False` is only the two-species shorthand
+for allowing local masks `[0, 1, 2]`.
+
 - `python/` exposes the native `qmbed` module and the versioned
   `qmbed.compat.quspin` migration surface.
 - `julia/` exposes only the native `QMBED` API.

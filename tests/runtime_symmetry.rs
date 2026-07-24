@@ -1,7 +1,8 @@
 use qmbed::Complex64;
 use qmbed::basis::{
-    Basis, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap, PackedBasis, SpinBasis1D,
-    SymmetryMap, SymmetryReducer, SymmetrySector,
+    Basis, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap,
+    LocalOccupationConstraint, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D,
+    SpinlessFermionBasis1D, SymmetryMap, SymmetryReducer, SymmetrySector,
 };
 
 #[test]
@@ -34,6 +35,92 @@ fn runtime_translation_matches_the_builtin_spin_sector() {
     let packed = PackedBasis::from(general);
     assert_eq!(packed.len(), builtin.len());
     assert_eq!(packed.state(0).unwrap(), builtin.state(0).unwrap());
+}
+
+#[test]
+fn additive_sector_unions_share_the_normal_basis_and_symmetry_paths() {
+    let selected = [0, 2, 4];
+    let spin = SpinBasis1D::builder(4)
+        .particle_sectors(selected)
+        .build()
+        .unwrap();
+    let fermion = SpinlessFermionBasis1D::builder(4)
+        .particle_sectors(selected)
+        .build()
+        .unwrap();
+    assert_eq!(spin.len(), 8);
+    assert_eq!(fermion.len(), 8);
+    assert_eq!(spin.particle_sectors(), Some(selected.as_slice()));
+    assert_eq!(fermion.particle_sectors(), Some(selected.as_slice()));
+    for index in 0..spin.len() {
+        assert_eq!(spin.state(index).unwrap(), fermion.state(index).unwrap());
+    }
+
+    let boson = BosonBasis1D::builder(3, 3)
+        .particle_sectors([0, 2])
+        .build()
+        .unwrap();
+    assert_eq!(boson.len(), 7);
+    assert_eq!(boson.particle_sectors(), Some([0, 2].as_slice()));
+
+    let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
+    let sector_dimensions = (0..4)
+        .map(|momentum| {
+            GeneralBasis::new(
+                SpinBasis1D::builder(4)
+                    .particle_sectors(selected)
+                    .build()
+                    .unwrap(),
+                SymmetrySector::new().with_map(translation.clone(), momentum),
+            )
+            .unwrap()
+            .len()
+        })
+        .sum::<usize>();
+    assert_eq!(sector_dimensions, spin.len());
+}
+
+#[test]
+fn local_binary_species_constraints_compose_with_sector_and_symmetry_reduction() {
+    let no_double = LocalOccupationConstraint::new(2, [0, 1, 2]).unwrap();
+    let parent = SpinfulFermionBasis1D::builder(3)
+        .particles(2, 1)
+        .local_occupation_constraint(no_double.clone())
+        .build()
+        .unwrap();
+    assert_eq!(parent.len(), 3);
+    assert_eq!(
+        parent
+            .local_occupation_constraint()
+            .unwrap()
+            .allowed_local_states(),
+        &[0, 1, 2]
+    );
+    for index in 0..parent.len() {
+        assert!(
+            no_double
+                .accepts_packed_state(parent.state(index).unwrap(), 3)
+                .unwrap()
+        );
+    }
+
+    let destinations = vec![1, 2, 0, 4, 5, 3];
+    let translation = LatticeSymmetryMap::site_permutation(2, destinations).unwrap();
+    let sector_dimensions = (0..3)
+        .map(|momentum| {
+            GeneralBasis::new(
+                SpinfulFermionBasis1D::builder(3)
+                    .particles(2, 1)
+                    .local_occupation_constraint(no_double.clone())
+                    .build()
+                    .unwrap(),
+                SymmetrySector::new().with_map(translation.clone(), momentum),
+            )
+            .unwrap()
+            .len()
+        })
+        .sum::<usize>();
+    assert_eq!(sector_dimensions, parent.len());
 }
 
 #[test]

@@ -233,6 +233,85 @@ fn operator_number_change(operator: &str) -> Result<Option<i32>> {
     Ok(Some(change))
 }
 
+fn operator_number_changes(operator: &str) -> Result<Vec<i32>> {
+    let mut changes = vec![0_i32];
+    for character in operator.chars().filter(|character| *character != '|') {
+        match character {
+            '+' => {
+                for change in &mut changes {
+                    *change += 1;
+                }
+            }
+            '-' => {
+                for change in &mut changes {
+                    *change -= 1;
+                }
+            }
+            'x' | 'y' => {
+                let mut lowered = changes.clone();
+                for change in &mut changes {
+                    *change += 1;
+                }
+                for change in &mut lowered {
+                    *change -= 1;
+                }
+                changes.extend(lowered);
+                changes.sort_unstable();
+                changes.dedup();
+            }
+            'I' | 'n' | 'z' => {}
+            _ => return Err(QmbedError::InvalidOperator(operator.into())),
+        }
+    }
+    Ok(changes)
+}
+
+fn canonical_particle_sectors(
+    sectors: impl IntoIterator<Item = usize>,
+    maximum: usize,
+    family: &str,
+) -> Result<Vec<usize>> {
+    let mut sectors = sectors.into_iter().collect::<Vec<_>>();
+    if sectors.is_empty() {
+        return Err(QmbedError::InvalidSector(format!(
+            "{family} particle-sector union must be nonempty"
+        )));
+    }
+    if sectors.iter().any(|&sector| sector > maximum) {
+        return Err(QmbedError::InvalidSector(format!(
+            "{family} particle sector exceeds the local capacity"
+        )));
+    }
+    sectors.sort_unstable();
+    sectors.dedup();
+    Ok(sectors)
+}
+
+fn selected_sectors_preserve_changes(
+    fixed: Option<usize>,
+    sectors: Option<&[usize]>,
+    maximum: usize,
+    changes: &[i32],
+) -> bool {
+    let contains = |sector: usize| {
+        sectors.map_or_else(
+            || fixed == Some(sector),
+            |selected| selected.binary_search(&sector).is_ok(),
+        )
+    };
+    let preserves_source = |source: usize| {
+        changes.iter().copied().all(|change| {
+            let target = source as i128 + i128::from(change);
+            target < 0 || target > maximum as i128 || contains(target as usize)
+        })
+    };
+    match (fixed, sectors) {
+        (_, Some(sectors)) => sectors.iter().copied().all(preserves_source),
+        (Some(fixed), None) => preserves_source(fixed),
+        (None, None) => true,
+    }
+}
+
 fn fixed_weight_states(sites: usize, particles: Option<usize>) -> Result<Vec<u128>> {
     if sites > 128 {
         return Err(QmbedError::UnsupportedBackend(
@@ -283,6 +362,22 @@ fn fixed_weight_states(sites: usize, particles: Option<usize>) -> Result<Vec<u12
         }
         state = next;
     }
+    Ok(states)
+}
+
+fn fixed_weight_sector_states(
+    sites: usize,
+    particles: Option<usize>,
+    particle_sectors: Option<&[usize]>,
+) -> Result<Vec<u128>> {
+    let Some(sectors) = particle_sectors else {
+        return fixed_weight_states(sites, particles);
+    };
+    let mut states = Vec::new();
+    for &sector in sectors {
+        states.extend(fixed_weight_states(sites, Some(sector))?);
+    }
+    states.sort_unstable();
     Ok(states)
 }
 
@@ -356,6 +451,115 @@ fn fixed_digit_sum_states(
     );
     states.sort_unstable();
     Ok(states)
+}
+
+fn fixed_digit_sum_sector_states(
+    sites: usize,
+    states_per_site: usize,
+    total: Option<usize>,
+    particle_sectors: Option<&[usize]>,
+) -> Result<Vec<u128>> {
+    let Some(sectors) = particle_sectors else {
+        return fixed_digit_sum_states(sites, states_per_site, total);
+    };
+    let mut states = Vec::new();
+    for &sector in sectors {
+        states.extend(fixed_digit_sum_states(
+            sites,
+            states_per_site,
+            Some(sector),
+        )?);
+    }
+    states.sort_unstable();
+    Ok(states)
+}
+
+/// Site-local constraint for packed binary species.
+///
+/// A local state is encoded as a bit mask over species: bit `s` is the
+/// occupation of species `s` at the site. This represents exclusions such as
+/// no-double-occupancy without embedding a model-specific predicate in the
+/// fermion basis or an interop layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalOccupationConstraint {
+    species: usize,
+    allowed_local_states: Vec<usize>,
+}
+
+impl LocalOccupationConstraint {
+    pub fn new(
+        species: usize,
+        allowed_local_states: impl IntoIterator<Item = usize>,
+    ) -> Result<Self> {
+        let local_dimension = 1_usize
+            .checked_shl(u32::try_from(species).unwrap_or(u32::MAX))
+            .ok_or_else(|| {
+                QmbedError::UnsupportedBackend(
+                    "the local binary-species dimension exceeds usize".into(),
+                )
+            })?;
+        if species == 0 {
+            return Err(QmbedError::InvalidSector(
+                "a local occupation constraint needs at least one species".into(),
+            ));
+        }
+        let mut allowed_local_states = allowed_local_states.into_iter().collect::<Vec<_>>();
+        if allowed_local_states.is_empty() {
+            return Err(QmbedError::InvalidSector(
+                "a local occupation constraint must allow at least one state".into(),
+            ));
+        }
+        if allowed_local_states
+            .iter()
+            .any(|&state| state >= local_dimension)
+        {
+            return Err(QmbedError::InvalidSector(
+                "an allowed local occupation is outside the binary-species space".into(),
+            ));
+        }
+        allowed_local_states.sort_unstable();
+        allowed_local_states.dedup();
+        Ok(Self {
+            species,
+            allowed_local_states,
+        })
+    }
+
+    pub const fn species(&self) -> usize {
+        self.species
+    }
+
+    pub fn allowed_local_states(&self) -> &[usize] {
+        &self.allowed_local_states
+    }
+
+    pub fn accepts_packed_state(&self, state: u128, sites: usize) -> Result<bool> {
+        let orbitals = self.species.checked_mul(sites).ok_or_else(|| {
+            QmbedError::UnsupportedBackend("binary-species orbital count overflow".into())
+        })?;
+        if orbitals > 128 {
+            return Err(QmbedError::UnsupportedBackend(
+                "the packed local-constraint backend supports at most 128 orbitals".into(),
+            ));
+        }
+        for site in 0..sites {
+            let mut local_state = 0_usize;
+            for species in 0..self.species {
+                let orbital = species * sites + site;
+                if state & (1_u128 << orbital) != 0 {
+                    local_state |= 1_usize << species;
+                }
+            }
+            if self
+                .allowed_local_states
+                .binary_search(&local_state)
+                .is_err()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn state_index(states: &[u128], state: u128) -> Result<usize> {
@@ -756,6 +960,7 @@ pub struct SpinBasis1D {
     states_per_site: u128,
     radix_bits: Option<u32>,
     up: Option<usize>,
+    particle_sectors: Option<Vec<usize>>,
     normalization: SpinNormalization,
     place_values: Vec<u128>,
     z_factors: Vec<f64>,
@@ -774,6 +979,7 @@ impl SpinBasis1D {
             sites,
             spin_twice: 1,
             up: None,
+            particle_sectors: None,
             momentum: None,
             parity: None,
             normalization: SpinNormalization::AngularMomentum,
@@ -790,6 +996,11 @@ impl SpinBasis1D {
 
     pub const fn up(&self) -> Option<usize> {
         self.up
+    }
+
+    /// Allowed additive spin-occupation sectors when the basis is a union.
+    pub fn particle_sectors(&self) -> Option<&[usize]> {
+        self.particle_sectors.as_deref()
     }
 
     pub const fn pauli(&self) -> bool {
@@ -954,6 +1165,7 @@ pub struct SpinBasisBuilder {
     sites: usize,
     spin_twice: u16,
     up: Option<usize>,
+    particle_sectors: Option<Vec<usize>>,
     momentum: Option<i32>,
     parity: Option<i8>,
     normalization: SpinNormalization,
@@ -965,13 +1177,22 @@ impl SpinBasisBuilder {
         self
     }
 
-    pub const fn up(mut self, up: usize) -> Self {
+    pub fn up(mut self, up: usize) -> Self {
         self.up = Some(up);
+        self.particle_sectors = None;
         self
     }
 
-    pub const fn magnetization(mut self, up: usize) -> Self {
+    pub fn magnetization(mut self, up: usize) -> Self {
         self.up = Some(up);
+        self.particle_sectors = None;
+        self
+    }
+
+    /// Select a union of additive spin-occupation sectors.
+    pub fn particle_sectors(mut self, sectors: impl IntoIterator<Item = usize>) -> Self {
+        self.particle_sectors = Some(sectors.into_iter().collect());
+        self.up = None;
         self
     }
 
@@ -1011,6 +1232,11 @@ impl SpinBasisBuilder {
             ));
         }
         let states_per_site = usize::from(self.spin_twice) + 1;
+        let maximum_particles = self.sites.saturating_mul(usize::from(self.spin_twice));
+        let particle_sectors = self
+            .particle_sectors
+            .map(|sectors| canonical_particle_sectors(sectors, maximum_particles, "spin"))
+            .transpose()?;
         let states_per_site_u128 = states_per_site as u128;
         let radix_bits = states_per_site_u128
             .is_power_of_two()
@@ -1060,9 +1286,14 @@ impl SpinBasisBuilder {
             );
         }
         let parent_states = if self.spin_twice == 1 {
-            fixed_weight_states(self.sites, self.up)?
+            fixed_weight_sector_states(self.sites, self.up, particle_sectors.as_deref())?
         } else {
-            fixed_digit_sum_states(self.sites, states_per_site, self.up)?
+            fixed_digit_sum_sector_states(
+                self.sites,
+                states_per_site,
+                self.up,
+                particle_sectors.as_deref(),
+            )?
         };
         let (states, orbit_lengths, symmetry_lookup, momentum, parity) = spin_symmetry_sector(
             parent_states,
@@ -1077,6 +1308,7 @@ impl SpinBasisBuilder {
             states_per_site: states_per_site_u128,
             radix_bits,
             up: self.up,
+            particle_sectors,
             normalization: self.normalization,
             place_values,
             z_factors,
@@ -1107,13 +1339,13 @@ impl Basis for SpinBasis1D {
 
     fn index(&self, state: Self::State) -> Result<usize> {
         if self.momentum.is_none() && self.parity.is_none() {
-            if self.spin_twice == 1 {
+            if self.spin_twice == 1 && self.particle_sectors.is_none() {
                 return self.up.map_or_else(
                     || direct_state_index(&self.states, state),
                     |up| fixed_weight_state_index(state, self.sites, up),
                 );
             }
-            if self.up.is_none() {
+            if self.up.is_none() && self.particle_sectors.is_none() {
                 return direct_state_index(&self.states, state);
             }
         }
@@ -1259,7 +1491,12 @@ impl Basis for SpinBasis1D {
     }
 
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
-        Ok(self.up.is_none() || operator_number_change(operator)? == Some(0))
+        Ok(selected_sectors_preserve_changes(
+            self.up,
+            self.particle_sectors.as_deref(),
+            self.sites.saturating_mul(usize::from(self.spin_twice)),
+            &operator_number_changes(operator)?,
+        ))
     }
 }
 
@@ -1268,6 +1505,7 @@ impl Basis for SpinBasis1D {
 pub struct BosonBasis1D {
     sites: usize,
     particles: Option<usize>,
+    particle_sectors: Option<Vec<usize>>,
     states_per_site: usize,
     states: Vec<u128>,
 }
@@ -1277,6 +1515,7 @@ impl BosonBasis1D {
         BosonBasisBuilder {
             sites,
             particles: None,
+            particle_sectors: None,
             states_per_site,
         }
     }
@@ -1287,6 +1526,11 @@ impl BosonBasis1D {
 
     pub const fn particles(&self) -> Option<usize> {
         self.particles
+    }
+
+    /// Allowed total-occupation sectors when the basis is a union.
+    pub fn particle_sectors(&self) -> Option<&[usize]> {
+        self.particle_sectors.as_deref()
     }
 
     pub const fn states_per_site(&self) -> usize {
@@ -1339,12 +1583,21 @@ impl BosonBasis1D {
 pub struct BosonBasisBuilder {
     sites: usize,
     particles: Option<usize>,
+    particle_sectors: Option<Vec<usize>>,
     states_per_site: usize,
 }
 
 impl BosonBasisBuilder {
-    pub const fn particles(mut self, particles: usize) -> Self {
+    pub fn particles(mut self, particles: usize) -> Self {
         self.particles = Some(particles);
+        self.particle_sectors = None;
+        self
+    }
+
+    /// Select a union of total boson-occupation sectors.
+    pub fn particle_sectors(mut self, sectors: impl IntoIterator<Item = usize>) -> Self {
+        self.particle_sectors = Some(sectors.into_iter().collect());
+        self.particles = None;
         self
     }
 
@@ -1354,21 +1607,32 @@ impl BosonBasisBuilder {
                 "boson sites and states_per_site must be positive".into(),
             ));
         }
+        let maximum_particles = self.sites * (self.states_per_site - 1);
         if self
             .particles
-            .is_some_and(|count| count > self.sites * (self.states_per_site - 1))
+            .is_some_and(|count| count > maximum_particles)
         {
             return Err(QmbedError::InvalidSector(
                 "particle count exceeds the local cutoff".into(),
             ));
         }
-        let states = fixed_digit_sum_states(self.sites, self.states_per_site, self.particles)?;
+        let particle_sectors = self
+            .particle_sectors
+            .map(|sectors| canonical_particle_sectors(sectors, maximum_particles, "boson"))
+            .transpose()?;
+        let states = fixed_digit_sum_sector_states(
+            self.sites,
+            self.states_per_site,
+            self.particles,
+            particle_sectors.as_deref(),
+        )?;
         if states.is_empty() {
             return Err(QmbedError::InvalidSector("empty boson sector".into()));
         }
         Ok(BosonBasis1D {
             sites: self.sites,
             particles: self.particles,
+            particle_sectors,
             states_per_site: self.states_per_site,
             states,
         })
@@ -1390,7 +1654,7 @@ impl Basis for BosonBasis1D {
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
-        if self.particles.is_none() {
+        if self.particles.is_none() && self.particle_sectors.is_none() {
             return direct_state_index(&self.states, state);
         }
         state_index(&self.states, state)
@@ -1425,7 +1689,12 @@ impl Basis for BosonBasis1D {
     }
 
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
-        Ok(self.particles.is_none() || operator_number_change(operator)? == Some(0))
+        Ok(selected_sectors_preserve_changes(
+            self.particles,
+            self.particle_sectors.as_deref(),
+            self.sites * (self.states_per_site - 1),
+            &operator_number_changes(operator)?,
+        ))
     }
 }
 
@@ -1434,6 +1703,7 @@ impl Basis for BosonBasis1D {
 pub struct SpinlessFermionBasis1D {
     sites: usize,
     particles: Option<usize>,
+    particle_sectors: Option<Vec<usize>>,
     momentum: Option<usize>,
     orbit_lengths: Vec<usize>,
     symmetry_lookup: HashMap<u128, SymmetryImage>,
@@ -1445,6 +1715,7 @@ impl SpinlessFermionBasis1D {
         SpinlessFermionBasisBuilder {
             sites,
             particles: None,
+            particle_sectors: None,
             momentum: None,
         }
     }
@@ -1455,6 +1726,11 @@ impl SpinlessFermionBasis1D {
 
     pub const fn particles(&self) -> Option<usize> {
         self.particles
+    }
+
+    /// Allowed particle-number sectors when the basis is a union.
+    pub fn particle_sectors(&self) -> Option<&[usize]> {
+        self.particle_sectors.as_deref()
     }
 
     pub const fn momentum(&self) -> Option<usize> {
@@ -1501,12 +1777,21 @@ impl SpinlessFermionBasis1D {
 pub struct SpinlessFermionBasisBuilder {
     sites: usize,
     particles: Option<usize>,
+    particle_sectors: Option<Vec<usize>>,
     momentum: Option<i32>,
 }
 
 impl SpinlessFermionBasisBuilder {
-    pub const fn particles(mut self, particles: usize) -> Self {
+    pub fn particles(mut self, particles: usize) -> Self {
         self.particles = Some(particles);
+        self.particle_sectors = None;
+        self
+    }
+
+    /// Select a union of particle-number sectors.
+    pub fn particle_sectors(mut self, sectors: impl IntoIterator<Item = usize>) -> Self {
+        self.particle_sectors = Some(sectors.into_iter().collect());
+        self.particles = None;
         self
     }
 
@@ -1516,12 +1801,18 @@ impl SpinlessFermionBasisBuilder {
     }
 
     pub fn build(self) -> Result<SpinlessFermionBasis1D> {
-        let parent_states = fixed_weight_states(self.sites, self.particles)?;
+        let particle_sectors = self
+            .particle_sectors
+            .map(|sectors| canonical_particle_sectors(sectors, self.sites, "fermion"))
+            .transpose()?;
+        let parent_states =
+            fixed_weight_sector_states(self.sites, self.particles, particle_sectors.as_deref())?;
         let (states, orbit_lengths, symmetry_lookup, momentum) =
             fermion_translation_sector(parent_states, self.sites, self.momentum)?;
         Ok(SpinlessFermionBasis1D {
             sites: self.sites,
             particles: self.particles,
+            particle_sectors,
             momentum,
             orbit_lengths,
             symmetry_lookup,
@@ -1589,6 +1880,9 @@ impl Basis for SpinlessFermionBasis1D {
 
     fn index(&self, state: Self::State) -> Result<usize> {
         if self.momentum.is_none() {
+            if self.particle_sectors.is_some() {
+                return state_index(&self.states, state);
+            }
             return self.particles.map_or_else(
                 || direct_state_index(&self.states, state),
                 |particles| fixed_weight_state_index(state, self.sites, particles),
@@ -1731,7 +2025,12 @@ impl Basis for SpinlessFermionBasis1D {
     }
 
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
-        Ok(self.particles.is_none() || operator_number_change(operator)? == Some(0))
+        Ok(selected_sectors_preserve_changes(
+            self.particles,
+            self.particle_sectors.as_deref(),
+            self.sites,
+            &operator_number_changes(operator)?,
+        ))
     }
 }
 
@@ -1742,6 +2041,7 @@ pub struct SpinfulFermionBasis1D {
     particles_up: Option<usize>,
     particles_down: Option<usize>,
     particle_sectors: Option<Vec<(usize, usize)>>,
+    local_occupation_constraint: Option<LocalOccupationConstraint>,
     states: Vec<u128>,
 }
 
@@ -1752,6 +2052,7 @@ impl SpinfulFermionBasis1D {
             particles_up: None,
             particles_down: None,
             particle_sectors: None,
+            local_occupation_constraint: None,
         }
     }
 
@@ -1769,6 +2070,10 @@ impl SpinfulFermionBasis1D {
 
     pub fn particle_sectors(&self) -> Option<&[(usize, usize)]> {
         self.particle_sectors.as_deref()
+    }
+
+    pub const fn local_occupation_constraint(&self) -> Option<&LocalOccupationConstraint> {
+        self.local_occupation_constraint.as_ref()
     }
 
     fn apply_local_symbols(
@@ -1809,6 +2114,7 @@ pub struct SpinfulFermionBasisBuilder {
     particles_up: Option<usize>,
     particles_down: Option<usize>,
     particle_sectors: Option<Vec<(usize, usize)>>,
+    local_occupation_constraint: Option<LocalOccupationConstraint>,
 }
 
 impl SpinfulFermionBasisBuilder {
@@ -1837,10 +2143,26 @@ impl SpinfulFermionBasisBuilder {
         self
     }
 
+    /// Restrict the allowed site-local occupation masks for the two binary
+    /// fermion species.
+    pub fn local_occupation_constraint(mut self, constraint: LocalOccupationConstraint) -> Self {
+        self.local_occupation_constraint = Some(constraint);
+        self
+    }
+
     pub fn build(self) -> Result<SpinfulFermionBasis1D> {
         if self.sites > 64 {
             return Err(QmbedError::UnsupportedBackend(
                 "the packed spinful backend supports at most 64 sites".into(),
+            ));
+        }
+        if self
+            .local_occupation_constraint
+            .as_ref()
+            .is_some_and(|constraint| constraint.species() != 2)
+        {
+            return Err(QmbedError::InvalidSector(
+                "spinful fermions require a two-species local occupation constraint".into(),
             ));
         }
         let sectors = match &self.particle_sectors {
@@ -1870,11 +2192,21 @@ impl SpinfulFermionBasisBuilder {
         }
         states.sort_unstable();
         states.dedup();
+        if let Some(constraint) = &self.local_occupation_constraint {
+            let mut filtered = Vec::with_capacity(states.len());
+            for state in states {
+                if constraint.accepts_packed_state(state, self.sites)? {
+                    filtered.push(state);
+                }
+            }
+            states = filtered;
+        }
         Ok(SpinfulFermionBasis1D {
             sites: self.sites,
             particles_up: self.particles_up,
             particles_down: self.particles_down,
             particle_sectors: self.particle_sectors,
+            local_occupation_constraint: self.local_occupation_constraint,
             states,
         })
     }
@@ -1895,7 +2227,7 @@ impl Basis for SpinfulFermionBasis1D {
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
-        if self.particle_sectors.is_none() {
+        if self.particle_sectors.is_none() && self.local_occupation_constraint.is_none() {
             let mask = if self.sites == 128 {
                 u128::MAX
             } else {
