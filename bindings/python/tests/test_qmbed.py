@@ -227,6 +227,50 @@ class QmbedBindingTests(unittest.TestCase):
             atol=1.0e-12,
         )
 
+    def test_reduction_queries_share_projector_coefficients(self):
+        sites = 4
+        translation = (np.arange(sites) + 1) % sites
+        basis = spin_basis_general(
+            sites,
+            Nup=2,
+            pauli=False,
+            translation=(translation, 1),
+        )
+        parent = spin_basis_general(sites, Nup=2, pauli=False)
+        states = parent.states.copy()
+        representatives = basis.representative(states)
+        projector = basis.get_proj(np.complex128, pcon=True).toarray()
+        factors = basis.get_amp(states.copy(), mode="full_basis")
+
+        for row, (representative, factor) in enumerate(
+            zip(representatives, factors)
+        ):
+            matches = np.flatnonzero(basis.states == representative)
+            if matches.size:
+                np.testing.assert_allclose(
+                    factor,
+                    projector[row, int(matches[0])],
+                    atol=1.0e-12,
+                )
+            else:
+                self.assertEqual(factor, 0.0)
+
+        norms = basis.normalization(basis.states)
+        self.assertTrue(np.all(norms > 0))
+        representative_factors = basis.get_amp(
+            basis.states.copy(),
+            mode="representative",
+        )
+        np.testing.assert_allclose(
+            np.abs(representative_factors),
+            1.0 / np.sqrt((4 * 4) / norms),
+            atol=1.0e-12,
+        )
+
+        inplace = np.zeros_like(states)
+        self.assertIsNone(basis.representative(states, out=inplace))
+        np.testing.assert_array_equal(inplace, representatives)
+
     def test_sector_shift_runs_directly_between_persistent_models(self):
         source = spin_basis_general(3, Nup=0, pauli=False)
         target = spin_basis_general(3, Nup=1, pauli=False)

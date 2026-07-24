@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from fractions import Fraction
 from functools import cached_property
+import math
 from typing import Any
 
 import numpy as np
@@ -120,16 +121,45 @@ def _general_symmetries(
     return symmetries
 
 
+def _symmetry_period(request: dict[str, Any], states_per_site: int) -> int:
+    destinations = [int(value) for value in request["destinations"]]
+    identity = list(range(states_per_site))
+    local_permutations = request.get("local_permutations")
+    if local_permutations is None:
+        local_permutations = [identity for _ in destinations]
+    visited = [False] * (len(destinations) * states_per_site)
+    period = 1
+    for seed in range(len(visited)):
+        if visited[seed]:
+            continue
+        current = seed
+        cycle = 0
+        while not visited[current]:
+            visited[current] = True
+            cycle += 1
+            source, digit = divmod(current, states_per_site)
+            current = (
+                int(destinations[source]) * states_per_site
+                + int(local_permutations[source][digit])
+            )
+        if current != seed:
+            raise ValueError("symmetry map does not decompose into closed cycles")
+        period = math.lcm(period, cycle)
+    return period
+
+
 def _one_dimensional_symmetries(
     sites: int,
     *,
     states_per_site: int,
     momentum: int | None,
     parity: int | None,
+    fermionic: bool = False,
+    translation_step: int = 1,
 ) -> list[dict[str, Any]]:
     blocks: dict[str, Any] = {}
     if momentum is not None:
-        translation = (np.arange(sites) + 1) % sites
+        translation = (np.arange(sites) + translation_step) % sites
         blocks["translation"] = (translation, int(momentum))
     if parity is not None:
         if parity not in (-1, 1):
@@ -140,6 +170,7 @@ def _one_dimensional_symmetries(
         blocks,
         sites=sites,
         states_per_site=states_per_site,
+        fermionic=fermionic,
     )
 
 
@@ -174,8 +205,29 @@ class _PackedBasis:
     def states(self) -> np.ndarray:
         return np.asarray(
             [int(state) for state in self._description["states"]],
-            dtype=object,
+            dtype=self.dtype,
         )
+
+    @property
+    def dtype(self) -> np.dtype:
+        if self._request["kind"] == "spin":
+            states_per_site = int(self._request.get("spin_twice", 1)) + 1
+            encoded_sites = self.N
+        elif self._request["kind"] == "boson":
+            states_per_site = int(self._request["states_per_site"])
+            encoded_sites = self.N
+        elif self._request["kind"] == "spinful_fermion":
+            states_per_site = 2
+            encoded_sites = 2 * self.N
+        else:
+            states_per_site = 2
+            encoded_sites = self.N
+        maximum = states_per_site**encoded_sites - 1
+        if maximum <= np.iinfo(np.uint32).max:
+            return np.dtype(np.uint32)
+        if maximum <= np.iinfo(np.uint64).max:
+            return np.dtype(np.uint64)
+        return np.dtype(object)
 
     @property
     def blocks(self) -> dict[str, Any]:
@@ -239,6 +291,129 @@ class _PackedBasis:
 
     def _parent_model(self, *, pcon: bool) -> NativeModel:
         return self._particle_parent_model if pcon else self._full_parent_model
+
+    def _reduction_entries(self, states) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        array = np.asarray(states, dtype=self.dtype, order="C")
+        array = np.atleast_1d(array)
+        if array.ndim != 1:
+            raise TypeError("dimension of array_like states must not exceed 1.")
+        result = self._model.execute(
+            "reduce_states_model",
+            states=[str(int(state)) for state in array],
+        )
+        return array, list(result["entries"])
+
+    def representative(
+        self,
+        states,
+        out=None,
+        return_g: bool = False,
+        return_sign: bool = False,
+    ):
+        if return_g or return_sign:
+            raise NotImplementedError(
+                "generator powers and fermionic representative signs are not exposed yet"
+            )
+        array, entries = self._reduction_entries(states)
+        representatives = np.asarray(
+            [
+                int(entry.get("representative", entry["state"]))
+                for entry in entries
+            ],
+            dtype=self.dtype,
+        )
+        if out is None:
+            return representatives
+        if not isinstance(out, np.ndarray):
+            raise TypeError("out must be a numpy.ndarray")
+        if out.shape != array.shape or out.dtype != self.dtype:
+            raise TypeError("out must have the same shape and dtype as states")
+        if not out.flags["CARRAY"]:
+            raise ValueError("out must be a writable C-contiguous array")
+        out[...] = representatives
+        return None
+
+    def _symmetry_period_product(self) -> int:
+        if self._request["kind"] == "spin":
+            states_per_site = int(self._request.get("spin_twice", 1)) + 1
+        elif self._request["kind"] == "boson":
+            states_per_site = int(self._request["states_per_site"])
+        else:
+            states_per_site = 2
+        return math.prod(
+            _symmetry_period(request, states_per_site)
+            for request in self._request.get("symmetries", [])
+        )
+
+    def normalization(self, states, out=None):
+        array, entries = self._reduction_entries(states)
+        period_product = self._symmetry_period_product()
+        values = np.asarray(
+            [
+                0
+                if "orbit_size" not in entry
+                else period_product * period_product // int(entry["orbit_size"])
+                for entry in entries
+            ],
+            dtype=np.uint64,
+        )
+        if out is None:
+            maximum = int(values.max(initial=0))
+            return values.astype(np.min_scalar_type(maximum)).squeeze()
+        if out.shape != array.shape:
+            raise TypeError("states and out must have same shape.")
+        if not np.issubdtype(out.dtype, np.unsignedinteger):
+            raise TypeError("out must have an unsigned integer datatype")
+        if not out.flags["CARRAY"]:
+            raise ValueError("out must be C-contiguous array.")
+        out[...] = values
+        return None
+
+    def get_amp(self, states, out=None, amps=None, mode: str = "representative"):
+        if mode not in {"representative", "full_basis"}:
+            raise ValueError(
+                "mode accepts only the values 'representative' and 'full_basis'."
+            )
+        array, entries = self._reduction_entries(states)
+        if out is None:
+            output_dtype = np.complex128 if amps is None else np.asarray(amps).dtype
+            out = np.zeros(array.shape, dtype=output_dtype)
+        else:
+            if out.shape != array.shape:
+                raise TypeError("states and out must have same shape.")
+            if out.dtype not in (
+                np.dtype(np.float32),
+                np.dtype(np.float64),
+                np.dtype(np.complex64),
+                np.dtype(np.complex128),
+            ):
+                raise TypeError("out must have a real or complex floating datatype")
+            if not out.flags["CARRAY"]:
+                raise ValueError("out must be C-contiguous array.")
+        factors = np.asarray(
+            [
+                0.0 if "amplitude" not in entry else complex(*entry["amplitude"])
+                for entry in entries
+            ],
+            dtype=np.complex128,
+        )
+        out[...] = self._values_for_dtype(factors, out.dtype)
+        if amps is not None:
+            if np.shape(amps) != array.shape:
+                raise TypeError("states and amps must have same shape.")
+            if mode == "representative":
+                amps *= out
+            else:
+                np.divide(amps, out, out=amps, where=out != 0)
+        if mode == "full_basis" and isinstance(states, np.ndarray):
+            states[...] = np.asarray(
+                [
+                    int(entry.get("representative", entry["state"]))
+                    for entry in entries
+                ],
+                dtype=states.dtype,
+            )
+        return out.squeeze()
 
     @staticmethod
     def _complex_vectors(array: np.ndarray) -> list[list[list[float]]]:
@@ -497,22 +672,24 @@ class spin_basis_1d(_PackedBasis):
             if Nup is not None:
                 raise ValueError("Nup and m cannot both be specified")
             Nup = round((float(m) + spin_twice / 2) * L)
-        _reject_options("spin_basis_1d", {"a": a, **blocks})
         self.N = int(L)
-        symmetries = []
-        momentum = None if kblock is None else -int(kblock)
-        parity = pblock
+        a = int(a)
+        if a <= 0 or self.N % a:
+            raise ValueError("a must be a positive divisor of L")
+        pzblock = blocks.pop("pzblock", None)
+        zAblock = blocks.pop("zAblock", None)
+        zBblock = blocks.pop("zBblock", None)
+        _reject_options("spin_basis_1d", blocks)
+        symmetries = _one_dimensional_symmetries(
+            self.N,
+            states_per_site=spin_twice + 1,
+            momentum=kblock,
+            parity=pblock,
+            translation_step=a,
+        )
         if zblock is not None:
             if zblock not in (-1, 1):
                 raise ValueError("zblock must be either -1 or +1")
-            symmetries.extend(
-                _one_dimensional_symmetries(
-                    self.N,
-                    states_per_site=spin_twice + 1,
-                    momentum=kblock,
-                    parity=pblock,
-                )
-            )
             inversion = -(np.arange(self.N) + 1)
             symmetries.extend(
                 _general_symmetries(
@@ -526,15 +703,49 @@ class spin_basis_1d(_PackedBasis):
                     states_per_site=spin_twice + 1,
                 )
             )
-            momentum = None
-            parity = None
+        for name, block, site_map in (
+            (
+                "pzblock",
+                pzblock,
+                -(np.arange(self.N)[::-1] + 1),
+            ),
+            (
+                "zAblock",
+                zAblock,
+                np.where(
+                    np.arange(self.N) % 2 == 0,
+                    -(np.arange(self.N) + 1),
+                    np.arange(self.N),
+                ),
+            ),
+            (
+                "zBblock",
+                zBblock,
+                np.where(
+                    np.arange(self.N) % 2 == 1,
+                    -(np.arange(self.N) + 1),
+                    np.arange(self.N),
+                ),
+            ),
+        ):
+            if block is None:
+                continue
+            if block not in (-1, 1):
+                raise ValueError(f"{name} must be either -1 or +1")
+            symmetries.extend(
+                _general_symmetries(
+                    {name: (site_map, 0 if block == 1 else 1)},
+                    sites=self.N,
+                    states_per_site=spin_twice + 1,
+                )
+            )
         self._request = {
             "kind": "spin",
             "sites": self.N,
             "spin_twice": spin_twice,
             "up": Nup,
-            "momentum": momentum,
-            "parity": parity,
+            "momentum": None,
+            "parity": None,
             "normalization": _spin_normalization(pauli, spin_twice),
             "symmetries": symmetries,
             "reverse": True,
@@ -552,8 +763,11 @@ class boson_basis_1d(_PackedBasis):
         a: int = 1,
         **blocks,
     ):
-        _reject_options("boson_basis_1d", {"a": a, **blocks})
+        _reject_options("boson_basis_1d", blocks)
         self.N = int(L)
+        a = int(a)
+        if a <= 0 or self.N % a:
+            raise ValueError("a must be a positive divisor of L")
         states_per_site = int(
             sps if sps is not None else (Nb + 1 if Nb is not None else 2)
         )
@@ -567,6 +781,7 @@ class boson_basis_1d(_PackedBasis):
                 states_per_site=states_per_site,
                 momentum=kblock,
                 parity=pblock,
+                translation_step=a,
             ),
             "reverse": True,
         }
@@ -587,16 +802,25 @@ class spinless_fermion_basis_1d(_PackedBasis):
         a: int = 1,
         **blocks,
     ):
-        _reject_options(
-            "spinless_fermion_basis_1d",
-            {"pblock": pblock, "a": a, **blocks},
-        )
+        _reject_options("spinless_fermion_basis_1d", blocks)
         self.N = int(L)
+        a = int(a)
+        if a <= 0 or self.N % a:
+            raise ValueError("a must be a positive divisor of L")
+        symmetries = _one_dimensional_symmetries(
+            self.N,
+            states_per_site=2,
+            momentum=kblock,
+            parity=pblock,
+            fermionic=True,
+            translation_step=a,
+        )
         self._request = {
             "kind": "spinless_fermion",
             "sites": self.N,
             "particles": Nf,
-            "momentum": None if kblock is None else -int(kblock),
+            "momentum": None,
+            "symmetries": symmetries,
             "reverse": True,
         }
 

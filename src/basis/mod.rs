@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -15,6 +15,56 @@ use crate::{QmbedError, Result};
 /// with wider branching use the same interface and spill to heap storage
 /// automatically.
 pub type LocalTransitions<State> = SmallVec<[(State, Complex64); 2]>;
+
+/// Canonical image of one physical state under a basis reduction.
+///
+/// `phase / sqrt(orbit_size)` is the coefficient of `state` in the normalized
+/// reduced vector labelled by `representative`. Keeping this convention at the
+/// basis boundary lets projectors, cross-sector operators, and language
+/// bindings share one source of truth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReductionImage<State> {
+    representative: State,
+    phase: Complex64,
+    orbit_size: usize,
+}
+
+impl<State> ReductionImage<State> {
+    pub fn new(representative: State, phase: Complex64, orbit_size: usize) -> Result<Self> {
+        if orbit_size == 0 || !phase.re.is_finite() || !phase.im.is_finite() {
+            return Err(QmbedError::InternalState(
+                "a reduction image requires a positive orbit and finite phase".into(),
+            ));
+        }
+        if (phase.norm() - 1.0).abs() > 1.0e-10 {
+            return Err(QmbedError::InternalState(
+                "a reduction-image phase must have unit magnitude".into(),
+            ));
+        }
+        Ok(Self {
+            representative,
+            phase,
+            orbit_size,
+        })
+    }
+
+    pub const fn representative(&self) -> &State {
+        &self.representative
+    }
+
+    pub const fn phase(&self) -> Complex64 {
+        self.phase
+    }
+
+    pub const fn orbit_size(&self) -> usize {
+        self.orbit_size
+    }
+
+    /// Normalized coefficient of the physical state in its reduced vector.
+    pub fn amplitude(&self) -> Complex64 {
+        self.phase / (self.orbit_size as f64).sqrt()
+    }
+}
 
 /// Finite Hilbert-space basis and its local operator semantics.
 pub trait Basis: Send + Sync {
@@ -111,17 +161,34 @@ pub trait Basis: Send + Sync {
         Ok(1)
     }
 
+    /// Return the canonical reduction metadata for a physical state.
+    ///
+    /// Explicit bases use a one-state orbit. Symmetry-reduced bases override
+    /// this query without exposing their lookup-table representation.
+    fn reduction_image(&self, state: Self::State) -> Result<Option<ReductionImage<Self::State>>> {
+        match self.index(state) {
+            Ok(_) => Ok(Some(ReductionImage::new(
+                state,
+                Complex64::new(1.0, 0.0),
+                1,
+            )?)),
+            Err(QmbedError::StateNotInBasis) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Map an unreduced physical target state into this basis.
     fn reduce_transition(
         &self,
         state: Self::State,
-        _source_orbit_size: usize,
+        source_orbit_size: usize,
     ) -> Result<Option<(Self::State, Complex64)>> {
-        match self.index(state) {
-            Ok(_) => Ok(Some((state, Complex64::new(1.0, 0.0)))),
-            Err(QmbedError::StateNotInBasis) => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(self.reduction_image(state)?.map(|image| {
+            (
+                image.representative,
+                (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
+            )
+        }))
     }
 
     /// Reduces a physical target and locates its row in one operation.
@@ -131,13 +198,13 @@ pub trait Basis: Send + Sync {
     fn index_transition(
         &self,
         state: Self::State,
-        _source_orbit_size: usize,
+        source_orbit_size: usize,
     ) -> Result<Option<(usize, Complex64)>> {
-        match self.index(state) {
-            Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
-            Err(QmbedError::StateNotInBasis) => Ok(None),
-            Err(error) => Err(error),
-        }
+        let Some((representative, amplitude)) = self.reduce_transition(state, source_orbit_size)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((self.index(representative)?, amplitude)))
     }
 
     /// Whether a local operator string preserves the particle-sector
@@ -1145,6 +1212,17 @@ impl Basis for SpinBasis1D {
         Ok(self.orbit_lengths[self.index(state)?])
     }
 
+    fn reduction_image(&self, state: Self::State) -> Result<Option<ReductionImage<Self::State>>> {
+        let Some(image) = self.symmetry_lookup.get(&state) else {
+            return Ok(None);
+        };
+        Ok(Some(ReductionImage::new(
+            image.representative,
+            image.phase,
+            image.orbit_size,
+        )?))
+    }
+
     fn reduce_transition(
         &self,
         state: Self::State,
@@ -1600,6 +1678,17 @@ impl Basis for SpinlessFermionBasis1D {
             return Ok(1);
         }
         Ok(self.orbit_lengths[self.index(state)?])
+    }
+
+    fn reduction_image(&self, state: Self::State) -> Result<Option<ReductionImage<Self::State>>> {
+        let Some(image) = self.symmetry_lookup.get(&state) else {
+            return Ok(None);
+        };
+        Ok(Some(ReductionImage::new(
+            image.representative,
+            image.phase,
+            image.orbit_size,
+        )?))
     }
 
     fn reduce_transition(
@@ -2535,7 +2624,8 @@ struct SymmetryGenerator<State> {
     sector: i32,
 }
 
-/// Commuting finite maps and their one-dimensional character sectors.
+/// Finite generators and sector phases that extend to a one-dimensional
+/// character of the generated group.
 pub struct SymmetrySector<State> {
     generators: Vec<SymmetryGenerator<State>>,
 }
@@ -2576,28 +2666,15 @@ struct GeneralSymmetryImage<State> {
     orbit_size: usize,
 }
 
-fn enumerate_symmetry_images<State>(
+fn trace_symmetry_orbit<State>(
     state: State,
     generators: &[SymmetryGenerator<State>],
-) -> Result<HashMap<State, Complex64>>
+) -> Result<(HashMap<State, Complex64>, bool)>
 where
     State: Copy + Eq + Hash,
 {
-    fn visit<State>(
-        generator_index: usize,
-        state: State,
-        amplitude: Complex64,
-        generators: &[SymmetryGenerator<State>],
-        output: &mut HashMap<State, Complex64>,
-    ) -> Result<()>
-    where
-        State: Copy + Eq + Hash,
-    {
-        if generator_index == generators.len() {
-            *output.entry(state).or_insert(Complex64::new(0.0, 0.0)) += amplitude;
-            return Ok(());
-        }
-        let generator = &generators[generator_index];
+    let mut sector_steps = Vec::with_capacity(generators.len());
+    for generator in generators {
         let period = generator.map.period();
         if period == 0 {
             return Err(QmbedError::InvalidSector(
@@ -2605,37 +2682,53 @@ where
             ));
         }
         let normalized_sector = i64::from(generator.sector).rem_euclid(period as i64) as usize;
-        let mut image = state;
-        let mut map_phase = Complex64::new(1.0, 0.0);
-        for power in 0..period {
-            let angle = -std::f64::consts::TAU * (normalized_sector * power) as f64 / period as f64;
-            visit(
-                generator_index + 1,
-                image,
-                amplitude * map_phase * Complex64::from_polar(1.0, angle),
-                generators,
-                output,
-            )?;
-            let (next, phase) = generator.map.apply(image)?;
+        let angle = -std::f64::consts::TAU * normalized_sector as f64 / period as f64;
+        sector_steps.push(Complex64::from_polar(1.0, angle));
+
+        let mut closure_state = state;
+        let mut closure_phase = Complex64::new(1.0, 0.0);
+        for _ in 0..period {
+            let (next, phase) = generator.map.apply(closure_state)?;
             if !phase.re.is_finite() || !phase.im.is_finite() {
                 return Err(QmbedError::IncompatibleSymmetry(
                     "a symmetry map returned a non-finite phase".into(),
                 ));
             }
-            image = next;
-            map_phase *= phase;
+            closure_state = next;
+            closure_phase *= phase;
         }
-        if image != state || (map_phase - Complex64::new(1.0, 0.0)).norm() > 1.0e-10 {
+        if closure_state != state || (closure_phase - Complex64::new(1.0, 0.0)).norm() > 1.0e-10 {
             return Err(QmbedError::IncompatibleSymmetry(
                 "a symmetry map does not close at its declared period".into(),
             ));
         }
-        Ok(())
     }
 
-    let mut images = HashMap::new();
-    visit(0, state, Complex64::new(1.0, 0.0), generators, &mut images)?;
-    Ok(images)
+    let mut coefficients = HashMap::new();
+    coefficients.insert(state, Complex64::new(1.0, 0.0));
+    let mut queue = VecDeque::from([state]);
+    let mut compatible = true;
+    while let Some(source) = queue.pop_front() {
+        let source_coefficient = coefficients[&source];
+        for (generator, &sector_step) in generators.iter().zip(&sector_steps) {
+            let (target, map_phase) = generator.map.apply(source)?;
+            if !map_phase.re.is_finite() || !map_phase.im.is_finite() {
+                return Err(QmbedError::IncompatibleSymmetry(
+                    "a symmetry map returned a non-finite phase".into(),
+                ));
+            }
+            let target_coefficient = source_coefficient * map_phase * sector_step;
+            if let Some(previous) = coefficients.get(&target) {
+                if (*previous - target_coefficient).norm() > 1.0e-10 {
+                    compatible = false;
+                }
+            } else {
+                coefficients.insert(target, target_coefficient);
+                queue.push_back(target);
+            }
+        }
+    }
+    Ok((coefficients, compatible))
 }
 
 /// Arbitrary finite-map reduction of any concrete parent basis.
@@ -2689,7 +2782,7 @@ where
             if visited.contains(&seed) {
                 continue;
             }
-            let mut coefficients = enumerate_symmetry_images(seed, &sector.generators)?;
+            let (coefficients, compatible) = trace_symmetry_orbit(seed, &sector.generators)?;
             for state in coefficients.keys() {
                 parent.index(*state).map_err(|_| {
                     QmbedError::IncompatibleSymmetry(
@@ -2698,8 +2791,7 @@ where
                 })?;
                 visited.insert(*state);
             }
-            coefficients.retain(|_, coefficient| coefficient.norm() > 1.0e-12);
-            if coefficients.is_empty() {
+            if !compatible {
                 continue;
             }
             let representative = *coefficients.keys().min().ok_or_else(|| {
@@ -2882,6 +2974,17 @@ where
 
     fn transition_orbit_size(&self, state: Self::State) -> Result<usize> {
         Ok(self.orbit_lengths[self.index(state)?])
+    }
+
+    fn reduction_image(&self, state: Self::State) -> Result<Option<ReductionImage<Self::State>>> {
+        let Some(image) = self.lookup.get(&state) else {
+            return Ok(None);
+        };
+        Ok(Some(ReductionImage::new(
+            image.representative,
+            image.phase,
+            image.orbit_size,
+        )?))
     }
 
     fn reduce_transition(
@@ -3742,7 +3845,7 @@ impl BasisProjector {
     /// Isometric lift from any basis into an explicitly selected parent basis.
     ///
     /// The reduced basis owns the symmetry-reduction convention through
-    /// [`Basis::index_transition`]. Iterating the explicit parent states makes
+    /// [`Basis::reduction_image`]. Iterating the explicit parent states makes
     /// this equally useful for built-in and runtime symmetry sectors, fixed
     /// particle subspaces, and unrestricted parent spaces.
     pub fn between<Reduced, Parent>(reduced: &Reduced, parent: &Parent) -> Result<Self>
@@ -3753,10 +3856,11 @@ impl BasisProjector {
         let mut columns = vec![Vec::<(usize, Complex64)>::new(); reduced.len()];
         for row in 0..parent.len() {
             let state = parent.state(row)?;
-            let Some((column, reduction_amplitude)) = reduced.index_transition(state, 1)? else {
+            let Some(image) = reduced.reduction_image(state)? else {
                 continue;
             };
-            columns[column].push((row, reduction_amplitude.conj()));
+            let column = reduced.index(*image.representative())?;
+            columns[column].push((row, image.amplitude()));
         }
         Self::from_columns(parent.len(), columns)
     }
@@ -4190,6 +4294,20 @@ impl Basis for PackedBasis {
             Self::GeneralSpinlessFermion(basis) => basis.transition_orbit_size(state),
             Self::GeneralSpinfulFermion(basis) => basis.transition_orbit_size(state),
             Self::Reversed(basis) => basis.transition_orbit_size(state),
+        }
+    }
+
+    fn reduction_image(&self, state: Self::State) -> Result<Option<ReductionImage<Self::State>>> {
+        match self {
+            Self::Spin(basis) => basis.reduction_image(state),
+            Self::Boson(basis) => basis.reduction_image(state),
+            Self::SpinlessFermion(basis) => basis.reduction_image(state),
+            Self::SpinfulFermion(basis) => basis.reduction_image(state),
+            Self::GeneralSpin(basis) => basis.reduction_image(state),
+            Self::GeneralBoson(basis) => basis.reduction_image(state),
+            Self::GeneralSpinlessFermion(basis) => basis.reduction_image(state),
+            Self::GeneralSpinfulFermion(basis) => basis.reduction_image(state),
+            Self::Reversed(basis) => basis.reduction_image(state),
         }
     }
 

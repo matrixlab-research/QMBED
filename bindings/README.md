@@ -34,6 +34,12 @@ Python `get_proj`, `project_from`, `project_to`, `get_vec`, and
 `Op_shift_sector`; `pcon` only chooses which explicit parent model the Python
 adapter requests.
 
+`reduce_states_model` exposes the same reduction contract without building an
+operator: for each physical state it returns the canonical representative,
+orbit size, phase, and normalized coefficient. Projector construction consumes
+that contract directly, so Python `representative`, `normalization`, and
+`get_amp` cannot drift from `get_proj`.
+
 - `python/` exposes the native `qmbed` module and the versioned
   `qmbed.compat.quspin` migration surface.
 - `julia/` exposes only the native `QMBED` API.
@@ -48,8 +54,11 @@ General packed bases use a serializable lattice-symmetry schema rather than
 frontend callbacks. Each generator specifies a bijection of source sites,
 optional per-site permutations of local states, and a character sector. Rust
 validates the map, derives its finite period, and computes fermionic exchange
-phases. The same representation therefore covers translations, reflections,
-local spin inversion, and higher-dimensional lattice permutations.
+phases. `GeneralBasis` follows the closure of the generated group rather than a
+fixed Cartesian product of generator powers. The same representation therefore
+covers translations, reflections, local spin inversion, dihedral combinations,
+and higher-dimensional lattice permutations; inconsistent one-dimensional
+character requests produce valid empty sectors.
 
 Spin requests also carry an explicit normalization instead of overloading one
 boolean: angular-momentum operators, Pauli scaling of every non-identity

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use num_complex::Complex64;
 
-use crate::basis::{Basis, BasisProjector, PackedBasis};
+use crate::basis::{Basis, BasisProjector, PackedBasis, ReductionImage};
 use crate::operator::{
     AssemblyChecks, BraKetTransition, LinearOperator, MatrixFormat, Operator, OperatorBuilder,
     OperatorSpec, apply_sector_shift,
@@ -88,6 +88,17 @@ impl PackedEdModel {
     pub fn states(&self) -> Result<Vec<u128>> {
         (0..self.basis.len())
             .map(|index| self.basis.state(index))
+            .collect()
+    }
+
+    /// Query canonical representatives and normalized orbit coefficients.
+    ///
+    /// This works for both explicit and symmetry-reduced bases and does not
+    /// materialize an operator or projector.
+    pub fn reduction_images(&self, states: &[u128]) -> Result<Vec<Option<ReductionImage<u128>>>> {
+        states
+            .iter()
+            .map(|&state| self.basis.reduction_image(state))
             .collect()
     }
 

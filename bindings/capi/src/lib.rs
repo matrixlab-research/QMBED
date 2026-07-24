@@ -103,6 +103,10 @@ enum CommandRequest {
         terms: Vec<TermRequest>,
         kets: Vec<String>,
     },
+    ReduceStatesModel {
+        handle: String,
+        states: Vec<String>,
+    },
     ProjectorModel {
         handle: String,
         parent_handle: String,
@@ -303,6 +307,19 @@ struct TransitionEntry {
 }
 
 #[derive(Debug, Serialize)]
+struct ReductionEntry {
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    representative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amplitude: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orbit_size: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum CommandResult {
     Basis {
@@ -320,6 +337,9 @@ enum CommandResult {
     },
     Transitions {
         entries: Vec<TransitionEntry>,
+    },
+    Reductions {
+        entries: Vec<ReductionEntry>,
     },
     Eigensystem {
         dimension: usize,
@@ -996,6 +1016,20 @@ fn registered_cross_sector_action(
     command_apply_terms_between(&source, &target, terms, vectors)
 }
 
+fn registered_bra_ket_terms(
+    handle: &str,
+    terms: Vec<TermRequest>,
+    kets: Vec<String>,
+) -> Result<CommandResult> {
+    let model = registered_model(handle)?;
+    command_bra_ket_terms(&model, terms, kets)
+}
+
+fn registered_reduce_states(handle: &str, states: Vec<String>) -> Result<CommandResult> {
+    let model = registered_model(handle)?;
+    command_reduce_states(&model, states)
+}
+
 fn command_bra_ket_terms(
     model: &PackedEdModel,
     terms: Vec<TermRequest>,
@@ -1031,6 +1065,38 @@ fn command_bra_ket_terms(
         })
         .collect();
     Ok(CommandResult::Transitions { entries })
+}
+
+fn command_reduce_states(model: &PackedEdModel, states: Vec<String>) -> Result<CommandResult> {
+    let states = states
+        .into_iter()
+        .map(|state| {
+            state.parse::<u128>().map_err(|_| {
+                QmbedError::InvalidOptions(format!(
+                    "physical state {state:?} is not an unsigned 128-bit integer"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let images = model.reduction_images(&states)?;
+    let entries = states
+        .into_iter()
+        .zip(images)
+        .map(|(state, image)| {
+            let representative = image.map(|value| value.representative().to_string());
+            let phase = image.map(|value| [value.phase().re, value.phase().im]);
+            let amplitude = image.map(|value| [value.amplitude().re, value.amplitude().im]);
+            let orbit_size = image.map(|value| value.orbit_size());
+            ReductionEntry {
+                state: state.to_string(),
+                representative,
+                phase,
+                amplitude,
+                orbit_size,
+            }
+        })
+        .collect();
+    Ok(CommandResult::Reductions { entries })
 }
 
 fn command_eigh(model: &PackedEdModel, eigenvectors: bool) -> Result<CommandResult> {
@@ -1175,9 +1241,9 @@ fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> 
             handle,
             terms,
             kets,
-        } => {
-            let model = registered_model(&handle)?;
-            command_bra_ket_terms(&model, terms, kets)
+        } => registered_bra_ket_terms(&handle, terms, kets),
+        CommandRequest::ReduceStatesModel { handle, states } => {
+            registered_reduce_states(&handle, states)
         }
         CommandRequest::ProjectorModel {
             handle,
@@ -1672,5 +1738,44 @@ mod tests {
             .filter(|value| value[0].as_f64().unwrap().abs() > f64::EPSILON)
             .count();
         assert_eq!(nonzero, 1);
+    }
+
+    #[test]
+    fn registered_model_reports_reduction_metadata_for_physical_states() {
+        let create = run_command_json(
+            r#"{
+                "operation":"create_model",
+                "basis":{
+                    "kind":"spin",
+                    "sites":4,
+                    "up":2,
+                    "symmetries":[{
+                        "destinations":[1,2,3,0],
+                        "sector":1
+                    }]
+                },
+                "terms":[]
+            }"#,
+        );
+        let create: Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(create["status"], "ok");
+        let handle = create["result"]["handle"].as_str().unwrap();
+
+        let reduced = run_command_json(&format!(
+            r#"{{
+                "operation":"reduce_states_model",
+                "handle":"{handle}",
+                "states":["3","6","5","0"]
+            }}"#
+        ));
+        let reduced: Value = serde_json::from_str(&reduced).unwrap();
+        assert_eq!(reduced["status"], "ok");
+        let entries = reduced["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["representative"], "3");
+        assert_eq!(entries[0]["orbit_size"], 4);
+        assert!((entries[0]["amplitude"][0].as_f64().unwrap() - 0.5).abs() < 1.0e-12);
+        assert_eq!(entries[1]["representative"], "3");
+        assert!(entries[2].get("representative").is_none());
+        assert!(entries[3].get("representative").is_none());
     }
 }

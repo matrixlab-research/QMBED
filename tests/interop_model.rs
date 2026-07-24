@@ -283,6 +283,7 @@ fn packed_models_project_between_explicit_parent_spaces() {
     let fixed_parent = PackedEdModel::new(SpinBasis1D::builder(4).up(2).build().unwrap(), []);
     let full_parent = PackedEdModel::new(SpinBasis1D::builder(4).build().unwrap(), []);
     let vectors = vec![vec![Complex64::new(0.25, -0.5); reduced.dimension()]];
+    let images = reduced.reduction_images(&[3, 6, 5, 0]).unwrap();
 
     let fixed_lifted = reduced.lift_to_batch(&fixed_parent, &vectors).unwrap();
     let full_lifted = reduced.lift_to_batch(&full_parent, &vectors).unwrap();
@@ -300,6 +301,16 @@ fn packed_models_project_between_explicit_parent_spaces() {
             .unwrap(),
         vectors
     );
+    let representative = images[0].unwrap();
+    assert_eq!(*representative.representative(), 3);
+    assert_eq!(representative.orbit_size(), 4);
+    assert!((representative.amplitude().norm() - 0.5).abs() < 1.0e-12);
+    assert_eq!(
+        images[1].unwrap().representative(),
+        representative.representative()
+    );
+    assert!(images[2].is_none());
+    assert!(images[3].is_none());
 }
 
 #[test]

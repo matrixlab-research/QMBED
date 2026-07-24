@@ -37,6 +37,45 @@ fn runtime_translation_matches_the_builtin_spin_sector() {
 }
 
 #[test]
+fn generated_group_closure_supports_noncommuting_trivial_characters() {
+    let sites = 4;
+    let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
+    let reflection = LatticeSymmetryMap::site_permutation(2, vec![3, 2, 1, 0]).unwrap();
+    let dihedral = GeneralBasis::new(
+        SpinBasis1D::builder(sites).build().unwrap(),
+        SymmetrySector::new()
+            .with_map(translation, 0)
+            .with_map(reflection, 0),
+    )
+    .unwrap();
+
+    let representatives = (0..dihedral.len())
+        .map(|index| dihedral.state(index).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(representatives, vec![0, 1, 3, 5, 7, 15]);
+    let image = dihedral.reduction_image(8).unwrap().unwrap();
+    assert_eq!(*image.representative(), 1);
+    assert_eq!(image.orbit_size(), 4);
+    assert!((image.amplitude().norm() - 0.5).abs() < 1.0e-12);
+}
+
+#[test]
+fn inconsistent_generator_phases_remove_incompatible_orbits() {
+    let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
+    let reflection = LatticeSymmetryMap::site_permutation(2, vec![3, 2, 1, 0]).unwrap();
+    let incompatible = GeneralBasis::new(
+        SpinBasis1D::builder(4).build().unwrap(),
+        SymmetrySector::new()
+            .with_map(translation, 1)
+            .with_map(reflection, 0),
+    )
+    .unwrap();
+
+    assert!(incompatible.is_empty());
+    assert!(incompatible.reduction_image(1).unwrap().is_none());
+}
+
+#[test]
 fn local_digit_permutations_cover_spin_inversion() {
     let sites = 4;
     let inversion = LatticeSymmetryMap::new(
