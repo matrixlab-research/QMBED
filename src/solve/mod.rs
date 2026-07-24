@@ -109,6 +109,14 @@ pub struct EigshOptions {
     pub seed: u64,
 }
 
+const GUARANTEED_DENSE_EIGSH_CROSSOVER: usize = 128;
+const AUTOMATIC_DENSE_EIGSH_CROSSOVER: usize = 256;
+
+fn use_dense_eigsh(dimension: usize, options: &EigshOptions) -> bool {
+    dimension <= GUARANTEED_DENSE_EIGSH_CROSSOVER
+        || (dimension <= AUTOMATIC_DENSE_EIGSH_CROSSOVER && options.krylov_dimension.is_none())
+}
+
 impl EigshOptions {
     pub fn smallest_algebraic(eigenpairs: usize) -> Self {
         Self {
@@ -610,7 +618,7 @@ where
     let dimension = operator.shape().0;
     let requested_dimension = options
         .krylov_dimension
-        .unwrap_or_else(|| (4 * options.eigenpairs + 24).max(48));
+        .unwrap_or_else(|| (8 * options.eigenpairs + 64).max(256));
     let krylov_dimension = requested_dimension
         .min(options.max_iterations)
         .min(dimension);
@@ -661,10 +669,16 @@ where
             }
         }
 
-        for vector in &basis {
-            let overlap = real_inner(vector, &output);
-            for (value, basis_value) in output.iter_mut().zip(vector) {
-                *value -= overlap * *basis_value;
+        // A second modified Gram-Schmidt pass is necessary when extremal
+        // Ritz values are clustered. Without it, a nominally complete
+        // Krylov space can still return residuals above the requested
+        // tolerance because roundoff reintroduces earlier Lanczos vectors.
+        for _ in 0..2 {
+            for vector in &basis {
+                let overlap = real_inner(vector, &output);
+                for (value, basis_value) in output.iter_mut().zip(vector) {
+                    *value -= overlap * *basis_value;
+                }
             }
         }
         let beta = real_vector_norm(&output);
@@ -785,7 +799,7 @@ where
     let dimension = operator.shape().0;
     let requested_dimension = options
         .krylov_dimension
-        .unwrap_or_else(|| (4 * options.eigenpairs + 24).max(48));
+        .unwrap_or_else(|| (8 * options.eigenpairs + 64).max(256));
     let krylov_dimension = requested_dimension
         .min(options.max_iterations)
         .min(dimension);
@@ -837,13 +851,14 @@ where
             }
         }
 
-        // Full modified Gram-Schmidt reorthogonalization keeps multiple and
-        // interior Ritz vectors reliable without the quadratic cost of a
-        // second unconditional pass.
-        for vector in &basis {
-            let overlap = inner(vector, &output);
-            for (value, basis_value) in output.iter_mut().zip(vector) {
-                *value -= overlap * *basis_value;
+        // Two-pass modified Gram-Schmidt keeps clustered, multiple, and
+        // interior Ritz vectors reliable at the requested residual.
+        for _ in 0..2 {
+            for vector in &basis {
+                let overlap = inner(vector, &output);
+                for (value, basis_value) in output.iter_mut().zip(vector) {
+                    *value -= overlap * *basis_value;
+                }
             }
         }
         let beta = vector_norm(&output);
@@ -946,7 +961,7 @@ where
         ));
     }
     options.validate(shape.0)?;
-    if shape.0 > 128 {
+    if !use_dense_eigsh(shape.0, &options) {
         return lanczos_eigsh(operator, &options, None);
     }
     let (values, vectors) = hermitian_eigenpairs_all(operator)?;
@@ -998,7 +1013,12 @@ where
         ));
     }
     options.validate(shape.0)?;
-    if shape.0 <= 128 {
+    if initial.len() != shape.0 {
+        return Err(QmbedError::DimensionMismatch(
+            "eigsh initial vector does not match the operator".into(),
+        ));
+    }
+    if use_dense_eigsh(shape.0, &options) {
         return eigsh(operator, options);
     }
     lanczos_eigsh(operator, &options, Some(initial))

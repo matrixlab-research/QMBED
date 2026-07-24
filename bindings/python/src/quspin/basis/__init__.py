@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import scipy.sparse as sp
 
-from qmbed._ffi import NativeModel, command
+from qmbed._ffi import NativeBasisPlan, NativeModel, command
 from qmbed.compat.quspin import operator_term
 from qmbed.model import Coupling
 
@@ -180,6 +180,12 @@ class _PackedBasis:
 
     @cached_property
     def _model(self) -> NativeModel:
+        if hasattr(self, "_basis_plan"):
+            if not self._made_basis:
+                raise AttributeError(
+                    "basis has not been constructed; call basis.make() first"
+                )
+            return self._materialized_model
         return NativeModel(
             {
                 "basis": self._request,
@@ -192,6 +198,33 @@ class _PackedBasis:
                 },
             }
         )
+
+    def _initialize_general_basis(self, *, make_basis: bool) -> None:
+        self._made_basis = False
+        self._basis_plan = NativeBasisPlan(
+            {
+                "basis": self._request,
+                "site_permutation": self._site_permutation,
+                "checks": {
+                    "hermiticity": False,
+                    "particle_conservation": False,
+                    "symmetry_compatibility": False,
+                },
+            }
+        )
+        if make_basis:
+            self.make()
+
+    def make(self, Ns_block_est=None, N_p=None):
+        del Ns_block_est, N_p
+        plan = getattr(self, "_basis_plan", None)
+        if plan is None or self._made_basis:
+            return None
+        self._materialized_model = plan.materialize()
+        self._made_basis = True
+        self.__dict__.pop("_model", None)
+        self.__dict__.pop("_description", None)
+        return None
 
     @cached_property
     def _description(self) -> dict[str, Any]:
@@ -292,16 +325,22 @@ class _PackedBasis:
     def _parent_model(self, *, pcon: bool) -> NativeModel:
         return self._particle_parent_model if pcon else self._full_parent_model
 
-    def _reduction_entries(self, states) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    def _reduction_entries(
+        self, states
+    ) -> tuple[np.ndarray, list[dict[str, Any]], int]:
         array = np.asarray(states, dtype=self.dtype, order="C")
         array = np.atleast_1d(array)
         if array.ndim != 1:
             raise TypeError("dimension of array_like states must not exceed 1.")
-        result = self._model.execute(
-            "reduce_states_model",
-            states=[str(int(state)) for state in array],
-        )
-        return array, list(result["entries"])
+        encoded = [str(int(state)) for state in array]
+        plan = getattr(self, "_basis_plan", None)
+        if plan is None:
+            result = self._model.execute("reduce_states_model", states=encoded)
+            period_product = self._symmetry_period_product()
+        else:
+            result = plan.execute("reduce_states_plan", states=encoded)
+            period_product = int(result["period_product"])
+        return array, list(result["entries"]), period_product
 
     def representative(
         self,
@@ -310,11 +349,7 @@ class _PackedBasis:
         return_g: bool = False,
         return_sign: bool = False,
     ):
-        if return_g or return_sign:
-            raise NotImplementedError(
-                "generator powers and fermionic representative signs are not exposed yet"
-            )
-        array, entries = self._reduction_entries(states)
+        array, entries, _period_product = self._reduction_entries(states)
         representatives = np.asarray(
             [
                 int(entry.get("representative", entry["state"]))
@@ -322,16 +357,41 @@ class _PackedBasis:
             ],
             dtype=self.dtype,
         )
-        if out is None:
+        if out is not None:
+            if not isinstance(out, np.ndarray):
+                raise TypeError("out must be a numpy.ndarray")
+            if out.shape != array.shape or out.dtype != self.dtype:
+                raise TypeError("out must have the same shape and dtype as states")
+            if not out.flags["CARRAY"]:
+                raise ValueError("out must be a writable C-contiguous array")
+            out[...] = representatives
+
+        extras = []
+        if return_g:
+            generators = len(self._request.get("symmetries", []))
+            generator_counts = np.zeros((array.size, generators), dtype=np.int32)
+            for row, entry in enumerate(entries):
+                for generator in entry.get("generator_word", []):
+                    generator_counts[row, int(generator)] += 1
+            extras.append(generator_counts)
+        if return_sign:
+            signs = np.ones(array.shape, dtype=np.int8)
+            for row, entry in enumerate(entries):
+                phase = complex(*entry.get("physical_phase_to_representative", [1.0, 0.0]))
+                if abs(phase.imag) > 1.0e-10 or abs(abs(phase.real) - 1.0) > 1.0e-10:
+                    raise ValueError(
+                        "representative sign requires a real fermionic map phase"
+                    )
+                signs[row] = 1 if phase.real >= 0.0 else -1
+            extras.append(signs)
+
+        if out is not None:
+            if not extras:
+                return None
+            return extras[0] if len(extras) == 1 else tuple(extras)
+        if not extras:
             return representatives
-        if not isinstance(out, np.ndarray):
-            raise TypeError("out must be a numpy.ndarray")
-        if out.shape != array.shape or out.dtype != self.dtype:
-            raise TypeError("out must have the same shape and dtype as states")
-        if not out.flags["CARRAY"]:
-            raise ValueError("out must be a writable C-contiguous array")
-        out[...] = representatives
-        return None
+        return (representatives, *extras)
 
     def _symmetry_period_product(self) -> int:
         if self._request["kind"] == "spin":
@@ -345,13 +405,28 @@ class _PackedBasis:
             for request in self._request.get("symmetries", [])
         )
 
+    @property
+    def _pers(self) -> np.ndarray:
+        if self._request["kind"] == "spin":
+            states_per_site = int(self._request.get("spin_twice", 1)) + 1
+        elif self._request["kind"] == "boson":
+            states_per_site = int(self._request["states_per_site"])
+        else:
+            states_per_site = 2
+        return np.asarray(
+            [
+                _symmetry_period(request, states_per_site)
+                for request in self._request.get("symmetries", [])
+            ],
+            dtype=np.int64,
+        )
+
     def normalization(self, states, out=None):
-        array, entries = self._reduction_entries(states)
-        period_product = self._symmetry_period_product()
+        array, entries, period_product = self._reduction_entries(states)
         values = np.asarray(
             [
                 0
-                if "orbit_size" not in entry
+                if not entry.get("compatible", "orbit_size" in entry)
                 else period_product * period_product // int(entry["orbit_size"])
                 for entry in entries
             ],
@@ -374,7 +449,7 @@ class _PackedBasis:
             raise ValueError(
                 "mode accepts only the values 'representative' and 'full_basis'."
             )
-        array, entries = self._reduction_entries(states)
+        array, entries, _period_product = self._reduction_entries(states)
         if out is None:
             output_dtype = np.complex128 if amps is None else np.asarray(amps).dtype
             out = np.zeros(array.shape, dtype=output_dtype)
@@ -392,7 +467,9 @@ class _PackedBasis:
                 raise ValueError("out must be C-contiguous array.")
         factors = np.asarray(
             [
-                0.0 if "amplitude" not in entry else complex(*entry["amplitude"])
+                0.0
+                if not entry.get("compatible", "amplitude" in entry)
+                else complex(*entry["amplitude"])
                 for entry in entries
             ],
             dtype=np.complex128,
@@ -857,8 +934,6 @@ class spin_basis_general(_PackedBasis):
         **blocks,
     ):
         spin_twice = _spin_twice(S)
-        if not make_basis:
-            raise NotImplementedError("deferred general-basis construction is not implemented")
         if block_order is not None:
             ordered = {
                 name: blocks.pop(name)
@@ -889,6 +964,7 @@ class spin_basis_general(_PackedBasis):
             ),
             "reverse": True,
         }
+        self._initialize_general_basis(make_basis=bool(make_basis))
 
 
 class boson_basis_general(_PackedBasis):
@@ -897,8 +973,18 @@ class boson_basis_general(_PackedBasis):
         N: int,
         Nb: int | None = None,
         sps: int | None = None,
+        make_basis: bool = True,
+        block_order=None,
         **blocks,
     ):
+        if block_order is not None:
+            ordered = {
+                name: blocks.pop(name)
+                for name in block_order
+                if name in blocks
+            }
+            ordered.update(blocks)
+            blocks = ordered
         self.N = int(N)
         states_per_site = int(
             sps if sps is not None else (Nb + 1 if Nb is not None else 2)
@@ -915,6 +1001,7 @@ class boson_basis_general(_PackedBasis):
             ),
             "reverse": True,
         }
+        self._initialize_general_basis(make_basis=bool(make_basis))
 
 
 class spinless_fermion_basis_general(_PackedBasis):
@@ -922,8 +1009,18 @@ class spinless_fermion_basis_general(_PackedBasis):
         self,
         N: int,
         Nf: int | None = None,
+        make_basis: bool = True,
+        block_order=None,
         **blocks,
     ):
+        if block_order is not None:
+            ordered = {
+                name: blocks.pop(name)
+                for name in block_order
+                if name in blocks
+            }
+            ordered.update(blocks)
+            blocks = ordered
         if Nf is not None and not isinstance(Nf, (int, np.integer)):
             raise NotImplementedError("unions of fermion particle sectors are not implemented")
         self.N = int(N)
@@ -940,6 +1037,7 @@ class spinless_fermion_basis_general(_PackedBasis):
             ),
             "reverse": True,
         }
+        self._initialize_general_basis(make_basis=bool(make_basis))
 
 
 class spinful_fermion_basis_general(_PackedBasis):
@@ -947,8 +1045,18 @@ class spinful_fermion_basis_general(_PackedBasis):
         self,
         N: int,
         Nf: tuple[int, int] | None = None,
+        make_basis: bool = True,
+        block_order=None,
         **blocks,
     ):
+        if block_order is not None:
+            ordered = {
+                name: blocks.pop(name)
+                for name in block_order
+                if name in blocks
+            }
+            ordered.update(blocks)
+            blocks = ordered
         self.N = int(N)
         particles_up, particles_down = (None, None) if Nf is None else Nf
         spatial_symmetries = _general_symmetries(
@@ -975,6 +1083,7 @@ class spinful_fermion_basis_general(_PackedBasis):
             "symmetries": symmetries,
             "reverse": True,
         }
+        self._initialize_general_basis(make_basis=bool(make_basis))
 
 
 __all__ = [

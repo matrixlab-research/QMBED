@@ -34,11 +34,18 @@ Python `get_proj`, `project_from`, `project_to`, `get_vec`, and
 `Op_shift_sector`; `pcon` only chooses which explicit parent model the Python
 adapter requests.
 
-`reduce_states_model` exposes the same reduction contract without building an
-operator: for each physical state it returns the canonical representative,
-orbit size, phase, and normalized coefficient. Projector construction consumes
-that contract directly, so Python `representative`, `normalization`, and
-`get_amp` cannot drift from `get_proj`.
+Reduction can also precede basis enumeration. `create_basis_plan` compiles a
+serializable finite-group action into a `SymmetryReducer` handle;
+`reduce_states_plan` returns the canonical representative, compatibility,
+orbit size, character phase, physical map phase, and exact generator word.
+`materialize_basis_plan` later enumerates the requested parent sector with that
+same reducer and returns a normal model handle. A 64-site fixed-particle plan
+is tested without attempting to enumerate its parent Hilbert space.
+
+For an already materialized model, `reduce_states_model` exposes the matching
+representative, orbit, phase, and normalized coefficient. Projector
+construction consumes the same core reduction contract, so Python
+`representative`, `normalization`, `get_amp`, and `get_proj` cannot drift.
 
 - `python/` exposes the native `qmbed` module and the versioned
   `qmbed.compat.quspin` migration surface.

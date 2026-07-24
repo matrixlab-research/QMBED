@@ -1315,6 +1315,10 @@ impl BosonBasis1D {
             match op {
                 'I' => {}
                 'n' => amplitude *= occupation as f64,
+                'z' => {
+                    amplitude *=
+                        occupation as f64 - 0.5 * (self.states_per_site.saturating_sub(1)) as f64;
+                }
                 '+' if occupation + 1 < base => {
                     state += place;
                     amplitude *= ((occupation + 1) as f64).sqrt();
@@ -1541,7 +1545,7 @@ fn apply_fermion(mut state: u128, orbital: usize, op: char) -> Result<Option<(u1
         'z' => {
             return Ok(Some((
                 state,
-                Complex64::new(if occupied { 1.0 } else { -1.0 }, 0.0),
+                Complex64::new(if occupied { 0.5 } else { -0.5 }, 0.0),
             )));
         }
         '+' if !occupied => {
@@ -2619,6 +2623,7 @@ where
     }
 }
 
+#[derive(Clone)]
 struct SymmetryGenerator<State> {
     map: Arc<dyn SymmetryMap<State>>,
     sector: i32,
@@ -2626,11 +2631,21 @@ struct SymmetryGenerator<State> {
 
 /// Finite generators and sector phases that extend to a one-dimensional
 /// character of the generated group.
-pub struct SymmetrySector<State> {
+#[derive(Clone)]
+pub struct SymmetryReducer<State> {
     generators: Vec<SymmetryGenerator<State>>,
 }
 
-impl<State> SymmetrySector<State> {
+impl<State> std::fmt::Debug for SymmetryReducer<State> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SymmetryReducer")
+            .field("generators", &self.generators.len())
+            .finish()
+    }
+}
+
+impl<State> SymmetryReducer<State> {
     pub fn new() -> Self {
         Self {
             generators: Vec::new(),
@@ -2651,11 +2666,70 @@ impl<State> SymmetrySector<State> {
     pub fn generators(&self) -> usize {
         self.generators.len()
     }
+
+    /// Product of declared generator periods.
+    ///
+    /// This is not generally the order of a non-Abelian generated group. It is
+    /// exposed because compatibility layers such as QuSpin define their
+    /// historical normalization convention from this product.
+    pub fn period_product(&self) -> Result<usize> {
+        self.generators
+            .iter()
+            .try_fold(1_usize, |product, generator| {
+                product.checked_mul(generator.map.period()).ok_or_else(|| {
+                    QmbedError::UnsupportedBackend("symmetry period product is too large".into())
+                })
+            })
+    }
 }
 
-impl<State> Default for SymmetrySector<State> {
+impl<State> Default for SymmetryReducer<State> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Backward-compatible name for a reducer configured with one sector
+/// character per generator.
+pub type SymmetrySector<State> = SymmetryReducer<State>;
+
+/// Result of reducing one physical state without materializing a basis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SymmetryOrbit<State> {
+    representative: State,
+    orbit_size: usize,
+    compatible: bool,
+    phase: Option<Complex64>,
+    physical_phase_to_representative: Complex64,
+    generator_word: Vec<usize>,
+}
+
+impl<State> SymmetryOrbit<State> {
+    pub const fn representative(&self) -> &State {
+        &self.representative
+    }
+
+    pub const fn orbit_size(&self) -> usize {
+        self.orbit_size
+    }
+
+    pub const fn is_compatible(&self) -> bool {
+        self.compatible
+    }
+
+    /// Unit phase of the queried physical state in the representative vector.
+    pub const fn phase(&self) -> Option<Complex64> {
+        self.phase
+    }
+
+    /// Physical map phase acquired along the returned generator word.
+    pub const fn physical_phase_to_representative(&self) -> Complex64 {
+        self.physical_phase_to_representative
+    }
+
+    /// Generator indices applied in order to reach the representative.
+    pub fn generator_word(&self) -> &[usize] {
+        &self.generator_word
     }
 }
 
@@ -2666,10 +2740,17 @@ struct GeneralSymmetryImage<State> {
     orbit_size: usize,
 }
 
+struct SymmetryTrace<State> {
+    coefficients: HashMap<State, Complex64>,
+    physical_phases: HashMap<State, Complex64>,
+    predecessors: HashMap<State, (State, usize)>,
+    compatible: bool,
+}
+
 fn trace_symmetry_orbit<State>(
     state: State,
     generators: &[SymmetryGenerator<State>],
-) -> Result<(HashMap<State, Complex64>, bool)>
+) -> Result<SymmetryTrace<State>>
 where
     State: Copy + Eq + Hash,
 {
@@ -2706,11 +2787,17 @@ where
 
     let mut coefficients = HashMap::new();
     coefficients.insert(state, Complex64::new(1.0, 0.0));
+    let mut physical_phases = HashMap::new();
+    physical_phases.insert(state, Complex64::new(1.0, 0.0));
+    let mut predecessors = HashMap::new();
     let mut queue = VecDeque::from([state]);
     let mut compatible = true;
     while let Some(source) = queue.pop_front() {
         let source_coefficient = coefficients[&source];
-        for (generator, &sector_step) in generators.iter().zip(&sector_steps) {
+        let source_physical_phase = physical_phases[&source];
+        for (generator_index, (generator, &sector_step)) in
+            generators.iter().zip(&sector_steps).enumerate()
+        {
             let (target, map_phase) = generator.map.apply(source)?;
             if !map_phase.re.is_finite() || !map_phase.im.is_finite() {
                 return Err(QmbedError::IncompatibleSymmetry(
@@ -2724,11 +2811,60 @@ where
                 }
             } else {
                 coefficients.insert(target, target_coefficient);
+                physical_phases.insert(target, source_physical_phase * map_phase);
+                predecessors.insert(target, (source, generator_index));
                 queue.push_back(target);
             }
         }
     }
-    Ok((coefficients, compatible))
+    Ok(SymmetryTrace {
+        coefficients,
+        physical_phases,
+        predecessors,
+        compatible,
+    })
+}
+
+impl<State> SymmetryReducer<State>
+where
+    State: Copy + Eq + Hash + Ord,
+{
+    /// Reduce one state using only the finite group action.
+    ///
+    /// This query does not enumerate a parent Hilbert space or construct the
+    /// reduced basis. Incompatible character requests still return the
+    /// canonical orbit representative, but have no reduced-vector phase.
+    pub fn orbit(&self, state: State) -> Result<SymmetryOrbit<State>> {
+        let trace = trace_symmetry_orbit(state, &self.generators)?;
+        let representative = *trace.coefficients.keys().min().ok_or_else(|| {
+            QmbedError::InternalState("a symmetry orbit contains no states".into())
+        })?;
+        let representative_coefficient = trace.coefficients[&representative];
+        let phase = trace.compatible.then(|| {
+            let gauge = representative_coefficient / representative_coefficient.norm();
+            gauge.conj()
+        });
+        let mut generator_word = Vec::new();
+        let mut cursor = representative;
+        while cursor != state {
+            let &(previous, generator) = trace.predecessors.get(&cursor).ok_or_else(|| {
+                QmbedError::InternalState(
+                    "a symmetry-orbit representative has no predecessor path".into(),
+                )
+            })?;
+            generator_word.push(generator);
+            cursor = previous;
+        }
+        generator_word.reverse();
+        Ok(SymmetryOrbit {
+            representative,
+            orbit_size: trace.coefficients.len(),
+            compatible: trace.compatible,
+            phase,
+            physical_phase_to_representative: trace.physical_phases[&representative],
+            generator_word,
+        })
+    }
 }
 
 /// Arbitrary finite-map reduction of any concrete parent basis.
@@ -2739,6 +2875,7 @@ where
     Parent::State: Hash + Ord,
 {
     parent: Parent,
+    reducer: SymmetryReducer<Parent::State>,
     states: Vec<Parent::State>,
     orbit_lengths: Vec<usize>,
     lookup: HashMap<Parent::State, GeneralSymmetryImage<Parent::State>>,
@@ -2750,7 +2887,12 @@ where
     Parent::State: Hash + Ord,
 {
     pub fn new(parent: Parent, sector: SymmetrySector<Parent::State>) -> Result<Self> {
-        if sector.generators.is_empty() {
+        Self::from_reducer(parent, sector)
+    }
+
+    /// Materialize a reduced basis from an independently reusable reducer.
+    pub fn from_reducer(parent: Parent, reducer: SymmetryReducer<Parent::State>) -> Result<Self> {
+        if reducer.generators.is_empty() {
             let mut states = Vec::with_capacity(parent.len());
             let mut lookup = HashMap::with_capacity(parent.len());
             for index in 0..parent.len() {
@@ -2768,6 +2910,7 @@ where
             states.sort_unstable();
             return Ok(Self {
                 parent,
+                reducer,
                 orbit_lengths: vec![1; states.len()],
                 states,
                 lookup,
@@ -2782,8 +2925,8 @@ where
             if visited.contains(&seed) {
                 continue;
             }
-            let (coefficients, compatible) = trace_symmetry_orbit(seed, &sector.generators)?;
-            for state in coefficients.keys() {
+            let trace = trace_symmetry_orbit(seed, &reducer.generators)?;
+            for state in trace.coefficients.keys() {
                 parent.index(*state).map_err(|_| {
                     QmbedError::IncompatibleSymmetry(
                         "a symmetry map leaves the parent basis".into(),
@@ -2791,22 +2934,23 @@ where
                 })?;
                 visited.insert(*state);
             }
-            if !compatible {
+            if !trace.compatible {
                 continue;
             }
-            let representative = *coefficients.keys().min().ok_or_else(|| {
+            let representative = *trace.coefficients.keys().min().ok_or_else(|| {
                 QmbedError::InvalidSector("symmetry projection generated no state".into())
             })?;
-            let representative_coefficient = coefficients[&representative];
+            let representative_coefficient = trace.coefficients[&representative];
             let gauge = representative_coefficient / representative_coefficient.norm();
-            let norm = coefficients
+            let norm = trace
+                .coefficients
                 .values()
                 .map(Complex64::norm_sqr)
                 .sum::<f64>()
                 .sqrt();
-            let orbit_size = coefficients.len();
+            let orbit_size = trace.coefficients.len();
             let expected_magnitude = 1.0 / (orbit_size as f64).sqrt();
-            for (&state, &coefficient) in &coefficients {
+            for (&state, &coefficient) in &trace.coefficients {
                 let normalized = coefficient / (gauge * norm);
                 if (normalized.norm() - expected_magnitude).abs() > 1.0e-10 {
                     return Err(QmbedError::IncompatibleSymmetry(
@@ -2828,6 +2972,7 @@ where
         let (states, orbit_lengths) = representatives.into_iter().unzip();
         Ok(Self {
             parent,
+            reducer,
             states,
             orbit_lengths,
             lookup,
@@ -2836,6 +2981,10 @@ where
 
     pub fn parent(&self) -> &Parent {
         &self.parent
+    }
+
+    pub const fn reducer(&self) -> &SymmetryReducer<Parent::State> {
+        &self.reducer
     }
 
     pub fn representative(&self, state: Parent::State) -> Result<Parent::State> {

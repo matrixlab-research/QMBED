@@ -8,8 +8,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use qmbed::basis::{
     Basis, BasisProjector, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap,
-    PackedBasis, SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D, SpinlessFermionBasis1D,
-    SymmetrySector,
+    PackedBasis, ReductionImage, SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D,
+    SpinlessFermionBasis1D, SymmetryReducer, SymmetrySector,
 };
 use qmbed::interop::{OperatorAction, PackedEdModel};
 use qmbed::operator::{
@@ -68,6 +68,22 @@ enum CommandRequest {
         site_permutation: Option<Vec<usize>>,
         #[serde(default)]
         checks: ChecksRequest,
+    },
+    CreateBasisPlan {
+        basis: BasisRequest,
+        site_permutation: Option<Vec<usize>>,
+        #[serde(default)]
+        checks: ChecksRequest,
+    },
+    ReduceStatesPlan {
+        plan_handle: String,
+        states: Vec<String>,
+    },
+    MaterializeBasisPlan {
+        plan_handle: String,
+    },
+    ReleaseBasisPlan {
+        plan_handle: String,
     },
     DescribeModel {
         handle: String,
@@ -157,7 +173,7 @@ impl From<ChecksRequest> for AssemblyChecks {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BasisRequest {
     Spin {
@@ -226,7 +242,7 @@ struct CouplingRequest {
     sites: Vec<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SymmetryRequest {
     destinations: Vec<usize>,
     local_permutations: Option<Vec<Vec<usize>>>,
@@ -317,6 +333,11 @@ struct ReductionEntry {
     amplitude: Option<[f64; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     orbit_size: Option<usize>,
+    compatible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    physical_phase_to_representative: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generator_word: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -339,6 +360,8 @@ enum CommandResult {
         entries: Vec<TransitionEntry>,
     },
     Reductions {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        period_product: Option<usize>,
         entries: Vec<ReductionEntry>,
     },
     Eigensystem {
@@ -354,6 +377,9 @@ enum CommandResult {
         handle: String,
         dimension: usize,
     },
+    BasisPlan {
+        handle: String,
+    },
     Released {
         handle: String,
     },
@@ -361,12 +387,26 @@ enum CommandResult {
 
 static NEXT_MODEL_HANDLE: AtomicU64 = AtomicU64::new(1);
 static MODEL_REGISTRY: OnceLock<RwLock<HashMap<u64, Arc<PackedEdModel>>>> = OnceLock::new();
+static NEXT_BASIS_PLAN_HANDLE: AtomicU64 = AtomicU64::new(1);
+static BASIS_PLAN_REGISTRY: OnceLock<RwLock<HashMap<u64, Arc<RegisteredBasisPlan>>>> =
+    OnceLock::new();
 type ProjectorKey = (u64, u64);
 type ProjectorCache = HashMap<ProjectorKey, Arc<BasisProjector>>;
 static PROJECTOR_REGISTRY: OnceLock<RwLock<ProjectorCache>> = OnceLock::new();
 
 fn model_registry() -> &'static RwLock<HashMap<u64, Arc<PackedEdModel>>> {
     MODEL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+struct RegisteredBasisPlan {
+    basis: BasisRequest,
+    reducer: SymmetryReducer<u128>,
+    site_permutation: Option<Vec<usize>>,
+    checks: AssemblyChecks,
+}
+
+fn basis_plan_registry() -> &'static RwLock<HashMap<u64, Arc<RegisteredBasisPlan>>> {
+    BASIS_PLAN_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn projector_registry() -> &'static RwLock<ProjectorCache> {
@@ -383,6 +423,64 @@ fn parse_model_handle(handle: &str) -> Result<u64> {
         ));
     }
     Ok(parsed)
+}
+
+fn parse_basis_plan_handle(handle: &str) -> Result<u64> {
+    let parsed = handle.parse::<u64>().map_err(|_| {
+        QmbedError::InvalidOptions(format!(
+            "basis-plan handle {handle:?} is not a positive integer"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(QmbedError::InvalidOptions(
+            "basis-plan handle must be positive".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn register_basis_plan(plan: RegisteredBasisPlan) -> Result<String> {
+    let handle = NEXT_BASIS_PLAN_HANDLE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| QmbedError::InvalidOptions("basis-plan handle space is exhausted".into()))?;
+    let previous = basis_plan_registry()
+        .write()
+        .map_err(|_| QmbedError::InternalState("basis-plan registry lock is poisoned".into()))?
+        .insert(handle, Arc::new(plan));
+    if previous.is_some() {
+        return Err(QmbedError::InvalidOptions(format!(
+            "basis-plan handle {handle} is already registered"
+        )));
+    }
+    Ok(handle.to_string())
+}
+
+fn registered_basis_plan(handle: &str) -> Result<Arc<RegisteredBasisPlan>> {
+    let handle = parse_basis_plan_handle(handle)?;
+    basis_plan_registry()
+        .read()
+        .map_err(|_| QmbedError::InternalState("basis-plan registry lock is poisoned".into()))?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| {
+            QmbedError::InvalidOptions(format!("basis-plan handle {handle} is not registered"))
+        })
+}
+
+fn release_basis_plan(handle: &str) -> Result<String> {
+    let parsed = parse_basis_plan_handle(handle)?;
+    let removed = basis_plan_registry()
+        .write()
+        .map_err(|_| QmbedError::InternalState("basis-plan registry lock is poisoned".into()))?
+        .remove(&parsed);
+    if removed.is_none() {
+        return Err(QmbedError::InvalidOptions(format!(
+            "basis-plan handle {parsed} is not registered"
+        )));
+    }
+    Ok(parsed.to_string())
 }
 
 fn register_model(model: PackedEdModel) -> Result<String> {
@@ -576,15 +674,25 @@ fn execute(request: SolveRequest) -> Result<SolveResult> {
 }
 
 fn build_basis(request: &BasisRequest) -> Result<PackedBasis> {
+    build_basis_with_reducer(request, None)
+}
+
+fn build_basis_with_reducer(
+    request: &BasisRequest,
+    reducer: Option<&SymmetryReducer<u128>>,
+) -> Result<PackedBasis> {
     match request {
-        BasisRequest::Spin { .. } => build_spin_basis(request),
-        BasisRequest::Boson { .. } => build_boson_basis(request),
-        BasisRequest::SpinlessFermion { .. } => build_spinless_basis(request),
-        BasisRequest::SpinfulFermion { .. } => build_spinful_basis(request),
+        BasisRequest::Spin { .. } => build_spin_basis(request, reducer),
+        BasisRequest::Boson { .. } => build_boson_basis(request, reducer),
+        BasisRequest::SpinlessFermion { .. } => build_spinless_basis(request, reducer),
+        BasisRequest::SpinfulFermion { .. } => build_spinful_basis(request, reducer),
     }
 }
 
-fn build_spin_basis(request: &BasisRequest) -> Result<PackedBasis> {
+fn build_spin_basis(
+    request: &BasisRequest,
+    reducer: Option<&SymmetryReducer<u128>>,
+) -> Result<PackedBasis> {
     let BasisRequest::Spin {
         sites,
         spin_twice,
@@ -622,21 +730,27 @@ fn build_spin_basis(request: &BasisRequest) -> Result<PackedBasis> {
     let packed = if symmetries.is_empty() {
         basis.into()
     } else {
-        GeneralBasis::new(
+        GeneralBasis::from_reducer(
             basis,
-            runtime_symmetry_sector(
-                *sites,
-                usize::from(*spin_twice) + 1,
-                ExchangeStatistics::Distinguishable,
-                symmetries,
-            )?,
+            match reducer {
+                Some(reducer) => reducer.clone(),
+                None => runtime_symmetry_sector(
+                    *sites,
+                    usize::from(*spin_twice) + 1,
+                    ExchangeStatistics::Distinguishable,
+                    symmetries,
+                )?,
+            },
         )?
         .into()
     };
     Ok(ordered_basis(packed, *reverse))
 }
 
-fn build_boson_basis(request: &BasisRequest) -> Result<PackedBasis> {
+fn build_boson_basis(
+    request: &BasisRequest,
+    reducer: Option<&SymmetryReducer<u128>>,
+) -> Result<PackedBasis> {
     let BasisRequest::Boson {
         sites,
         particles,
@@ -655,21 +769,27 @@ fn build_boson_basis(request: &BasisRequest) -> Result<PackedBasis> {
     let packed = if symmetries.is_empty() {
         basis.into()
     } else {
-        GeneralBasis::new(
+        GeneralBasis::from_reducer(
             basis,
-            runtime_symmetry_sector(
-                *sites,
-                *states_per_site,
-                ExchangeStatistics::Distinguishable,
-                symmetries,
-            )?,
+            match reducer {
+                Some(reducer) => reducer.clone(),
+                None => runtime_symmetry_sector(
+                    *sites,
+                    *states_per_site,
+                    ExchangeStatistics::Distinguishable,
+                    symmetries,
+                )?,
+            },
         )?
         .into()
     };
     Ok(ordered_basis(packed, *reverse))
 }
 
-fn build_spinless_basis(request: &BasisRequest) -> Result<PackedBasis> {
+fn build_spinless_basis(
+    request: &BasisRequest,
+    reducer: Option<&SymmetryReducer<u128>>,
+) -> Result<PackedBasis> {
     let BasisRequest::SpinlessFermion {
         sites,
         particles,
@@ -696,16 +816,24 @@ fn build_spinless_basis(request: &BasisRequest) -> Result<PackedBasis> {
     let packed = if symmetries.is_empty() {
         basis.into()
     } else {
-        GeneralBasis::new(
+        GeneralBasis::from_reducer(
             basis,
-            runtime_symmetry_sector(*sites, 2, ExchangeStatistics::Fermionic, symmetries)?,
+            match reducer {
+                Some(reducer) => reducer.clone(),
+                None => {
+                    runtime_symmetry_sector(*sites, 2, ExchangeStatistics::Fermionic, symmetries)?
+                }
+            },
         )?
         .into()
     };
     Ok(ordered_basis(packed, *reverse))
 }
 
-fn build_spinful_basis(request: &BasisRequest) -> Result<PackedBasis> {
+fn build_spinful_basis(
+    request: &BasisRequest,
+    reducer: Option<&SymmetryReducer<u128>>,
+) -> Result<PackedBasis> {
     let BasisRequest::SpinfulFermion {
         sites,
         particles_up,
@@ -727,16 +855,19 @@ fn build_spinful_basis(request: &BasisRequest) -> Result<PackedBasis> {
     let packed = if symmetries.is_empty() {
         basis.into()
     } else {
-        GeneralBasis::new(
+        GeneralBasis::from_reducer(
             basis,
-            runtime_symmetry_sector(
-                sites.checked_mul(2).ok_or_else(|| {
-                    QmbedError::UnsupportedBackend("spinful orbital count is too large".into())
-                })?,
-                2,
-                ExchangeStatistics::Fermionic,
-                symmetries,
-            )?,
+            match reducer {
+                Some(reducer) => reducer.clone(),
+                None => runtime_symmetry_sector(
+                    sites.checked_mul(2).ok_or_else(|| {
+                        QmbedError::UnsupportedBackend("spinful orbital count is too large".into())
+                    })?,
+                    2,
+                    ExchangeStatistics::Fermionic,
+                    symmetries,
+                )?,
+            },
         )?
         .into()
     };
@@ -768,6 +899,67 @@ fn runtime_symmetry_sector(
     Ok(sector)
 }
 
+fn request_symmetry_reducer(request: &BasisRequest) -> Result<SymmetryReducer<u128>> {
+    match request {
+        BasisRequest::Spin {
+            sites,
+            spin_twice,
+            momentum,
+            parity,
+            symmetries,
+            ..
+        } => {
+            if momentum.is_some() || parity.is_some() {
+                return Err(QmbedError::InvalidOptions(
+                    "deferred basis plans require serializable symmetry generators; \
+                     encode built-in momentum/parity as lattice maps"
+                        .into(),
+                ));
+            }
+            runtime_symmetry_sector(
+                *sites,
+                usize::from(*spin_twice) + 1,
+                ExchangeStatistics::Distinguishable,
+                symmetries,
+            )
+        }
+        BasisRequest::Boson {
+            sites,
+            states_per_site,
+            symmetries,
+            ..
+        } => runtime_symmetry_sector(
+            *sites,
+            *states_per_site,
+            ExchangeStatistics::Distinguishable,
+            symmetries,
+        ),
+        BasisRequest::SpinlessFermion {
+            sites,
+            momentum,
+            symmetries,
+            ..
+        } => {
+            if momentum.is_some() {
+                return Err(QmbedError::InvalidOptions(
+                    "deferred basis plans require momentum as a serializable lattice map".into(),
+                ));
+            }
+            runtime_symmetry_sector(*sites, 2, ExchangeStatistics::Fermionic, symmetries)
+        }
+        BasisRequest::SpinfulFermion {
+            sites, symmetries, ..
+        } => runtime_symmetry_sector(
+            sites.checked_mul(2).ok_or_else(|| {
+                QmbedError::UnsupportedBackend("spinful orbital count is too large".into())
+            })?,
+            2,
+            ExchangeStatistics::Fermionic,
+            symmetries,
+        ),
+    }
+}
+
 fn ordered_basis(basis: PackedBasis, reverse: bool) -> PackedBasis {
     if reverse { basis.reversed() } else { basis }
 }
@@ -787,6 +979,34 @@ fn build_model(
         Some(permutation) => model.with_site_permutation(&permutation),
         None => Ok(model),
     }
+}
+
+fn create_basis_plan(
+    basis: BasisRequest,
+    site_permutation: Option<Vec<usize>>,
+    checks: AssemblyChecks,
+) -> Result<CommandResult> {
+    let reducer = request_symmetry_reducer(&basis)?;
+    let handle = register_basis_plan(RegisteredBasisPlan {
+        basis,
+        reducer,
+        site_permutation,
+        checks,
+    })?;
+    Ok(CommandResult::BasisPlan { handle })
+}
+
+fn materialize_basis_plan(handle: &str) -> Result<CommandResult> {
+    let plan = registered_basis_plan(handle)?;
+    let basis = build_basis_with_reducer(&plan.basis, Some(&plan.reducer))?;
+    let model = PackedEdModel::new(basis, []).with_checks(plan.checks);
+    let model = match &plan.site_permutation {
+        Some(permutation) => model.with_site_permutation(permutation)?,
+        None => model,
+    };
+    let dimension = model.dimension();
+    let handle = register_model(model)?;
+    Ok(CommandResult::Model { handle, dimension })
 }
 
 fn solve_model(
@@ -1067,8 +1287,8 @@ fn command_bra_ket_terms(
     Ok(CommandResult::Transitions { entries })
 }
 
-fn command_reduce_states(model: &PackedEdModel, states: Vec<String>) -> Result<CommandResult> {
-    let states = states
+fn parse_physical_states(states: Vec<String>) -> Result<Vec<u128>> {
+    states
         .into_iter()
         .map(|state| {
             state.parse::<u128>().map_err(|_| {
@@ -1077,7 +1297,11 @@ fn command_reduce_states(model: &PackedEdModel, states: Vec<String>) -> Result<C
                 ))
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+fn command_reduce_states(model: &PackedEdModel, states: Vec<String>) -> Result<CommandResult> {
+    let states = parse_physical_states(states)?;
     let images = model.reduction_images(&states)?;
     let entries = states
         .into_iter()
@@ -1093,10 +1317,52 @@ fn command_reduce_states(model: &PackedEdModel, states: Vec<String>) -> Result<C
                 phase,
                 amplitude,
                 orbit_size,
+                compatible: image.is_some(),
+                physical_phase_to_representative: None,
+                generator_word: None,
             }
         })
         .collect();
-    Ok(CommandResult::Reductions { entries })
+    Ok(CommandResult::Reductions {
+        period_product: None,
+        entries,
+    })
+}
+
+fn command_reduce_states_plan(
+    plan: &RegisteredBasisPlan,
+    states: Vec<String>,
+) -> Result<CommandResult> {
+    let states = parse_physical_states(states)?;
+    let period_product = plan.reducer.period_product()?;
+    let entries = states
+        .into_iter()
+        .map(|state| {
+            let orbit = plan.reducer.orbit(state)?;
+            let phase = orbit.phase();
+            let amplitude = phase
+                .map(|value| {
+                    ReductionImage::new(state, value, orbit.orbit_size())
+                        .map(|image| image.amplitude())
+                })
+                .transpose()?;
+            let physical_phase = orbit.physical_phase_to_representative();
+            Ok(ReductionEntry {
+                state: state.to_string(),
+                representative: Some(orbit.representative().to_string()),
+                phase: phase.map(|value| [value.re, value.im]),
+                amplitude: amplitude.map(|value| [value.re, value.im]),
+                orbit_size: Some(orbit.orbit_size()),
+                compatible: orbit.is_compatible(),
+                physical_phase_to_representative: Some([physical_phase.re, physical_phase.im]),
+                generator_word: Some(orbit.generator_word().to_vec()),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CommandResult::Reductions {
+        period_product: Some(period_product),
+        entries,
+    })
 }
 
 fn command_eigh(model: &PackedEdModel, eigenvectors: bool) -> Result<CommandResult> {
@@ -1184,24 +1450,18 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
             let handle = register_model(model)?;
             Ok(CommandResult::Model { handle, dimension })
         }
+        CommandRequest::CreateBasisPlan {
+            basis,
+            site_permutation,
+            checks,
+        } => create_basis_plan(basis, site_permutation, checks.into()),
         request => execute_registered_command(request),
     }
 }
 
 fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> {
     match request {
-        CommandRequest::DescribeModel { handle } => {
-            let model = registered_model(&handle)?;
-            let states = model
-                .states()?
-                .into_iter()
-                .map(|state| state.to_string())
-                .collect();
-            Ok(CommandResult::Basis {
-                dimension: model.dimension(),
-                states,
-            })
-        }
+        CommandRequest::DescribeModel { handle } => registered_describe_model(&handle),
         CommandRequest::MaterializeModel { handle, format } => {
             let model = registered_model(&handle)?;
             command_operator(&model, format)
@@ -1245,6 +1505,9 @@ fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> 
         CommandRequest::ReduceStatesModel { handle, states } => {
             registered_reduce_states(&handle, states)
         }
+        request @ (CommandRequest::ReduceStatesPlan { .. }
+        | CommandRequest::MaterializeBasisPlan { .. }
+        | CommandRequest::ReleaseBasisPlan { .. }) => execute_basis_plan_command(request),
         CommandRequest::ProjectorModel {
             handle,
             parent_handle,
@@ -1284,9 +1547,43 @@ fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> 
         | CommandRequest::Materialize { .. }
         | CommandRequest::Eigh { .. }
         | CommandRequest::Eigsh { .. }
-        | CommandRequest::CreateModel { .. } => {
+        | CommandRequest::CreateModel { .. }
+        | CommandRequest::CreateBasisPlan { .. } => {
             unreachable!("stateless command was pre-dispatched")
         }
+    }
+}
+
+fn registered_describe_model(handle: &str) -> Result<CommandResult> {
+    let model = registered_model(handle)?;
+    let states = model
+        .states()?
+        .into_iter()
+        .map(|state| state.to_string())
+        .collect();
+    Ok(CommandResult::Basis {
+        dimension: model.dimension(),
+        states,
+    })
+}
+
+fn execute_basis_plan_command(request: CommandRequest) -> Result<CommandResult> {
+    match request {
+        CommandRequest::ReduceStatesPlan {
+            plan_handle,
+            states,
+        } => {
+            let plan = registered_basis_plan(&plan_handle)?;
+            command_reduce_states_plan(&plan, states)
+        }
+        CommandRequest::MaterializeBasisPlan { plan_handle } => {
+            materialize_basis_plan(&plan_handle)
+        }
+        CommandRequest::ReleaseBasisPlan { plan_handle } => {
+            let handle = release_basis_plan(&plan_handle)?;
+            Ok(CommandResult::Released { handle })
+        }
+        _ => unreachable!("only basis-plan commands are routed here"),
     }
 }
 
@@ -1578,6 +1875,130 @@ mod tests {
         let invalid: Value = serde_json::from_str(&invalid).unwrap();
         assert_eq!(invalid["status"], "error");
         assert!(invalid["error"].as_str().unwrap().contains("expected 3"));
+    }
+
+    #[test]
+    fn basis_plan_reduces_large_states_without_enumerating_the_parent_basis() {
+        let destinations = (1..64).chain(std::iter::once(0)).collect::<Vec<_>>();
+        let create = run_command_json(&format!(
+            r#"{{
+                "operation":"create_basis_plan",
+                "basis":{{
+                    "kind":"spin",
+                    "sites":64,
+                    "up":32,
+                    "symmetries":[{{
+                        "destinations":{destinations:?},
+                        "sector":0
+                    }}]
+                }}
+            }}"#
+        ));
+        let create: Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(create["status"], "ok");
+        let handle = create["result"]["handle"].as_str().unwrap();
+
+        let reduce = run_command_json(&format!(
+            r#"{{
+                "operation":"reduce_states_plan",
+                "plan_handle":"{handle}",
+                "states":["1"]
+            }}"#
+        ));
+        let reduce: Value = serde_json::from_str(&reduce).unwrap();
+        assert_eq!(reduce["status"], "ok");
+        assert_eq!(reduce["result"]["period_product"], 64);
+        assert_eq!(reduce["result"]["entries"][0]["representative"], "1");
+        assert_eq!(reduce["result"]["entries"][0]["orbit_size"], 64);
+        assert_eq!(reduce["result"]["entries"][0]["compatible"], true);
+
+        let release = run_command_json(&format!(
+            r#"{{"operation":"release_basis_plan","plan_handle":"{handle}"}}"#
+        ));
+        let release: Value = serde_json::from_str(&release).unwrap();
+        assert_eq!(release["status"], "ok");
+
+        let stale = run_command_json(&format!(
+            r#"{{
+                "operation":"reduce_states_plan",
+                "plan_handle":"{handle}",
+                "states":["1"]
+            }}"#
+        ));
+        let stale: Value = serde_json::from_str(&stale).unwrap();
+        assert_eq!(stale["status"], "error");
+        assert!(
+            stale["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not registered")
+        );
+    }
+
+    #[test]
+    fn basis_plan_materializes_the_same_reducer_it_queries() {
+        let create = run_command_json(
+            r#"{
+                "operation":"create_basis_plan",
+                "basis":{
+                    "kind":"spin",
+                    "sites":4,
+                    "symmetries":[
+                        {"destinations":[1,2,3,0],"sector":0},
+                        {"destinations":[3,2,1,0],"sector":0}
+                    ]
+                }
+            }"#,
+        );
+        let create: Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(create["status"], "ok");
+        let plan_handle = create["result"]["handle"].as_str().unwrap();
+
+        let reduce = run_command_json(&format!(
+            r#"{{
+                "operation":"reduce_states_plan",
+                "plan_handle":"{plan_handle}",
+                "states":["8"]
+            }}"#
+        ));
+        let reduce: Value = serde_json::from_str(&reduce).unwrap();
+        assert_eq!(reduce["status"], "ok");
+        assert_eq!(reduce["result"]["entries"][0]["representative"], "1");
+        assert_eq!(
+            reduce["result"]["entries"][0]["generator_word"],
+            serde_json::json!([0])
+        );
+
+        let materialize = run_command_json(&format!(
+            r#"{{
+                "operation":"materialize_basis_plan",
+                "plan_handle":"{plan_handle}"
+            }}"#
+        ));
+        let materialize: Value = serde_json::from_str(&materialize).unwrap();
+        assert_eq!(materialize["status"], "ok");
+        assert_eq!(materialize["result"]["dimension"], 6);
+        let model_handle = materialize["result"]["handle"].as_str().unwrap();
+
+        let describe = run_command_json(&format!(
+            r#"{{"operation":"describe_model","handle":"{model_handle}"}}"#
+        ));
+        let describe: Value = serde_json::from_str(&describe).unwrap();
+        assert_eq!(
+            describe["result"]["states"],
+            serde_json::json!(["0", "1", "3", "5", "7", "15"])
+        );
+
+        let release_model = run_command_json(&format!(
+            r#"{{"operation":"release_model","handle":"{model_handle}"}}"#
+        ));
+        let release_model: Value = serde_json::from_str(&release_model).unwrap();
+        assert_eq!(release_model["status"], "ok");
+        let release_plan = run_command_json(&format!(
+            r#"{{"operation":"release_basis_plan","plan_handle":"{plan_handle}"}}"#
+        ));
+        let release_plan: Value = serde_json::from_str(&release_plan).unwrap();
+        assert_eq!(release_plan["status"], "ok");
     }
 
     #[test]

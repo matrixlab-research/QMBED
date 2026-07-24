@@ -1,7 +1,7 @@
 use qmbed::Complex64;
 use qmbed::basis::{
     Basis, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap, PackedBasis, SpinBasis1D,
-    SymmetryMap, SymmetrySector,
+    SymmetryMap, SymmetryReducer, SymmetrySector,
 };
 
 #[test]
@@ -57,6 +57,35 @@ fn generated_group_closure_supports_noncommuting_trivial_characters() {
     assert_eq!(*image.representative(), 1);
     assert_eq!(image.orbit_size(), 4);
     assert!((image.amplitude().norm() - 0.5).abs() < 1.0e-12);
+}
+
+#[test]
+fn reducer_queries_orbits_before_basis_materialization() {
+    let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
+    let reflection = LatticeSymmetryMap::site_permutation(2, vec![3, 2, 1, 0]).unwrap();
+    let reducer = SymmetryReducer::new()
+        .with_map(translation, 0)
+        .with_map(reflection, 0);
+
+    let orbit = reducer.orbit(8).unwrap();
+    assert_eq!(*orbit.representative(), 1);
+    assert_eq!(orbit.orbit_size(), 4);
+    assert!(orbit.is_compatible());
+    assert_eq!(orbit.phase(), Some(Complex64::new(1.0, 0.0)));
+    assert_eq!(
+        orbit.physical_phase_to_representative(),
+        Complex64::new(1.0, 0.0)
+    );
+    assert_eq!(orbit.generator_word(), &[0]);
+    assert_eq!(reducer.period_product().unwrap(), 8);
+
+    let basis =
+        GeneralBasis::from_reducer(SpinBasis1D::builder(4).build().unwrap(), reducer.clone())
+            .unwrap();
+    let image = basis.reduction_image(8).unwrap().unwrap();
+    assert_eq!(image.phase(), orbit.phase().unwrap());
+    assert_eq!(image.orbit_size(), orbit.orbit_size());
+    assert_eq!(basis.reducer().generators(), 2);
 }
 
 #[test]

@@ -137,6 +137,24 @@ fn built_in_basis_visible_anchors() {
 }
 
 #[test]
+fn particle_z_operators_are_centered_number_operators() {
+    let boson = BosonBasis1D::builder(1, 3).build().unwrap();
+    assert_eq!(boson.apply_local(0, "z", &[0]).unwrap(), Some((0, c(-1.0))));
+    assert_eq!(boson.apply_local(1, "z", &[0]).unwrap(), Some((1, c(0.0))));
+    assert_eq!(boson.apply_local(2, "z", &[0]).unwrap(), Some((2, c(1.0))));
+
+    let fermion = SpinlessFermionBasis1D::builder(1).build().unwrap();
+    assert_eq!(
+        fermion.apply_local(0, "z", &[0]).unwrap(),
+        Some((0, c(-0.5)))
+    );
+    assert_eq!(
+        fermion.apply_local(1, "z", &[0]).unwrap(),
+        Some((1, c(0.5)))
+    );
+}
+
+#[test]
 fn spin_translation_sector_uses_normalized_orbit_representatives() {
     let momentum_zero = SpinBasis1D::builder(4).up(2).momentum(0).build().unwrap();
     let momentum_one = SpinBasis1D::builder(4).up(2).momentum(1).build().unwrap();
