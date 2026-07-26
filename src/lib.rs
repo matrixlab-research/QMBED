@@ -9,8 +9,6 @@ pub mod archive;
 pub mod basis;
 /// Static and time-dependent block operators.
 pub mod block;
-/// Compatibility names that translate into the native QMBED implementation.
-pub mod compat;
 /// Time-dependent, Floquet, spectral, and correlation workflows.
 pub mod dynamics;
 /// Structured public error and result types.
@@ -28,7 +26,7 @@ pub mod solve;
 /// Composite workflows such as state tracking and Lindblad generators.
 pub mod workflow;
 
-pub use error::{QmbedError, QuSpinError, Result};
+pub use error::{QmbedError, Result};
 pub use num_complex::Complex64;
 
 /// Crate version used by verification adapters.

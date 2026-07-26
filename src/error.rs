@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Stable failure categories for all recoverable public operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum QmbedError {
     #[error("invalid or unregistered operator: {0}")]
     InvalidOperator(String),
@@ -35,7 +36,3 @@ pub enum QmbedError {
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, QmbedError>;
-
-/// Compatibility spelling retained for source migrations from the earlier
-/// QuSpin-derived Rust API.
-pub type QuSpinError = QmbedError;

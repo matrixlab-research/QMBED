@@ -12,8 +12,8 @@ use crate::{QmbedError, Result};
 
 /// One typed local action in an operator product.
 ///
-/// This is the native QMBED spelling. Character strings belong to compatibility
-/// adapters and are parsed once into this representation before assembly.
+/// Compact character labels are parsed once into this representation before
+/// assembly; numerical kernels never dispatch on model or string names.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LocalOperator {
     Identity,
@@ -57,6 +57,32 @@ pub struct OpProduct {
 }
 
 impl OpProduct {
+    /// Parse QMBED's compact operator-label grammar.
+    ///
+    /// `|` records a tensor-factor boundary and every other character maps to
+    /// one built-in or custom local action.
+    pub fn parse(label: impl AsRef<str>) -> Result<Self> {
+        let mut splits = Vec::new();
+        let mut local = Vec::with_capacity(label.as_ref().chars().count());
+        for symbol in label.as_ref().chars() {
+            if symbol == '|' {
+                splits.push(local.len());
+                continue;
+            }
+            local.push(match symbol {
+                'I' => LocalOperator::Identity,
+                'n' => LocalOperator::Number,
+                'z' => LocalOperator::Z,
+                '+' => LocalOperator::Raising,
+                '-' => LocalOperator::Lowering,
+                'x' => LocalOperator::X,
+                'y' => LocalOperator::Y,
+                custom => LocalOperator::Custom(custom),
+            });
+        }
+        Self::with_splits(local, splits)
+    }
+
     /// Construct a single-factor ordered product.
     ///
     /// The product must contain at least one local action. Sites are attached
@@ -137,7 +163,7 @@ impl OpProduct {
         &self.local
     }
 
-    /// Return the legacy single species boundary, when exactly one exists.
+    /// Return the single species boundary, when exactly one exists.
     pub const fn split(&self) -> Option<usize> {
         self.split
     }
@@ -177,19 +203,22 @@ impl Coupling {
     }
 }
 
-/// Parsed-once local operator string and its couplings.
+/// One typed local operator product and its spatial couplings.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OperatorTerm {
+pub struct OperatorSpec {
     product: OpProduct,
     couplings: Vec<Coupling>,
 }
 
-/// Native name for one typed product and its spatial couplings.
-///
-/// `OperatorTerm` remains as the compatibility spelling during migration.
-pub type OperatorSpec = OperatorTerm;
+impl OperatorSpec {
+    /// Parse a compact product label and attach its spatial couplings.
+    pub fn new(
+        label: impl AsRef<str>,
+        couplings: impl IntoIterator<Item = Coupling>,
+    ) -> Result<Self> {
+        Self::from_product(OpProduct::parse(label)?, couplings)
+    }
 
-impl OperatorTerm {
     /// Attach spatial couplings to a parsed local operator product.
     ///
     /// Every coupling must have the same arity as `product`, and coefficients
@@ -217,7 +246,7 @@ impl OperatorTerm {
         Ok(Self { product, couplings })
     }
 
-    /// Return the canonical compatibility operator string.
+    /// Return the canonical compact operator label.
     pub fn operator(&self) -> &str {
         self.product.label()
     }
@@ -291,6 +320,7 @@ impl OperatorTerm {
 
 /// Requested materialization backend.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum MatrixFormat {
     /// Row-major dense storage.
     Dense,
@@ -1915,7 +1945,7 @@ where
 {
     source: &'a Source,
     target: &'a Target,
-    terms: Vec<OperatorTerm>,
+    terms: Vec<OperatorSpec>,
     checks: AssemblyChecks,
 }
 
@@ -1969,7 +1999,7 @@ fn definite_number_change_components(operator: &str) -> Result<Vec<(usize, Strin
 /// before sector closure is tested, so cancellations such as `xx + yy` are
 /// recognized. The Cartesian degree remains part of the canonical key because
 /// a basis may normalize `x/y` differently from explicit `+/-` symbols.
-pub fn operator_sum_preserves_particle_sector<B>(basis: &B, terms: &[OperatorTerm]) -> Result<bool>
+pub fn operator_sum_preserves_particle_sector<B>(basis: &B, terms: &[OperatorSpec]) -> Result<bool>
 where
     B: Basis,
 {
@@ -2036,13 +2066,13 @@ where
     }
 
     /// Append several validated local terms.
-    pub fn terms(mut self, terms: impl IntoIterator<Item = OperatorTerm>) -> Self {
+    pub fn terms(mut self, terms: impl IntoIterator<Item = OperatorSpec>) -> Self {
         self.terms.extend(terms);
         self
     }
 
     /// Append one validated local term.
-    pub fn term(mut self, term: OperatorTerm) -> Self {
+    pub fn term(mut self, term: OperatorSpec) -> Self {
         self.terms.push(term);
         self
     }
@@ -2275,7 +2305,7 @@ where
 pub fn apply_sector_shift<Source, Target>(
     source: &Source,
     target: &Target,
-    terms: &[OperatorTerm],
+    terms: &[OperatorSpec],
     input: &[Complex64],
     output: &mut [Complex64],
 ) -> Result<()>
@@ -2325,7 +2355,7 @@ type DriveFunction = Arc<dyn Fn(f64) -> Complex64 + Send + Sync>;
 /// A parsed local term multiplied by a scalar function of time.
 #[derive(Clone)]
 pub struct DynamicTerm {
-    term: OperatorTerm,
+    term: OperatorSpec,
     drive: DriveFunction,
 }
 
@@ -2340,7 +2370,7 @@ impl std::fmt::Debug for DynamicTerm {
 }
 
 impl DynamicTerm {
-    pub fn new<F>(term: OperatorTerm, drive: F) -> Self
+    pub fn new<F>(term: OperatorSpec, drive: F) -> Self
     where
         F: Fn(f64) -> Complex64 + Send + Sync + 'static,
     {
@@ -2354,7 +2384,7 @@ impl DynamicTerm {
         finite_drive_value(time, (self.drive)(time))
     }
 
-    fn into_parts(self) -> (OperatorTerm, DriveFunction) {
+    fn into_parts(self) -> (OperatorSpec, DriveFunction) {
         (self.term, self.drive)
     }
 }

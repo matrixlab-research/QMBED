@@ -25,7 +25,7 @@ symmetry orbits—rather than model names.
 
 | Interface | Intended use | API policy |
 |---|---|---|
-| [Rust](https://matrixlab-research.github.io/QMBED/rust/) | Native applications and reusable simulation components | Complete typed core |
+| [Rust](https://matrixlab-research.github.io/QMBED/rust/) | Native applications and reusable simulation components | One canonical typed API |
 | [Python](https://matrixlab-research.github.io/QMBED/python/) | Python workflows and QuSpin migration | Native `qmbed` API plus versioned `quspin` compatibility |
 | [Julia](https://matrixlab-research.github.io/QMBED/julia/) | Julia-native scientific workflows | Native `QMBED` API only |
 
@@ -62,6 +62,11 @@ Python and Julia source-install instructions and equivalent examples are in
 the [getting-started guide](https://matrixlab-research.github.io/QMBED/getting-started/).
 The language packages are not yet published to PyPI or the Julia General
 registry.
+
+Rust intentionally has no migration namespace or duplicate compatibility
+aliases. See the
+[Rust API stability policy](https://matrixlab-research.github.io/QMBED/rust/api-stability/)
+for the canonical names and extension rules.
 
 ## What is implemented
 

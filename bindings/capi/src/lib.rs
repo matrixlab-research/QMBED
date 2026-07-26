@@ -19,8 +19,8 @@ use qmbed::basis::{
     GeneralBasis, LatticeSymmetryMap, LocalOccupationConstraint, MatrixSymmetryReducer,
     MatrixSymmetrySubspace, PackedBasis, PackedPhotonBasis, PackedTensorBasis, ReductionImage,
     RepresentativeOrdering, SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D,
-    SpinlessFermionBasis1D, StateStorage, SymmetryMap, SymmetryReducer, SymmetrySector, UserBasis,
-    WidePackedBasis, WideSpinBasis, WideState, get_basis_type,
+    SpinlessFermionBasis1D, StateStorage, SymmetryMap, SymmetryReducer, UserBasis, WidePackedBasis,
+    WideSpinBasis, WideState, get_basis_type,
 };
 use qmbed::dynamics::{
     DriveStep, Floquet, FloquetAnalysis, FloquetTimeVector, analyze_floquet_unitary,
@@ -2043,14 +2043,19 @@ impl From<StorageFormat> for MatrixFormat {
     }
 }
 
-impl From<MatrixFormat> for StorageFormat {
-    fn from(value: MatrixFormat) -> Self {
+impl TryFrom<MatrixFormat> for StorageFormat {
+    type Error = QmbedError;
+
+    fn try_from(value: MatrixFormat) -> Result<Self> {
         match value {
-            MatrixFormat::Dense => Self::Dense,
-            MatrixFormat::Csc => Self::Csc,
-            MatrixFormat::Csr => Self::Csr,
-            MatrixFormat::Dia => Self::Dia,
-            MatrixFormat::MatrixFree => Self::MatrixFree,
+            MatrixFormat::Dense => Ok(Self::Dense),
+            MatrixFormat::Csc => Ok(Self::Csc),
+            MatrixFormat::Csr => Ok(Self::Csr),
+            MatrixFormat::Dia => Ok(Self::Dia),
+            MatrixFormat::MatrixFree => Ok(Self::MatrixFree),
+            _ => Err(QmbedError::UnsupportedBackend(
+                "the C ABI does not expose this operator storage format".into(),
+            )),
         }
     }
 }
@@ -2074,13 +2079,14 @@ struct SolverRequest {
 
 impl SolverRequest {
     fn options(&self) -> EigshOptions {
-        EigshOptions {
-            eigenpairs: self.eigenpairs,
-            target: self.target.into(),
-            krylov_dimension: self.krylov_dimension,
-            tolerance: self.tolerance,
-            max_iterations: self.max_iterations,
-            seed: self.seed,
+        let options = EigshOptions::new(self.eigenpairs, self.target.into())
+            .with_tolerance(self.tolerance)
+            .with_max_iterations(self.max_iterations)
+            .with_seed(self.seed);
+        if let Some(dimension) = self.krylov_dimension {
+            options.with_krylov_dimension(dimension)
+        } else {
+            options
         }
     }
 
@@ -3099,11 +3105,11 @@ fn runtime_symmetry_sector<State>(
     states_per_site: usize,
     statistics: ExchangeStatistics,
     requests: &[SymmetryRequest],
-) -> Result<SymmetrySector<State>>
+) -> Result<SymmetryReducer<State>>
 where
     LatticeSymmetryMap: SymmetryMap<State>,
 {
-    let mut sector = SymmetrySector::new();
+    let mut sector = SymmetryReducer::new();
     for request in requests {
         if request.destinations.len() != encoded_sites {
             return Err(QmbedError::InvalidOptions(format!(
@@ -3652,13 +3658,15 @@ fn build_operator_model(
     }
 }
 
-fn archive_component_results(archive: &OperatorArchive) -> Vec<ArchiveComponentResult> {
+fn archive_component_results(archive: &OperatorArchive) -> Result<Vec<ArchiveComponentResult>> {
     archive
         .iter()
-        .map(|(name, entry)| ArchiveComponentResult {
-            name: name.to_string(),
-            format: entry.operator.format().into(),
-            default: entry.default.map(|value| [value.re, value.im]),
+        .map(|(name, entry)| {
+            Ok(ArchiveComponentResult {
+                name: name.to_string(),
+                format: entry.operator.format().try_into()?,
+                default: entry.default.map(|value| [value.re, value.im]),
+            })
         })
         .collect()
 }
@@ -3672,7 +3680,7 @@ fn archive_metadata(archive: &OperatorArchive) -> HashMap<String, String> {
 
 fn command_load_operator_archive(path: String) -> Result<CommandResult> {
     let archive = load_zip(&path)?;
-    let components = archive_component_results(&archive);
+    let components = archive_component_results(&archive)?;
     let metadata = archive_metadata(&archive);
     let model = PackedOperatorModel::from_component_archive(archive, MatrixFormat::Csc)?;
     let dimension = model.dimension();
@@ -3732,7 +3740,7 @@ fn registered_save_operator_archive(
     for (key, value) in metadata {
         archive.insert_metadata(key, value)?;
     }
-    let components = archive_component_results(&archive);
+    let components = archive_component_results(&archive)?;
     let metadata = archive_metadata(&archive);
     save_zip(&path, &archive)?;
     Ok(CommandResult::Archive {
@@ -4049,10 +4057,7 @@ fn command_lanczos_operator(
     let decomposition = lanczos_ritz(
         &operator,
         &initial,
-        LanczosOptions {
-            krylov_dimension,
-            tolerance,
-        },
+        LanczosOptions::new(krylov_dimension).with_tolerance(tolerance),
     )?;
     let projected_dimension = decomposition.eigenvalues.len();
     let initial_norm = decomposition.decomposition.initial_norm;
@@ -4679,13 +4684,10 @@ fn command_evolve_model(
     let trajectory = model.evolve_batch(
         &complex_parameters(parameters),
         &complex_vectors(vectors),
-        EvolutionOptions {
-            times: evolution.times,
-            krylov_dimension: evolution.krylov_dimension,
-            tolerance: evolution.tolerance,
-            max_substeps: evolution.max_substeps,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(evolution.times)
+            .with_krylov_dimension(evolution.krylov_dimension)
+            .with_tolerance(evolution.tolerance)
+            .with_max_substeps(evolution.max_substeps),
     )?;
     Ok(command_trajectory(model.dimension(), trajectory))
 }
@@ -4706,13 +4708,10 @@ fn execute_drive_evolution(
     let trajectory = model.evolve_time_dependent_batch(
         &complex_vectors(request.vectors),
         request.initial_time,
-        EvolutionOptions {
-            times: request.evolution.times,
-            krylov_dimension: request.evolution.krylov_dimension,
-            tolerance: request.evolution.tolerance,
-            max_substeps: request.evolution.max_substeps,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(request.evolution.times)
+            .with_krylov_dimension(request.evolution.krylov_dimension)
+            .with_tolerance(request.evolution.tolerance)
+            .with_max_substeps(request.evolution.max_substeps),
         if request.evolution.imaginary_time {
             Complex64::new(0.0, -1.0)
         } else {
@@ -5295,9 +5294,7 @@ fn command_eigh(
 ) -> Result<CommandResult> {
     let result = model.eigh(
         &complex_parameters(parameters),
-        EighOptions {
-            return_eigenvectors: eigenvectors,
-        },
+        EighOptions::new(eigenvectors),
     )?;
     Ok(command_eigensystem(model.dimension(), result, eigenvectors))
 }
@@ -5694,12 +5691,7 @@ fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> 
         } => {
             let operator = evaluate_operator_expression(expression)?;
             let dimension = qmbed::operator::LinearOperator::shape(&operator).0;
-            let result = eigh_with_options(
-                &operator,
-                EighOptions {
-                    return_eigenvectors: eigenvectors,
-                },
-            )?;
+            let result = eigh_with_options(&operator, EighOptions::new(eigenvectors))?;
             Ok(command_eigensystem(dimension, result, eigenvectors))
         }
         CommandRequest::EigshOperatorExpression {

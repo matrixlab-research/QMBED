@@ -40,11 +40,32 @@ assert!(result.converged);
 | `runtime` | Vector ownership and coarse execution primitives |
 | `interop` | Reusable owned models for language frontends |
 
-New code should use these native modules. `qmbed::compat::quspin` retains older
-Rust spellings during migration, but does not select another implementation.
+Rust exposes one native vocabulary. There is no Rust compatibility namespace
+or second set of migration aliases. The Python package separately provides its
+versioned QuSpin-compatible import surface.
+
+## Choose the native path
+
+| Workflow | Canonical Rust types |
+|---|---|
+| Build one Hamiltonian | `Basis` → `OperatorSpec` → `OperatorBuilder` |
+| Repeated parameter scan | `QuantumOperator` → `QuantumOperatorPlan` |
+| Selected spectrum | `eigsh` + `EigshOptions` |
+| Related selected spectra | `eigsh_with_workspace` + `EigshWorkspace` |
+| State evolution | `evolve` + `EvolutionOptions` |
+| Frontend-owned persistent model | `interop::EdModel` |
+
+`interop` is the runtime-selected ownership boundary used by Python, Julia,
+and C callers. Native Rust applications should prefer the generic basis,
+operator, and solver modules unless they specifically need that frontend
+lifecycle.
 
 ## Reuse for scans
 
 For related Hamiltonians, use `QuantumOperatorPlan` to retain one sparse
 pattern and `EigshWorkspace` to carry the converged subspace between solves.
 These are generic operator and solver facilities, not model-specific paths.
+
+See [API stability](api-stability.md) for the naming and evolution policy, and
+the repository's `examples/native_workflows.rs` for parameter scans, symmetry
+projection, time evolution, Floquet analysis, custom bases, and wide states.

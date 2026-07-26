@@ -15,7 +15,7 @@ class VersionTests(unittest.TestCase):
 
     def test_repository_versions_match(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        self.assertEqual(check_versions(root), "0.1.0")
+        self.assertEqual(check_versions(root), "0.2.0")
 
     def test_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

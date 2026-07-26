@@ -15,6 +15,7 @@ use crate::{QmbedError, Result};
 
 /// Accelerator requested by an execution profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Accelerator {
     /// Host CPU execution.
     Cpu,
@@ -27,9 +28,13 @@ pub enum Accelerator {
 /// `ranks > 1` denotes a distributed run. Each rank may in turn use the
 /// requested accelerator and number of host threads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ExecutionProfile {
+    /// Compute device requested for each rank.
     pub accelerator: Accelerator,
+    /// Number of cooperating process ranks.
     pub ranks: usize,
+    /// Host threads available to each rank.
     pub threads_per_rank: usize,
 }
 

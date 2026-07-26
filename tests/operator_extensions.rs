@@ -5,7 +5,7 @@ use approx::assert_abs_diff_eq;
 use qmbed::basis::{SpinBasis1D, SpinfulFermionBasis1D};
 use qmbed::operator::{
     AssemblyChecks, Coupling, DynamicTerm, ExpGrid, ExpOp, Hamiltonian, LinearOperator,
-    MatrixFormat, Operator, OperatorBuilder, OperatorTerm, QuantumComponent, QuantumLinearOperator,
+    MatrixFormat, Operator, OperatorBuilder, OperatorSpec, QuantumComponent, QuantumLinearOperator,
     QuantumOperator, Static, TimeDependentOperator, TimeOperator, anticommutator, commutator,
     get_matvec_function, is_exp_op, is_hamiltonian, is_quantum_linear_operator,
     is_quantum_operator, matmat, matvec, rmatmat, rmatvec,
@@ -21,9 +21,9 @@ fn assert_complex_close(actual: Complex64, expected: Complex64) {
 #[test]
 fn dynamic_hamiltonian_evaluation_and_action_share_one_semantics() {
     let basis = SpinBasis1D::builder(1).pauli(true).build().unwrap();
-    let static_term = OperatorTerm::new("z", [Coupling::new(0.25, vec![0])]).unwrap();
+    let static_term = OperatorSpec::new("z", [Coupling::new(0.25, vec![0])]).unwrap();
     let driven_term = DynamicTerm::new(
-        OperatorTerm::new("x", [Coupling::new(1.0, vec![0])]).unwrap(),
+        OperatorSpec::new("x", [Coupling::new(1.0, vec![0])]).unwrap(),
         |time| Complex64::new(time.sin(), 0.0),
     );
     let hamiltonian = OperatorBuilder::on(&basis)
@@ -176,18 +176,18 @@ fn spinful_basis_accepts_unified_orbital_labels_without_losing_sector_checks() {
         symmetry_compatibility: true,
     };
     let unified_down = OperatorBuilder::on(&basis)
-        .term(OperatorTerm::new("+-", [Coupling::new(1.0, vec![2, 3])]).unwrap())
+        .term(OperatorSpec::new("+-", [Coupling::new(1.0, vec![2, 3])]).unwrap())
         .checks(component_checks)
         .build(MatrixFormat::Csc)
         .unwrap();
     let split_down = OperatorBuilder::on(&basis)
-        .term(OperatorTerm::new("|+-", [Coupling::new(1.0, vec![0, 1])]).unwrap())
+        .term(OperatorSpec::new("|+-", [Coupling::new(1.0, vec![0, 1])]).unwrap())
         .checks(component_checks)
         .build(MatrixFormat::Csc)
         .unwrap();
     assert_eq!(unified_down.triplets(), split_down.triplets());
 
-    let cross_species = OperatorTerm::new("+-", [Coupling::new(1.0, vec![0, 2])]).unwrap();
+    let cross_species = OperatorSpec::new("+-", [Coupling::new(1.0, vec![0, 2])]).unwrap();
     assert!(matches!(
         OperatorBuilder::on(&basis)
             .term(cross_species)
@@ -327,7 +327,7 @@ fn time_operator_algebra_matches_materialized_matrix_arithmetic() {
     let dynamic = OperatorBuilder::on(&basis)
         .build_dynamic(
             [DynamicTerm::new(
-                OperatorTerm::new("x", [Coupling::new(1.0, vec![0])]).unwrap(),
+                OperatorSpec::new("x", [Coupling::new(1.0, vec![0])]).unwrap(),
                 |time| Complex64::new(time.sin(), 0.0),
             )],
             MatrixFormat::Csc,
@@ -335,7 +335,7 @@ fn time_operator_algebra_matches_materialized_matrix_arithmetic() {
         .unwrap();
     let static_h = Hamiltonian::<Static>::new(
         OperatorBuilder::on(&basis)
-            .term(OperatorTerm::new("z", [Coupling::new(0.3, vec![0])]).unwrap())
+            .term(OperatorSpec::new("z", [Coupling::new(0.3, vec![0])]).unwrap())
             .build(MatrixFormat::Csc)
             .unwrap(),
     )
@@ -471,7 +471,7 @@ fn exp_op_grid_and_right_action_match_explicit_matrices() {
 #[test]
 fn assembly_particle_check_rejects_sector_leakage_and_can_be_explicitly_disabled() {
     let basis = SpinBasis1D::builder(4).up(2).build().unwrap();
-    let transverse = OperatorTerm::new("x", [Coupling::new(1.0, vec![0])]).unwrap();
+    let transverse = OperatorSpec::new("x", [Coupling::new(1.0, vec![0])]).unwrap();
     let error = OperatorBuilder::on(&basis)
         .term(transverse.clone())
         .build(MatrixFormat::Csc)
@@ -496,15 +496,15 @@ fn assembly_particle_check_accounts_for_cancellation_across_the_operator_sum() {
     let coupling = Coupling::new(0.5, vec![0, 1]);
     let cartesian = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new("xx", [coupling.clone()]).unwrap(),
-            OperatorTerm::new("yy", [coupling]).unwrap(),
+            OperatorSpec::new("xx", [coupling.clone()]).unwrap(),
+            OperatorSpec::new("yy", [coupling]).unwrap(),
         ])
         .build(MatrixFormat::Dense)
         .unwrap();
     let ladder = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new("+-", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
-            OperatorTerm::new("-+", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
+            OperatorSpec::new("+-", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
+            OperatorSpec::new("-+", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
         ])
         .build(MatrixFormat::Dense)
         .unwrap();
@@ -512,8 +512,8 @@ fn assembly_particle_check_accounts_for_cancellation_across_the_operator_sum() {
 
     let residual_leakage = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new("xx", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
-            OperatorTerm::new("yy", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
+            OperatorSpec::new("xx", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
+            OperatorSpec::new("yy", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
         ])
         .build(MatrixFormat::Dense)
         .unwrap_err();

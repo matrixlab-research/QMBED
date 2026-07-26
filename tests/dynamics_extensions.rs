@@ -187,13 +187,10 @@ fn dynamical_correlator_matches_a_two_level_lehmann_phase() {
         &[Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
         &sigma_x,
         &sigma_x,
-        EvolutionOptions {
-            times: times.clone(),
-            krylov_dimension: 8,
-            tolerance: 1.0e-12,
-            max_substeps: 100,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(times.clone())
+            .with_krylov_dimension(8)
+            .with_tolerance(1.0e-12)
+            .with_max_substeps(100),
     )
     .unwrap();
     for (value, time) in values.iter().zip(times) {

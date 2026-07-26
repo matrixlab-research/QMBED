@@ -4,7 +4,7 @@ use qmbed::basis::{
     Basis, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap, MatrixSymmetryReducer,
     SpinBasis1D, SymmetryReducer,
 };
-use qmbed::operator::{Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm};
+use qmbed::operator::{Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorSpec};
 use qmbed::solve::eigh;
 
 fn dihedral_reducer(
@@ -50,14 +50,14 @@ fn dihedral_reducer(
         .unwrap()
 }
 
-fn invariant_spin_terms(sites: usize) -> Vec<OperatorTerm> {
+fn invariant_spin_terms(sites: usize) -> Vec<OperatorSpec> {
     vec![
-        OperatorTerm::new(
+        OperatorSpec::new(
             "zz",
             (0..sites).map(|site| Coupling::new(0.73, vec![site, (site + 1) % sites])),
         )
         .unwrap(),
-        OperatorTerm::new("x", (0..sites).map(|site| Coupling::new(-0.41, vec![site]))).unwrap(),
+        OperatorSpec::new("x", (0..sites).map(|site| Coupling::new(-0.41, vec![site]))).unwrap(),
     ]
 }
 

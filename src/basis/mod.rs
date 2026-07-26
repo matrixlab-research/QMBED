@@ -3389,10 +3389,6 @@ impl<State> Default for SymmetryReducer<State> {
     }
 }
 
-/// Backward-compatible name for a reducer configured with one sector
-/// character per generator.
-pub type SymmetrySector<State> = SymmetryReducer<State>;
-
 /// Result of reducing one physical state without materializing a basis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SymmetryOrbit<State> {
@@ -4099,7 +4095,7 @@ where
     Parent: Basis,
     Parent::State: Hash + Ord,
 {
-    pub fn new(parent: Parent, sector: SymmetrySector<Parent::State>) -> Result<Self> {
+    pub fn new(parent: Parent, sector: SymmetryReducer<Parent::State>) -> Result<Self> {
         Self::from_reducer(parent, sector)
     }
 
@@ -5001,10 +4997,6 @@ pub type U256 = WideState<4>;
 pub type U1024 = WideState<16>;
 pub type U4096 = WideState<64>;
 pub type U16384 = WideState<256>;
-pub type UInt256 = U256;
-pub type UInt1024 = U1024;
-pub type UInt4096 = U4096;
-pub type UInt16384 = U16384;
 
 /// Runtime-selected fixed-width basis state.
 ///

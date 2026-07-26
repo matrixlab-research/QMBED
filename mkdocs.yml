@@ -38,6 +38,7 @@ nav:
   - Get started: getting-started.md
   - Interfaces:
       - Rust: rust/index.md
+      - Rust API stability: rust/api-stability.md
       - Python: python/index.md
       - Python API: python/api.md
       - QuSpin compatibility: python/quspin-compat.md

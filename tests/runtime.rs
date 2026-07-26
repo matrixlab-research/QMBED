@@ -2,7 +2,7 @@ use qmbed::basis::SpinBasis1D;
 use qmbed::operator::{
     Coupling, LocalOperator, MatrixFormat, OpProduct, OperatorBuilder, OperatorSpec,
 };
-use qmbed::runtime::{Accelerator, CpuRuntime, ExecutionProfile, Runtime, RuntimeLinearOperator};
+use qmbed::runtime::{CpuRuntime, ExecutionProfile, Runtime, RuntimeLinearOperator};
 use qmbed::{Complex64, QmbedError};
 
 #[test]
@@ -30,11 +30,7 @@ fn cpu_runtime_applies_the_same_scientific_operator() {
 
 #[test]
 fn accelerator_and_distributed_requests_never_silently_fall_back() {
-    let gpu = ExecutionProfile {
-        accelerator: Accelerator::Gpu { device: 0 },
-        ranks: 1,
-        threads_per_rank: 4,
-    };
+    let gpu = ExecutionProfile::local_gpu(0, 4);
     let mpi = ExecutionProfile::distributed_cpu(4, 8);
     assert!(matches!(
         CpuRuntime::from_profile(gpu),

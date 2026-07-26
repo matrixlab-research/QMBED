@@ -105,13 +105,9 @@ impl Floquet {
         Ok(Self {
             steps,
             dimension,
-            evolution: EvolutionOptions {
-                times: vec![0.0],
-                krylov_dimension: 64,
-                tolerance: 1.0e-12,
-                max_substeps: 10_000,
-                hamiltonian: true,
-            },
+            evolution: EvolutionOptions::new([0.0])
+                .with_krylov_dimension(64)
+                .with_tolerance(1.0e-12),
             analysis_period: None,
         })
     }
@@ -134,13 +130,9 @@ impl Floquet {
         Ok(Self {
             steps,
             dimension,
-            evolution: EvolutionOptions {
-                times: vec![0.0],
-                krylov_dimension: 64,
-                tolerance: 1.0e-12,
-                max_substeps: 10_000,
-                hamiltonian: true,
-            },
+            evolution: EvolutionOptions::new([0.0])
+                .with_krylov_dimension(64)
+                .with_tolerance(1.0e-12),
             analysis_period: None,
         })
     }
@@ -604,16 +596,48 @@ impl LinearOperator for Floquet {
     }
 }
 
+/// Frequency grid and Lanczos controls for broadened spectral functions.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SpectrumOptions {
+    /// Frequencies at which the response is evaluated.
     pub frequencies: Vec<f64>,
+    /// Reference-state energy subtracted from the resolvent.
     pub reference_energy: f64,
+    /// Positive Lorentzian broadening.
     pub broadening: f64,
+    /// Maximum Krylov dimension.
     pub krylov_dimension: usize,
+    /// Continued-fraction termination tolerance.
     pub tolerance: f64,
 }
 
 impl SpectrumOptions {
+    /// Construct spectral-function controls for a frequency grid.
+    pub fn new(frequencies: impl Into<Vec<f64>>, reference_energy: f64, broadening: f64) -> Self {
+        Self {
+            frequencies: frequencies.into(),
+            reference_energy,
+            broadening,
+            krylov_dimension: 64,
+            tolerance: 1.0e-10,
+        }
+    }
+
+    /// Set the maximum Krylov dimension.
+    #[must_use]
+    pub fn with_krylov_dimension(mut self, dimension: usize) -> Self {
+        self.krylov_dimension = dimension;
+        self
+    }
+
+    /// Set the continued-fraction termination tolerance.
+    #[must_use]
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.frequencies.is_empty()
             || self.frequencies.iter().any(|value| !value.is_finite())
