@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install the Python binding
-        run: python -m pip install -e bindings/python
+        run: python -m pip install -e "bindings/python[test]"
       - name: Test the Python binding
         env:
           QMBED_LIBRARY_PATH: bindings/capi/target/release/libqmbed_capi.so
