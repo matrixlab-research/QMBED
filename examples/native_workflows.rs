@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use qmbed::basis::{Basis, BasisProjector, SpinBasis1D, U256, UserBasis};
-use qmbed::dynamics::{DriveStep, Floquet};
-use qmbed::measure::{EntropyOrder, entanglement_entropy};
+use qmbed::dynamics::{DriveStep, Floquet, FloquetSpectrumOptions};
+use qmbed::measure::{EntropyOrder, entanglement_entropy, entanglement_entropy_sector};
 use qmbed::operator::{
     Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorSpec,
     QuantumComponent, QuantumOperator,
@@ -78,6 +78,8 @@ fn dynamics_and_measurement() -> Result<()> {
     ])?;
     let analysis = floquet.analyze(MatrixFormat::Dense)?;
     assert_eq!(analysis.eigensystem.quasienergies.len(), 2);
+    let selected = floquet.selected_eigensystem(FloquetSpectrumOptions::new(1, 0.0))?;
+    assert_eq!(selected.quasienergies.len(), 1);
 
     let scale = 1.0 / 2.0_f64.sqrt();
     let bell = [
@@ -109,6 +111,17 @@ fn custom_and_wide_states() -> Result<()> {
 
     let state = U256::zero().with_bit(200, true)?;
     assert!(state.bit(200)?);
+    let partner = U256::zero().with_bit(1, true)?.with_bit(199, true)?;
+    let scale = 1.0 / 2.0_f64.sqrt();
+    let entropy = entanglement_entropy_sector(
+        &[Complex64::new(scale, 0.0), Complex64::new(scale, 0.0)],
+        &[state, partner],
+        201,
+        &[200],
+        &[],
+        EntropyOrder::VonNeumann,
+    )?;
+    assert!((entropy - 2.0_f64.ln()).abs() < 1.0e-12);
     Ok(())
 }
 

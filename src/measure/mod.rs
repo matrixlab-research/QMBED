@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use num_complex::Complex64;
 
-use crate::basis::BasisProjector;
+use crate::basis::{BasisProjector, BinaryState};
 use crate::operator::{LinearOperator, MatrixFormat, Operator};
 use crate::solve::StateTrajectory;
 use crate::{QmbedError, Result};
@@ -718,6 +718,362 @@ pub fn partial_trace_density_subsystem(
         }
     }
     Ok(reduced)
+}
+
+#[derive(Clone, Debug)]
+struct BinarySectorSubsystemLayout {
+    total_sites: usize,
+    retained_sites: Vec<usize>,
+    environment_sites: Vec<usize>,
+    subsystem_dimension: usize,
+    group_for_site: Vec<Option<usize>>,
+    new_position: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SplitBinarySectorState {
+    subsystem: usize,
+    environment: Vec<u64>,
+    exchange_phase: Complex64,
+}
+
+fn binary_sector_subsystem_layout(
+    total_sites: usize,
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<BinarySectorSubsystemLayout> {
+    if total_sites == 0 {
+        return Err(QmbedError::InvalidOptions(
+            "a binary subsystem requires at least one site".into(),
+        ));
+    }
+    let mut retained = vec![false; total_sites];
+    for &site in retained_sites {
+        if site >= total_sites {
+            return Err(QmbedError::InvalidSite {
+                site,
+                sites: total_sites,
+            });
+        }
+        if std::mem::replace(&mut retained[site], true) {
+            return Err(QmbedError::InvalidOptions(
+                "retained subsystem sites must be unique".into(),
+            ));
+        }
+    }
+    let subsystem_dimension =
+        1_usize
+            .checked_shl(u32::try_from(retained_sites.len()).map_err(|_| {
+                QmbedError::DimensionMismatch("retained subsystem is too large".into())
+            })?)
+            .ok_or_else(|| {
+                QmbedError::DimensionMismatch(
+                    "retained subsystem is too large for a dense reduced density matrix".into(),
+                )
+            })?;
+    subsystem_dimension
+        .checked_mul(subsystem_dimension)
+        .ok_or_else(|| {
+            QmbedError::DimensionMismatch("reduced density-matrix allocation would overflow".into())
+        })?;
+
+    let environment_sites = (0..total_sites)
+        .filter(|site| !retained[*site])
+        .collect::<Vec<_>>();
+    let mut new_order = environment_sites.clone();
+    new_order.extend_from_slice(retained_sites);
+    let mut new_position = vec![0; total_sites];
+    for (position, &site) in new_order.iter().enumerate() {
+        new_position[site] = position;
+    }
+    let mut group_for_site = vec![None; total_sites];
+    for (group, noncommuting_group) in noncommuting_groups.iter().enumerate() {
+        let mut seen = std::collections::HashSet::with_capacity(noncommuting_group.sites().len());
+        for &site in noncommuting_group.sites() {
+            if site >= total_sites {
+                return Err(QmbedError::InvalidSite {
+                    site,
+                    sites: total_sites,
+                });
+            }
+            if !seen.insert(site) {
+                return Err(QmbedError::InvalidOptions(
+                    "a noncommuting group cannot repeat a site".into(),
+                ));
+            }
+            if group_for_site[site].replace(group).is_some() {
+                return Err(QmbedError::InvalidOptions(
+                    "noncommuting groups must be disjoint".into(),
+                ));
+            }
+        }
+    }
+    Ok(BinarySectorSubsystemLayout {
+        total_sites,
+        retained_sites: retained_sites.to_vec(),
+        environment_sites,
+        subsystem_dimension,
+        group_for_site,
+        new_position,
+    })
+}
+
+fn split_binary_sector_state<State>(
+    state: State,
+    layout: &BinarySectorSubsystemLayout,
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<SplitBinarySectorState>
+where
+    State: BinaryState,
+{
+    let mut subsystem = 0_usize;
+    for (position, &site) in layout.retained_sites.iter().enumerate() {
+        if state.bit(site)? {
+            subsystem |= 1_usize << position;
+        }
+    }
+    let mut environment = vec![0_u64; layout.environment_sites.len().div_ceil(64)];
+    for (position, &site) in layout.environment_sites.iter().enumerate() {
+        if state.bit(site)? {
+            environment[position / 64] |= 1_u64 << (position % 64);
+        }
+    }
+    let mut inversions = vec![0_u32; noncommuting_groups.len()];
+    for left in 0..layout.total_sites {
+        let Some(group) = layout.group_for_site[left] else {
+            continue;
+        };
+        if !state.bit(left)? {
+            continue;
+        }
+        for right in (left + 1)..layout.total_sites {
+            if layout.group_for_site[right] == Some(group)
+                && state.bit(right)?
+                && layout.new_position[left] > layout.new_position[right]
+            {
+                inversions[group] += 1;
+            }
+        }
+    }
+    let exchange_phase = inversions
+        .into_iter()
+        .zip(noncommuting_groups)
+        .fold(Complex64::new(1.0, 0.0), |phase, (count, group)| {
+            phase * group.exchange_phase().powu(count)
+        });
+    Ok(SplitBinarySectorState {
+        subsystem,
+        environment,
+        exchange_phase,
+    })
+}
+
+fn split_binary_sector_states<State>(
+    states: &[State],
+    layout: &BinarySectorSubsystemLayout,
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<Vec<SplitBinarySectorState>>
+where
+    State: BinaryState,
+{
+    let mut seen = std::collections::HashSet::with_capacity(states.len());
+    states
+        .iter()
+        .copied()
+        .map(|state| {
+            if !seen.insert(state) {
+                return Err(QmbedError::InvalidOptions(
+                    "sector basis states must be unique".into(),
+                ));
+            }
+            split_binary_sector_state(state, layout, noncommuting_groups)
+        })
+        .collect()
+}
+
+fn zero_complex_square(dimension: usize) -> Result<Vec<Complex64>> {
+    let length = dimension.checked_mul(dimension).ok_or_else(|| {
+        QmbedError::DimensionMismatch("reduced density-matrix allocation would overflow".into())
+    })?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(length).map_err(|_| {
+        QmbedError::UnsupportedBackend(format!(
+            "a dense {dimension}x{dimension} reduced density matrix does not fit in memory"
+        ))
+    })?;
+    values.resize(length, Complex64::new(0.0, 0.0));
+    Ok(values)
+}
+
+/// Reduced density matrix of a pure state stored in an arbitrary binary
+/// sector basis.
+///
+/// The contraction groups amplitudes by the environment bit pattern.  It
+/// never enumerates or allocates the unrestricted `2^total_sites` parent
+/// space; memory is proportional to the supplied sector and the requested
+/// dense subsystem matrix.
+pub fn partial_trace_sector_state<State>(
+    amplitudes: &[Complex64],
+    basis_states: &[State],
+    total_sites: usize,
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<Vec<Complex64>>
+where
+    State: BinaryState,
+{
+    if amplitudes.len() != basis_states.len() {
+        return Err(QmbedError::DimensionMismatch(
+            "sector amplitudes and basis states must have the same length".into(),
+        ));
+    }
+    let norm = amplitudes.iter().map(Complex64::norm_sqr).sum::<f64>();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(QmbedError::InvalidOptions(
+            "state must have positive finite norm".into(),
+        ));
+    }
+    let layout = binary_sector_subsystem_layout(total_sites, retained_sites, noncommuting_groups)?;
+    let split = split_binary_sector_states(basis_states, &layout, noncommuting_groups)?;
+    let mut by_environment = std::collections::HashMap::<Vec<u64>, Vec<(usize, Complex64)>>::new();
+    for (state, amplitude) in split.iter().zip(amplitudes) {
+        by_environment
+            .entry(state.environment.clone())
+            .or_default()
+            .push((state.subsystem, state.exchange_phase * *amplitude));
+    }
+    let mut reduced = zero_complex_square(layout.subsystem_dimension)?;
+    for amplitudes in by_environment.values() {
+        for &(left, left_value) in amplitudes {
+            for &(right, right_value) in amplitudes {
+                reduced[left * layout.subsystem_dimension + right] +=
+                    left_value * right_value.conj() / norm;
+            }
+        }
+    }
+    Ok(reduced)
+}
+
+/// Reduced density matrix of a mixed state stored in an arbitrary binary
+/// sector basis.
+///
+/// Only pairs with the same environment key are visited.  The input remains a
+/// dense matrix in the selected sector, but no unrestricted parent density
+/// matrix is formed.
+pub fn partial_trace_sector_density<State>(
+    density: &[Complex64],
+    basis_states: &[State],
+    total_sites: usize,
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<Vec<Complex64>>
+where
+    State: BinaryState,
+{
+    let dimension = basis_states.len();
+    if density.len() != dimension.saturating_mul(dimension) {
+        return Err(QmbedError::DimensionMismatch(
+            "sector density matrix does not match the basis dimension".into(),
+        ));
+    }
+    let trace = (0..dimension)
+        .map(|index| density[index * dimension + index])
+        .sum::<Complex64>();
+    if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
+        return Err(QmbedError::InvalidOptions(
+            "density matrix must have a positive real trace".into(),
+        ));
+    }
+    for row in 0..dimension {
+        for column in 0..dimension {
+            if (density[row * dimension + column] - density[column * dimension + row].conj()).norm()
+                > 1.0e-10
+            {
+                return Err(QmbedError::InvalidOptions(
+                    "density matrix must be Hermitian".into(),
+                ));
+            }
+        }
+    }
+    let layout = binary_sector_subsystem_layout(total_sites, retained_sites, noncommuting_groups)?;
+    let split = split_binary_sector_states(basis_states, &layout, noncommuting_groups)?;
+    let mut rows_by_environment =
+        std::collections::HashMap::<Vec<u64>, Vec<usize>>::with_capacity(dimension);
+    for (row, state) in split.iter().enumerate() {
+        rows_by_environment
+            .entry(state.environment.clone())
+            .or_default()
+            .push(row);
+    }
+    let mut reduced = zero_complex_square(layout.subsystem_dimension)?;
+    for rows in rows_by_environment.values() {
+        for &row in rows {
+            for &column in rows {
+                let left = &split[row];
+                let right = &split[column];
+                reduced[left.subsystem * layout.subsystem_dimension + right.subsystem] += left
+                    .exchange_phase
+                    * density[row * dimension + column]
+                    * right.exchange_phase.conj()
+                    / trace.re;
+            }
+        }
+    }
+    Ok(reduced)
+}
+
+/// Entanglement spectrum of a pure state represented in a binary sector.
+pub fn entanglement_spectrum_sector<State>(
+    amplitudes: &[Complex64],
+    basis_states: &[State],
+    total_sites: usize,
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<Vec<f64>>
+where
+    State: BinaryState,
+{
+    let dimension = 1_usize
+        .checked_shl(u32::try_from(retained_sites.len()).unwrap_or(u32::MAX))
+        .ok_or_else(|| {
+            QmbedError::DimensionMismatch(
+                "retained subsystem is too large for a dense entanglement spectrum".into(),
+            )
+        })?;
+    density_matrix_spectrum(
+        partial_trace_sector_state(
+            amplitudes,
+            basis_states,
+            total_sites,
+            retained_sites,
+            noncommuting_groups,
+        )?,
+        dimension,
+    )
+}
+
+/// Entanglement entropy of a pure state represented in a binary sector.
+pub fn entanglement_entropy_sector<State>(
+    amplitudes: &[Complex64],
+    basis_states: &[State],
+    total_sites: usize,
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+    order: EntropyOrder,
+) -> Result<f64>
+where
+    State: BinaryState,
+{
+    entropy_from_spectrum(
+        &entanglement_spectrum_sector(
+            amplitudes,
+            basis_states,
+            total_sites,
+            retained_sites,
+            noncommuting_groups,
+        )?,
+        order,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -21,7 +21,7 @@ orbit traces across compatible constructions.
 - static, driven, and named parameterized Hamiltonians;
 - rectangular source-to-target operators;
 - reusable sparse matvec and parameter-scan plans;
-- safe versioned dense and sparse archives.
+- safe versioned dense/sparse operator archives and ordered basis manifests.
 
 All forms implement or adapt to one rectangular `LinearOperator` interface.
 
@@ -32,12 +32,15 @@ All forms implement or adapt to one rectangular `LinearOperator` interface.
 - restarted and fully reorthogonalized Lanczos;
 - reusable eigensolver and shift-invert workspaces;
 - exponential action, Krylov propagation, callable drives, FTLM, and LTLM;
-- Floquet unitaries, quasienergies, and eigensystems.
+- Floquet unitaries, complete dense spectra, and matrix-free selected
+  quasienergies.
 
 ## Measurements and workflows
 
 - expectation values and fluctuations;
 - pure and mixed partial traces;
+- sector-native binary partial traces that do not enumerate the unrestricted
+  parent Hilbert space;
 - fermionic and general exchange phases for arbitrary subsystems;
 - entanglement spectra and entropies;
 - spectral functions and dynamical correlators;
@@ -52,4 +55,7 @@ extension points and currently return an error instead of silently falling
 back to CPU.
 
 Full Floquet spectra materialize a dense unitary and therefore retain
-quadratic memory and cubic dense diagonalization scaling.
+quadratic memory and cubic dense diagonalization scaling. Workflows needing
+only a few quasienergies can instead use `Floquet::selected_eigensystem`,
+which applies the period map and its adjoint without constructing the dense
+unitary.

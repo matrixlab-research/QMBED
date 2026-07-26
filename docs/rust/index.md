@@ -39,6 +39,7 @@ assert!(result.converged);
 | `measure` | Expectations, partial traces, entanglement, ensembles |
 | `runtime` | Vector ownership and coarse execution primitives |
 | `interop` | Reusable owned models for language frontends |
+| `archive` | Versioned operator archives and ordered portable basis manifests |
 
 Rust exposes one native vocabulary. There is no Rust compatibility namespace
 or second set of migration aliases. The Python package separately provides its
@@ -53,6 +54,8 @@ versioned QuSpin-compatible import surface.
 | Selected spectrum | `eigsh` + `EigshOptions` |
 | Related selected spectra | `eigsh_with_workspace` + `EigshWorkspace` |
 | State evolution | `evolve` + `EvolutionOptions` |
+| Selected Floquet spectrum | `Floquet::selected_eigensystem` + `FloquetSpectrumOptions` |
+| Wide-sector entanglement | `entanglement_entropy_sector` |
 | Frontend-owned persistent model | `interop::EdModel` |
 
 `interop` is the runtime-selected ownership boundary used by Python, Julia,

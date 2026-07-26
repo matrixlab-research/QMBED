@@ -3,8 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use approx::assert_abs_diff_eq;
 use qmbed::Complex64;
 use qmbed::archive::{
-    ARCHIVE_VERSION, OperatorArchive, load_operator_npz, load_zip, save_operator_npz, save_zip,
+    ARCHIVE_VERSION, BASIS_ARCHIVE_VERSION, BasisArchive, OperatorArchive, load_basis_zip,
+    load_operator_npz, load_zip, save_basis_zip, save_operator_npz, save_zip,
 };
+use qmbed::basis::ErasedState;
 use qmbed::operator::{LinearOperator, MatrixFormat, Operator};
 
 #[test]
@@ -90,5 +92,32 @@ fn named_archive_preserves_dense_sparse_names_formats_and_defaults() {
     );
     assert!(restored.get("sparse").unwrap().default.is_none());
     assert_eq!(restored.metadata_value("scalar_dtype"), Some("float32"));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn basis_archive_preserves_wide_state_width_order_and_metadata() {
+    assert_eq!(BASIS_ARCHIVE_VERSION, 1);
+    let states = [
+        "0",
+        "3",
+        "1606938044258990275541962092341162602522202993782792835301376",
+    ]
+    .into_iter()
+    .map(|value| ErasedState::from_decimal(256, value).unwrap())
+    .collect::<Vec<_>>();
+    let mut basis = BasisArchive::new(256, states.clone()).unwrap();
+    basis.insert_metadata("kind", "spin").unwrap();
+    basis.insert_metadata("sites", "200").unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "qmbed-rust-basis-archive-{}.npz",
+        std::process::id()
+    ));
+    save_basis_zip(&path, &basis).unwrap();
+    let restored = load_basis_zip(&path).unwrap();
+    assert_eq!(restored.width_bits(), 256);
+    assert_eq!(restored.states(), states);
+    assert_eq!(restored.metadata_value("kind"), Some("spin"));
+    assert_eq!(restored.metadata_value("sites"), Some("200"));
     std::fs::remove_file(path).unwrap();
 }

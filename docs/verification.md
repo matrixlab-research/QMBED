@@ -11,7 +11,7 @@ QMBED separates four questions that are often conflated:
 
 | Workflow | What it checks |
 |---|---|
-| `CI` | Rust formatting, Clippy, unit/integration tests, paper-scale visible contracts |
+| `CI` | Rust formatting, Clippy, unit/integration tests, Rust 1.85 MSRV, macOS/Windows compilation, public-API semver checks, crates.io dry-run, and paper-scale visible contracts |
 | `language-bindings` | C ABI, Python native and compatibility tests, Julia tests |
 | `documentation` | strict MkDocs, rustdoc, Documenter, and assembled-site links |
 | `release` | synchronized versions, packages, bindings, and tagged release gate |
@@ -45,9 +45,11 @@ complete paper reproductions.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
 cargo test --release --test visible_contract -- --ignored --test-threads=1
+cargo +1.85.0 check --all-targets --all-features --locked
+cargo publish --dry-run --locked
 ```
 
 For bindings:

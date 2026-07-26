@@ -80,6 +80,8 @@ for the canonical names and extension rules.
 - Floquet spectra, spectral and dynamical response, expectation values,
   subsystem density matrices, entanglement, diagonal ensembles, state tracking,
   and Lindblad generators.
+- Matrix-free selected Floquet quasienergies, sector-native wide-state
+  entanglement contractions, and portable ordered basis manifests.
 - Reusable parameter-scan operator plans and shared symmetry-orbit caches.
 
 The four fixed-width state types (`U256`, `U1024`, `U4096`, and `U16384`) are
@@ -108,9 +110,10 @@ numerical backend. More detail is available in
 
 ## Verification and benchmarks
 
-The repository CI checks formatting, Clippy, unit and integration tests,
-paper-scale visible contracts, the shared C boundary, Python compatibility,
-Julia bindings, and all three documentation builds.
+The repository CI checks formatting, Clippy, Rust 1.85, macOS/Windows
+portability, public-API semver compatibility, crates.io packaging, unit and
+integration tests, paper-scale visible contracts, the shared C boundary,
+Python compatibility, Julia bindings, and all three documentation builds.
 
 Independent verification lives in
 [QMBED Benchmark](https://github.com/matrixlab-research/QMBED-benchmark). It

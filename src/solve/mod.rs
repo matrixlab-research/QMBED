@@ -1335,10 +1335,10 @@ where
     let mut output = vec![Complex64::new(0.0, 0.0); dimension];
     let mut reorthogonalization_passes = 0;
     let mut conditional_second_passes = 0;
-    if let SpectrumTarget::Shift(shift) = options.target
-        && shifted_solver.is_none()
-    {
-        shifted_solver = operator.shifted_solver(shift)?;
+    if let SpectrumTarget::Shift(shift) = options.target {
+        if shifted_solver.is_none() {
+            shifted_solver = operator.shifted_solver(shift)?;
+        }
     }
 
     for iteration in 0..krylov_dimension {

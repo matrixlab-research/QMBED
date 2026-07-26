@@ -28,8 +28,8 @@ from quspin.tools.evolution import evolve
 Compatibility does not imply identity with every Python implementation detail.
 Known boundaries include exact reproduction of custom wide NumPy dtype
 identities, every legacy execution hint, incidental warning text, and a few
-wide-state subsystem operations that require a sector-native sparse
-contraction.
+wide-state subsystem calls whose legacy two-sided dense return protocol has
+not yet been routed to Rust's sector-native one-sided contraction.
 
 The machine-readable status and source hashes live under
 `bindings/python/compat_tests/quspin-1.0.1/`. CI refuses to silently remove an

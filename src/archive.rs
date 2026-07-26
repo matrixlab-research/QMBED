@@ -7,12 +7,15 @@ use num_complex::Complex64;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::basis::{Basis, ErasedState};
 use crate::operator::{
     LinearOperator, MatrixFormat, Operator, QuantumComponent, QuantumOperator, materialize_dense,
 };
 use crate::{QmbedError, Result};
 
 pub const ARCHIVE_VERSION: u8 = 1;
+/// Current portable basis-manifest archive version.
+pub const BASIS_ARCHIVE_VERSION: u8 = 1;
 
 fn archive_error(error: impl std::fmt::Display) -> QmbedError {
     QmbedError::Archive(error.to_string())
@@ -216,6 +219,202 @@ fn read_complex_matrix(reader: &mut impl Read) -> Result<(usize, usize, Vec<Comp
     Ok((shape[0], shape[1], values))
 }
 
+fn validate_metadata(key: &str, value: &str) -> Result<()> {
+    if key.is_empty()
+        || key
+            .chars()
+            .any(|character| !(character.is_ascii_alphanumeric() || "_.-".contains(character)))
+    {
+        return Err(QmbedError::Archive(
+            "archive metadata keys may contain only ASCII letters, digits, `_`, `-`, and `.`"
+                .into(),
+        ));
+    }
+    if value
+        .chars()
+        .any(|character| matches!(character, '\t' | '\r' | '\n'))
+    {
+        return Err(QmbedError::Archive(
+            "archive metadata values may not contain tabs or newlines".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Portable, versioned manifest of ordered physical basis states.
+///
+/// A basis archive stores stable state identifiers, their logical bit width,
+/// public row ordering, and scalar metadata.  It intentionally does not
+/// serialize executable callbacks.  Built-in frontends may store their
+/// language-neutral constructor request in metadata and rebuild local
+/// operator semantics after loading, while every consumer can use the state
+/// manifest to align vectors, projectors, and operator archives safely.
+#[derive(Clone, Debug)]
+pub struct BasisArchive {
+    width_bits: usize,
+    states: Vec<ErasedState>,
+    metadata: BTreeMap<String, String>,
+}
+
+impl BasisArchive {
+    /// Construct an archive from ordered, unique physical state identifiers.
+    pub fn new(width_bits: usize, states: impl IntoIterator<Item = ErasedState>) -> Result<Self> {
+        let states = states.into_iter().collect::<Vec<_>>();
+        if width_bits == 0 || states.iter().any(|state| state.width_bits() != width_bits) {
+            return Err(QmbedError::Archive(
+                "basis states must share one positive logical width".into(),
+            ));
+        }
+        let mut unique = std::collections::HashSet::with_capacity(states.len());
+        if states.iter().any(|state| !unique.insert(*state)) {
+            return Err(QmbedError::Archive(
+                "basis archives require unique physical states".into(),
+            ));
+        }
+        Ok(Self {
+            width_bits,
+            states,
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    /// Snapshot any integer-labelled basis without changing its public order.
+    pub fn from_basis<B>(basis: &B, width_bits: usize) -> Result<Self>
+    where
+        B: Basis,
+        B::State: std::fmt::Display,
+    {
+        let states = (0..basis.len())
+            .map(|index| {
+                let state = basis.state(index)?;
+                ErasedState::from_decimal(width_bits, &state.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(width_bits, states)
+    }
+
+    /// Logical bit width of every archived state.
+    pub const fn width_bits(&self) -> usize {
+        self.width_bits
+    }
+
+    /// Ordered physical states, one per public basis row.
+    pub fn states(&self) -> &[ErasedState] {
+        &self.states
+    }
+
+    /// Attach a small language-neutral reconstruction hint or provenance item.
+    pub fn insert_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        let value = value.into();
+        validate_metadata(&key, &value)?;
+        self.metadata.insert(key, value);
+        Ok(())
+    }
+
+    /// Iterate over archived scalar metadata.
+    pub fn metadata(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
+    /// Read one archived metadata value.
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+}
+
+/// Save a pickle-free basis manifest preserving logical width and row order.
+pub fn save_basis_zip(path: impl AsRef<Path>, basis: &BasisArchive) -> Result<()> {
+    let file = File::create(path).map_err(archive_error)?;
+    let mut archive = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    archive
+        .start_file("basis_archive_version.npy", options)
+        .map_err(archive_error)?;
+    write_u8_npy(&mut archive, &[BASIS_ARCHIVE_VERSION])?;
+    archive
+        .start_file("basis_manifest.tsv", options)
+        .map_err(archive_error)?;
+    archive
+        .write_all(format!("width_bits\t{}\n", basis.width_bits).as_bytes())
+        .map_err(archive_error)?;
+    for state in &basis.states {
+        archive
+            .write_all(format!("state\t{}\n", state.to_decimal()).as_bytes())
+            .map_err(archive_error)?;
+    }
+    archive
+        .start_file("metadata.tsv", options)
+        .map_err(archive_error)?;
+    for (key, value) in &basis.metadata {
+        archive
+            .write_all(format!("{key}\t{value}\n").as_bytes())
+            .map_err(archive_error)?;
+    }
+    archive.finish().map_err(archive_error)?;
+    Ok(())
+}
+
+/// Load and validate a portable basis manifest.
+pub fn load_basis_zip(path: impl AsRef<Path>) -> Result<BasisArchive> {
+    let file = File::open(path).map_err(archive_error)?;
+    let mut archive = ZipArchive::new(file).map_err(archive_error)?;
+    {
+        let mut version = archive
+            .by_name("basis_archive_version.npy")
+            .map_err(archive_error)?;
+        let version = read_version(&mut version)?;
+        if version != BASIS_ARCHIVE_VERSION {
+            return Err(QmbedError::Archive(format!(
+                "unsupported basis archive version {version}"
+            )));
+        }
+    }
+    let manifest = {
+        let mut entry = archive
+            .by_name("basis_manifest.tsv")
+            .map_err(archive_error)?;
+        let mut text = String::new();
+        entry.read_to_string(&mut text).map_err(archive_error)?;
+        text
+    };
+    let mut lines = manifest.lines();
+    let width_bits = lines
+        .next()
+        .and_then(|line| line.strip_prefix("width_bits\t"))
+        .ok_or_else(|| QmbedError::Archive("basis width is missing".into()))?
+        .parse::<usize>()
+        .map_err(archive_error)?;
+    let states = lines
+        .map(|line| {
+            let value = line
+                .strip_prefix("state\t")
+                .ok_or_else(|| QmbedError::Archive("invalid basis state row".into()))?;
+            ErasedState::from_decimal(width_bits, value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut basis = BasisArchive::new(width_bits, states)?;
+    let has_metadata = archive.file_names().any(|name| name == "metadata.tsv");
+    if has_metadata {
+        let mut entry = archive.by_name("metadata.tsv").map_err(archive_error)?;
+        let mut text = String::new();
+        entry.read_to_string(&mut text).map_err(archive_error)?;
+        for line in text.lines() {
+            let (key, value) = line
+                .split_once('\t')
+                .ok_or_else(|| QmbedError::Archive("invalid archive metadata row".into()))?;
+            basis.insert_metadata(key, value)?;
+        }
+    }
+    Ok(basis)
+}
+
 /// Save a versioned, pickle-free NPZ archive readable as `np.load(path)["matrix"]`.
 pub fn save_operator_npz(
     operator: &(impl LinearOperator + ?Sized),
@@ -324,24 +523,7 @@ impl OperatorArchive {
     ) -> Result<()> {
         let key = key.into();
         let value = value.into();
-        if key.is_empty()
-            || key
-                .chars()
-                .any(|character| !(character.is_ascii_alphanumeric() || "_.-".contains(character)))
-        {
-            return Err(QmbedError::Archive(
-                "archive metadata keys may contain only ASCII letters, digits, `_`, `-`, and `.`"
-                    .into(),
-            ));
-        }
-        if value
-            .chars()
-            .any(|character| matches!(character, '\t' | '\r' | '\n'))
-        {
-            return Err(QmbedError::Archive(
-                "archive metadata values may not contain tabs or newlines".into(),
-            ));
-        }
+        validate_metadata(&key, &value)?;
         self.metadata.insert(key, value);
         Ok(())
     }
