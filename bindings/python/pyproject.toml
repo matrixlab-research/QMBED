@@ -7,7 +7,7 @@ name = "qmbed"
 version = "0.1.0"
 description = "Thin Python bindings for the QMBED Rust core"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "scipy>=1.10"]
+dependencies = ["numba>=0.59", "numpy>=1.24", "scipy>=1.10"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
