@@ -1,0 +1,126 @@
+name: Prepare Julia native artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python ci/check_versions.py --tag "v${VERSION}"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux_image: quay.io/pypa/manylinux2014_x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux_image: quay.io/pypa/manylinux2014_aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os != 'Linux'
+        with:
+          workspaces: bindings/capi
+          shared-key: native-artifact-${{ matrix.target }}
+      - name: Build portable Linux shared library
+        if: runner.os == 'Linux'
+        env:
+          MANYLINUX_IMAGE: ${{ matrix.manylinux_image }}
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/io" \
+            -w /io \
+            "${MANYLINUX_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+              sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.85.0
+              . "$HOME/.cargo/env"
+              cargo build --release --locked --target "${{ matrix.target }}" --manifest-path bindings/capi/Cargo.toml
+            '
+      - name: Build native Apple or Windows shared library
+        if: runner.os != 'Linux'
+        run: cargo build --release --locked --target "${{ matrix.target }}" --manifest-path bindings/capi/Cargo.toml
+      - name: Package deterministic artifact
+        run: >-
+          python ci/package_native_artifact.py
+          --target "${{ matrix.target }}"
+          --version "${{ inputs.version }}"
+          --output-dir native-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: native-artifacts/*.tar.gz
+
+  manifest:
+    name: Publish artifacts and open manifest PR
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+          merge-multiple: true
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.10"
+      - name: Create versioned artifact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "artifacts-v${VERSION}"
+          --prerelease
+          --title "QMBED native artifacts v${VERSION}"
+          --notes "Platform libraries consumed by the QMBED Julia package."
+          native-artifacts/*.tar.gz
+      - name: Generate Julia Artifacts.toml
+        run: >-
+          julia ci/generate_julia_artifacts.jl
+          native-artifacts
+          "${VERSION}"
+          bindings/julia/Artifacts.toml
+          "https://github.com/${{ github.repository }}/releases/download/artifacts-v${VERSION}"
+      - name: Test artifact-backed Julia package
+        run: julia --project=bindings/julia -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          branch: release/julia-artifacts-v${{ inputs.version }}
+          commit-message: Add Julia native artifacts for v${{ inputs.version }}
+          title: Add Julia native artifacts for v${{ inputs.version }}
+          body: |
+            Generated from the versioned `artifacts-v${{ inputs.version }}` release.
+            Merge this PR before creating the final `v${{ inputs.version }}` tag.
+          add-paths: bindings/julia/Artifacts.toml

@@ -46,6 +46,7 @@ nav:
   - Capabilities: capabilities.md
   - Architecture: architecture.md
   - Verification: verification.md
+  - Release process: releasing.md
   - Contributing: contributing.md
 
 plugins:

@@ -4,6 +4,7 @@
 
 [![Rust core](https://github.com/matrixlab-research/QMBED/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/ci.yml)
 [![Language bindings](https://github.com/matrixlab-research/QMBED/actions/workflows/bindings.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/bindings.yml)
+[![Python wheels](https://github.com/matrixlab-research/QMBED/actions/workflows/wheels.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/wheels.yml)
 [![Documentation](https://github.com/matrixlab-research/QMBED/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/docs.yml)
 [![Paper workflows](https://github.com/matrixlab-research/QMBED-benchmark/actions/workflows/rust-contract.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED-benchmark/actions/workflows/rust-contract.yml)
 [![Release](https://img.shields.io/github/v/release/matrixlab-research/QMBED)](https://github.com/matrixlab-research/QMBED/releases)

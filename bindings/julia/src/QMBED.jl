@@ -8,6 +8,7 @@ in Julia, Python, Rust, and the language-neutral C schema.
 module QMBED
 
 using JSON3
+using LazyArtifacts
 using Libdl
 
 export BosonBasis, Coupling, Eigensystem, EigshOptions, LocalOperator
@@ -196,6 +197,21 @@ struct Eigensystem
     eigenvectors::Union{Nothing,Vector{Vector{ComplexF64}}}
 end
 
+const _artifacts_toml = normpath(joinpath(@__DIR__, "..", "Artifacts.toml"))
+
+function _artifact_library_path(artifacts_toml=_artifacts_toml)
+    isfile(artifacts_toml) || return nothing
+    hash = LazyArtifacts.artifact_hash("qmbed_capi", artifacts_toml)
+    hash === nothing && return nothing
+    LazyArtifacts.ensure_artifact_installed("qmbed_capi", artifacts_toml)
+    root = LazyArtifacts.artifact_path(hash)
+    library = "libqmbed_capi.$(Libdl.dlext)"
+    for candidate in (joinpath(root, "lib", library), joinpath(root, library))
+        isfile(candidate) && return candidate
+    end
+    error("QMBED artifact does not contain $(library)")
+end
+
 function _library_path()
     if haskey(ENV, "QMBED_LIBRARY_PATH")
         configured = expanduser(ENV["QMBED_LIBRARY_PATH"])
@@ -203,8 +219,23 @@ function _library_path()
         repository = normpath(joinpath(@__DIR__, "..", "..", ".."))
         return normpath(joinpath(repository, configured))
     end
+    artifact = _artifact_library_path()
+    artifact === nothing || return artifact
     profile = get(ENV, "QMBED_BUILD_PROFILE", "release")
-    joinpath(@__DIR__, "..", "..", "capi", "target", profile, "libqmbed_capi.$(Libdl.dlext)")
+    source_library = joinpath(
+        @__DIR__,
+        "..",
+        "..",
+        "capi",
+        "target",
+        profile,
+        "libqmbed_capi.$(Libdl.dlext)",
+    )
+    isfile(source_library) && return source_library
+    error(
+        "QMBED native library not found; reinstall a registered package artifact, " *
+        "set QMBED_LIBRARY_PATH, or build bindings/capi with cargo",
+    )
 end
 
 function _run(request)

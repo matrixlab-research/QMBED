@@ -1,13 +1,31 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "setuptools-rust>=1.12"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "qmbed"
 version = "0.2.0"
 description = "Thin Python bindings for the QMBED Rust core"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Matrix Lab" }]
 requires-python = ">=3.10"
 dependencies = ["numba>=0.59", "numpy>=1.24", "scipy>=1.10"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Documentation = "https://matrixlab-research.github.io/QMBED/python/"
+Repository = "https://github.com/matrixlab-research/QMBED"
+Issues = "https://github.com/matrixlab-research/QMBED/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
@@ -17,3 +35,22 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 quspin = ["LICENSE.rst"]
+
+[[tool.setuptools-rust.ext-modules]]
+target = "qmbed._native"
+path = "../capi/Cargo.toml"
+binding = "NoBinding"
+cargo-manifest-args = ["--locked"]
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_*"
+build-frontend = "build[uv]"
+test-command = "python {package}/tests/wheel_smoke.py"
+
+[tool.cibuildwheel.linux]
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.85.0"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "11.0"
