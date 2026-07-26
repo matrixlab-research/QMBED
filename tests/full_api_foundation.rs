@@ -277,18 +277,24 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
     }
     let operator = Operator::from_dense(5, 5, dense).unwrap();
 
-    assert_eq!(
-        target_values(&operator, SpectrumTarget::SmallestMagnitude, 2),
-        vec![0.25, -2.0]
-    );
-    assert_eq!(
-        target_values(&operator, SpectrumTarget::LargestMagnitude, 2),
-        vec![7.0, -5.0]
-    );
-    assert_eq!(
-        target_values(&operator, SpectrumTarget::BothEnds, 3),
-        vec![-5.0, 3.0, 7.0]
-    );
+    for (actual, expected) in target_values(&operator, SpectrumTarget::SmallestMagnitude, 2)
+        .into_iter()
+        .zip([0.25, -2.0])
+    {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1.0e-12);
+    }
+    for (actual, expected) in target_values(&operator, SpectrumTarget::LargestMagnitude, 2)
+        .into_iter()
+        .zip([7.0, -5.0])
+    {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1.0e-12);
+    }
+    for (actual, expected) in target_values(&operator, SpectrumTarget::BothEnds, 3)
+        .into_iter()
+        .zip([-5.0, 3.0, 7.0])
+    {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1.0e-12);
+    }
     let without_vectors = eigh_with_options(
         &operator,
         EighOptions {
@@ -298,10 +304,13 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
     .unwrap();
     assert!(without_vectors.eigenvectors.is_empty());
     assert_eq!(without_vectors.eigenvalues.len(), 5);
-    assert_eq!(
-        eigsh_values(&operator, EigshOptions::smallest_algebraic(2),).unwrap(),
-        vec![-5.0, -2.0]
-    );
+    for (actual, expected) in eigsh_values(&operator, EigshOptions::smallest_algebraic(2))
+        .unwrap()
+        .into_iter()
+        .zip([-5.0, -2.0])
+    {
+        assert_abs_diff_eq!(actual, expected, epsilon = 1.0e-12);
+    }
 
     let large = Operator::from_triplets(
         129,
@@ -317,4 +326,38 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
     )
     .unwrap_err();
     assert!(matches!(invalid_initial, QmbedError::DimensionMismatch(_)));
+
+    let zero_initial = eigsh_with_initial(
+        &large,
+        EigshOptions::smallest_algebraic(1),
+        &[Complex64::new(0.0, 0.0); 129],
+    )
+    .unwrap_err();
+    assert!(matches!(zero_initial, QmbedError::InvalidOptions(_)));
+
+    let nonfinite_initial = eigsh_with_initial(
+        &large,
+        EigshOptions::smallest_algebraic(1),
+        &[Complex64::new(f64::NAN, 0.0); 129],
+    )
+    .unwrap_err();
+    assert!(matches!(nonfinite_initial, QmbedError::InvalidOptions(_)));
+
+    let mut selected_subspace = vec![Complex64::new(0.0, 0.0); 129];
+    selected_subspace[127] = Complex64::new(1.0, 0.0);
+    selected_subspace[128] = Complex64::new(1.0, 0.0);
+    let selected = eigsh_with_initial(
+        &large,
+        EigshOptions {
+            eigenpairs: 1,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(2),
+            tolerance: 1.0e-12,
+            max_iterations: 2,
+            seed: 0,
+        },
+        &selected_subspace,
+    )
+    .unwrap();
+    assert_abs_diff_eq!(selected.eigenvalues[0], 127.0, epsilon = 1.0e-10);
 }

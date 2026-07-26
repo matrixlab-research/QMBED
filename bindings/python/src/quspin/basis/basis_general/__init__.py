@@ -1,0 +1,41 @@
+"""QuSpin-compatible general-basis imports."""
+
+from .. import (
+    basis_int_to_python_int,
+    basis_ones,
+    basis_zeros,
+    bitwise_and,
+    bitwise_leftshift,
+    bitwise_not,
+    bitwise_or,
+    bitwise_rightshift,
+    bitwise_xor,
+    boson_basis_general,
+    get_basis_type,
+    python_int_to_basis_int,
+    spin_basis_general,
+    spinful_fermion_basis_general,
+    spinless_fermion_basis_general,
+    uint32,
+    uint64,
+)
+
+__all__ = [
+    "basis_int_to_python_int",
+    "basis_ones",
+    "basis_zeros",
+    "bitwise_and",
+    "bitwise_leftshift",
+    "bitwise_not",
+    "bitwise_or",
+    "bitwise_rightshift",
+    "bitwise_xor",
+    "boson_basis_general",
+    "get_basis_type",
+    "python_int_to_basis_int",
+    "spin_basis_general",
+    "spinful_fermion_basis_general",
+    "spinless_fermion_basis_general",
+    "uint32",
+    "uint64",
+]

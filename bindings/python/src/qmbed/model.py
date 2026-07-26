@@ -21,6 +21,7 @@ class LocalOperator(str, Enum):
 class OpProduct:
     local: tuple[LocalOperator | str, ...]
     split: int | None = None
+    splits: tuple[int, ...] = ()
 
     @classmethod
     def spinful(
@@ -37,7 +38,11 @@ class OpProduct:
             for operator in self.local
         ]
         result = {"local": local}
-        if self.split is not None:
+        if self.splits:
+            if self.split is not None:
+                raise ValueError("OpProduct cannot define both split and splits")
+            result["splits"] = list(self.splits)
+        elif self.split is not None:
             result["split"] = self.split
         return result
 

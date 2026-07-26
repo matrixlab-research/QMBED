@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
-use qmbed::Complex64;
 use qmbed::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
 use qmbed::runtime::{CpuRuntime, ExecutionProfile};
 use qmbed::solve::{
-    EigshOptions, ExpmMultiplyParallel, ExpmOptions, LanczosOptions, ShiftInvertPlan,
-    SpectrumTarget, eigsh, expm_multiply, ftlm_observable_iteration, ftlm_static_iteration,
-    lanczos_full, lanczos_iter, linear_combination_qt, ltlm_observable_iteration,
-    ltlm_static_iteration,
+    EigshOptions, ExpmActionPlan, ExpmMultiplyParallel, ExpmOptions, LanczosOptions,
+    ShiftInvertPlan, SpectrumTarget, eigsh, evolve_with_diagnostics, expm_multiply,
+    ftlm_observable_iteration, ftlm_static_iteration, lanczos_full, lanczos_iter, lanczos_ritz,
+    linear_combination_qt, ltlm_observable_iteration, ltlm_static_iteration,
 };
+use qmbed::{Complex64, QmbedError};
 
 fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
     left.iter()
@@ -62,12 +62,56 @@ fn real_operator_capability_drives_large_sparse_eigsh() {
     assert_abs_diff_eq!(result.eigenvalues[0], -2.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(result.eigenvalues[1], -1.0, epsilon = 1.0e-12);
     assert!(result.residuals.iter().all(|residual| *residual < 1.0e-12));
+    assert!(result.reorthogonalization_passes >= result.iterations);
+    assert!(result.conditional_second_passes < result.iterations);
 
     let complex =
         Operator::from_triplets(1, 1, [(0, 0, Complex64::new(0.0, 1.0))], MatrixFormat::Csc)
             .unwrap();
     assert!(!complex.is_real());
     assert!(complex.apply_real(&[1.0], &mut [0.0]).is_err());
+}
+
+#[test]
+fn eigsh_never_relabels_a_loose_ritz_pair_as_converged() {
+    let values = (0..300)
+        .map(|index| index as f64 * 1.0e-8 / 299.0)
+        .collect::<Vec<_>>();
+    let result = eigsh(
+        &diagonal(&values),
+        EigshOptions {
+            eigenpairs: 1,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(2),
+            tolerance: 1.0e-12,
+            max_iterations: 2,
+            seed: 7,
+        },
+    );
+    assert!(matches!(result, Err(QmbedError::NonConvergence { .. })));
+}
+
+#[test]
+fn automatic_eigsh_expands_the_krylov_space_within_the_iteration_budget() {
+    let values = (0..300)
+        .map(|index| index as f64 / 299.0)
+        .collect::<Vec<_>>();
+    let result = eigsh(
+        &diagonal(&values),
+        EigshOptions {
+            eigenpairs: 1,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: None,
+            tolerance: 1.0e-16,
+            max_iterations: 1_000,
+            seed: 7,
+        },
+    )
+    .unwrap();
+    assert_abs_diff_eq!(result.eigenvalues[0], 0.0, epsilon = 1.0e-13);
+    assert!(result.residuals[0] <= 1.0e-13);
+    assert!(result.iterations > 256);
+    assert!(result.conditional_second_passes < result.iterations);
 }
 
 #[test]
@@ -98,6 +142,32 @@ fn public_lanczos_full_and_iterator_return_the_same_tridiagonalization() {
             assert_abs_diff_eq!(actual.re, expected.re, epsilon = 1.0e-12);
             assert_abs_diff_eq!(actual.im, expected.im, epsilon = 1.0e-12);
         }
+    }
+}
+
+#[test]
+fn ritz_decomposition_reconstructs_general_complex_exponential_actions() {
+    let operator = diagonal(&[-1.0, 0.5, 2.0]);
+    let initial = vec![
+        Complex64::new(0.5, -0.25),
+        Complex64::new(-0.75, 0.125),
+        Complex64::new(0.25, 0.5),
+    ];
+    let ritz = lanczos_ritz(
+        &operator,
+        &initial,
+        LanczosOptions {
+            krylov_dimension: 3,
+            tolerance: 1.0e-13,
+        },
+    )
+    .unwrap();
+    let coefficient = Complex64::new(-0.2, 0.3);
+    let actual = ritz.exponential_action(coefficient).unwrap();
+    for ((value, initial), energy) in actual.iter().zip(&initial).zip([-1.0, 0.5, 2.0]) {
+        let expected = *initial * (coefficient * energy).exp();
+        assert_abs_diff_eq!(value.re, expected.re, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(value.im, expected.im, epsilon = 1.0e-12);
     }
 }
 
@@ -159,6 +229,43 @@ fn expm_multiply_reuses_the_existing_trajectory_contract() {
     .unwrap();
     assert_eq!(trajectory.states.len(), 3);
     assert_abs_diff_eq!(trajectory.states[2][0].norm(), 1.0, epsilon = 1.0e-12);
+}
+
+#[test]
+fn hermitian_evolution_adapts_a_small_krylov_space_to_the_requested_tolerance() {
+    let values = (0..32)
+        .map(|index| -2.0 + 4.0 * index as f64 / 31.0)
+        .collect::<Vec<_>>();
+    let operator = diagonal(&values);
+    let amplitude = 1.0 / (values.len() as f64).sqrt();
+    let initial = vec![Complex64::new(amplitude, 0.0); values.len()];
+    let (trajectory, diagnostics) = evolve_with_diagnostics(
+        &operator,
+        &initial,
+        qmbed::solve::EvolutionOptions {
+            times: vec![0.0, 1.0, 5.0],
+            krylov_dimension: 8,
+            tolerance: 1.0e-10,
+            max_substeps: 10_000,
+            hamiltonian: true,
+        },
+    )
+    .unwrap();
+    assert!(diagnostics.lanczos_projections > 1);
+    assert_eq!(
+        diagnostics.matrix_vector_products,
+        diagnostics.lanczos_projections * 8
+    );
+    assert_eq!(
+        diagnostics.accepted_substeps,
+        diagnostics.lanczos_projections
+    );
+    assert!(diagnostics.rejected_trial_intervals > 0);
+
+    for ((actual, energy), initial) in trajectory.states[2].iter().zip(values).zip(initial) {
+        let expected = initial * Complex64::new(0.0, -5.0 * energy).exp();
+        assert!((*actual - expected).norm() < 1.0e-9);
+    }
 }
 
 #[test]
@@ -271,6 +378,50 @@ fn reusable_exponential_plan_supports_batches_and_coefficient_updates() {
     plan.apply_in_place(&mut state).unwrap();
     assert_abs_diff_eq!(state[0].re, 0.5_f64.cosh(), epsilon = 1.0e-12);
     assert_abs_diff_eq!(state[1].im, -0.5_f64.sinh(), epsilon = 1.0e-12);
+}
+
+#[test]
+fn scaled_taylor_action_handles_a_large_nonnormal_nilpotent_generator() {
+    let generator = Operator::from_triplets(
+        4,
+        4,
+        [
+            (0, 1, Complex64::new(20.0, 0.0)),
+            (1, 2, Complex64::new(-15.0, 0.0)),
+            (2, 3, Complex64::new(10.0, 0.0)),
+        ],
+        MatrixFormat::Csr,
+    )
+    .unwrap();
+    let coefficient = Complex64::new(0.7, -0.2);
+    let input = vec![
+        Complex64::new(1.0, -0.5),
+        Complex64::new(-2.0, 0.25),
+        Complex64::new(0.5, 1.0),
+        Complex64::new(3.0, -1.0),
+    ];
+    let plan = ExpmActionPlan::new(&generator, coefficient, 55, 0.5 * f64::EPSILON, 1_000).unwrap();
+    assert!(plan.scaling() > 1);
+    let actual = plan.apply(&generator, &input).unwrap();
+
+    let mut expected = input.clone();
+    let mut power = input;
+    let mut applied = vec![Complex64::new(0.0, 0.0); 4];
+    let mut coefficient_power = Complex64::new(1.0, 0.0);
+    let mut factorial = 1.0;
+    for order in 1..4 {
+        generator.apply(&power, &mut applied).unwrap();
+        power.copy_from_slice(&applied);
+        coefficient_power *= coefficient;
+        factorial *= order as f64;
+        for (value, term) in expected.iter_mut().zip(&power) {
+            *value += coefficient_power * *term / factorial;
+        }
+    }
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_abs_diff_eq!(actual.re, expected.re, epsilon = 2.0e-12);
+        assert_abs_diff_eq!(actual.im, expected.im, epsilon = 2.0e-12);
+    }
 }
 
 #[test]

@@ -5,7 +5,7 @@ using Libdl
 
 export BosonBasis, Coupling, Eigensystem, EigshOptions, LocalOperator
 export OpProduct, OperatorSpec, SpinBasis, SpinfulFermionBasis
-export SpinlessFermionBasis, eigsh, Compat
+export SpinlessFermionBasis, eigsh
 export IdentityOp, NumberOp, ZOp, RaisingOp, LoweringOp, XOp, YOp
 
 @enum LocalOperator begin
@@ -225,37 +225,6 @@ function eigsh(
         Bool(result.converged),
         vectors,
     )
-end
-
-module Compat
-module QuSpin
-
-import ...QMBED: Coupling, LocalOperator, LoweringOp, NumberOp, OpProduct
-import ...QMBED: OperatorSpec, RaisingOp, XOp, YOp, ZOp, IdentityOp
-
-const _symbols = Dict(
-    'I' => IdentityOp,
-    'n' => NumberOp,
-    'z' => ZOp,
-    '+' => RaisingOp,
-    '-' => LoweringOp,
-    'x' => XOp,
-    'y' => YOp,
-)
-
-function operator_term(operator::AbstractString, couplings)
-    count(==('|'), operator) <= 1 ||
-        throw(ArgumentError("a spinful operator may contain only one separator"))
-    separator = findfirst(==('|'), operator)
-    split = isnothing(separator) ? nothing : separator - 1
-    local_operators = Union{LocalOperator,String}[
-        get(_symbols, symbol, "custom:$symbol")
-        for symbol in operator if symbol != '|'
-    ]
-    OperatorSpec(OpProduct(local_operators; split), Coupling[c for c in couplings])
-end
-
-end
 end
 
 end

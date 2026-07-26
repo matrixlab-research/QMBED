@@ -59,9 +59,10 @@ explicit functions in `qmbed::compat::quspin`. They are parsed once into the
 same `OpProduct` used above; they do not select a second assembler.
 
 Thin [Python and Julia bindings](bindings/README.md) construct the same typed
-request through a shared C ABI. Their compatibility namespaces
-(`qmbed.compat.quspin` and `QMBED.Compat.QuSpin`) translate legacy operator
-strings before crossing that boundary.
+request through a shared C ABI. Python offers a versioned
+`qmbed.compat.quspin` migration surface, tested against an unchanged snapshot
+of the official QuSpin tests. Julia deliberately exposes only native QMBED
+types and does not carry a second compatibility API.
 
 The same `OperatorBuilder::between(source, target)` path constructs a
 rectangular probe between particle-number or symmetry sectors. The same

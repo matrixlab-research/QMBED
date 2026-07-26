@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
 use qmbed::dynamics::{
-    CallableDriveStep, DriveStep, Floquet, FloquetTimeVector, dynamical_correlator,
+    CallableDriveStep, DriveStep, Floquet, FloquetTimeVector, analyze_floquet_unitary,
+    dynamical_correlator,
 };
 use qmbed::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
 use qmbed::solve::EvolutionOptions;
@@ -46,6 +47,57 @@ fn floquet_builds_unitary_quasienergies_and_effective_hamiltonian() {
 }
 
 #[test]
+fn floquet_analysis_reuses_one_propagator_and_supports_kicked_periods() {
+    let hamiltonian = diagonal(&[-1.0, 1.0]);
+    let floquet = Floquet::new([DriveStep::new(Arc::new(hamiltonian), 0.25).unwrap()])
+        .unwrap()
+        .with_period(1.0)
+        .unwrap();
+    let analysis = floquet.analyze(MatrixFormat::Dense).unwrap();
+    assert_abs_diff_eq!(analysis.period, 1.0, epsilon = 1.0e-15);
+    assert_abs_diff_eq!(analysis.protocol_duration, 0.25, epsilon = 1.0e-15);
+    assert_abs_diff_eq!(
+        analysis.eigensystem.quasienergies[0],
+        -0.25,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        analysis.eigensystem.quasienergies[1],
+        0.25,
+        epsilon = 1.0e-12
+    );
+    let effective = analysis.effective_hamiltonian.to_dense();
+    assert_abs_diff_eq!(effective[0].re, -0.25, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(effective[3].re, 0.25, epsilon = 1.0e-12);
+}
+
+#[test]
+fn externally_constructed_unitary_uses_the_same_floquet_analysis() {
+    let unitary = Operator::from_dense(
+        2,
+        2,
+        vec![
+            Complex64::new(0.3_f64.cos(), 0.3_f64.sin()),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.3_f64.cos(), -0.3_f64.sin()),
+        ],
+    )
+    .unwrap();
+    let analysis = analyze_floquet_unitary(&unitary, 0.6, MatrixFormat::Dense).unwrap();
+    assert_abs_diff_eq!(
+        analysis.eigensystem.quasienergies[0],
+        -0.5,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        analysis.eigensystem.quasienergies[1],
+        0.5,
+        epsilon = 1.0e-12
+    );
+}
+
+#[test]
 fn callable_floquet_drive_integrates_within_the_period() {
     let zero = diagonal(&[0.0, 0.0]);
     let driven = Hamiltonian::<Dynamic>::new(
@@ -82,6 +134,16 @@ fn floquet_time_vector_has_exact_cycle_coordinates() {
         times.coordinate(9).unwrap_err(),
         QmbedError::InvalidOptions(_)
     ));
+}
+
+#[test]
+fn staged_floquet_time_vector_includes_ramps_and_both_endpoints() {
+    let times = FloquetTimeVector::staged(0.5, 2, 3, 1, 4).unwrap();
+    assert_eq!(times.cycles(), 6);
+    assert_eq!(times.points_per_cycle(), 4);
+    assert_eq!(times.times().len(), 25);
+    assert_abs_diff_eq!(times.times()[0], -1.0, epsilon = 1.0e-15);
+    assert_abs_diff_eq!(times.times()[24], 2.0, epsilon = 1.0e-15);
 }
 
 #[test]

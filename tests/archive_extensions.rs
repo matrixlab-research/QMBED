@@ -65,6 +65,7 @@ fn named_archive_preserves_dense_sparse_names_formats_and_defaults() {
         .insert("dense", dense.clone(), Some(Complex64::new(1.0, 0.0)))
         .unwrap();
     entries.insert("sparse", sparse.clone(), None).unwrap();
+    entries.insert_metadata("scalar_dtype", "float32").unwrap();
     let path = std::env::temp_dir().join(format!(
         "qmbed-rust-named-archive-{}.npz",
         std::process::id()
@@ -88,5 +89,6 @@ fn named_archive_preserves_dense_sparse_names_formats_and_defaults() {
         sparse.triplets()
     );
     assert!(restored.get("sparse").unwrap().default.is_none());
+    assert_eq!(restored.metadata_value("scalar_dtype"), Some("float32"));
     std::fs::remove_file(path).unwrap();
 }

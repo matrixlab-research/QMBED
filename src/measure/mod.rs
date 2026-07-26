@@ -4,7 +4,7 @@ use num_complex::Complex64;
 
 use crate::basis::BasisProjector;
 use crate::operator::{LinearOperator, MatrixFormat, Operator};
-use crate::solve::{StateTrajectory, eigh};
+use crate::solve::StateTrajectory;
 use crate::{QmbedError, Result};
 
 /// Gauge-independent finite-dimensional subspace.
@@ -143,6 +143,30 @@ pub fn quantum_fluctuation(
     let mean = inner(state, &applied) / norm;
     let second = inner(&applied, &applied).re / norm;
     Ok((second - mean.norm_sqr()).max(0.0))
+}
+
+/// Raw pure-state fluctuation
+/// `⟨ψ|A²|ψ⟩ - ⟨ψ|A|ψ⟩²` without normalizing `ψ`.
+///
+/// This preserves array-oriented compatibility semantics, including the zero
+/// vector, while [`quantum_fluctuation`] remains the strict normalized-state
+/// variance API.
+pub fn raw_quantum_fluctuation(
+    operator: &(impl LinearOperator + ?Sized),
+    state: &[Complex64],
+) -> Result<Complex64> {
+    let shape = operator.shape();
+    if shape.0 != shape.1 || state.len() != shape.0 {
+        return Err(QmbedError::DimensionMismatch(
+            "raw quantum fluctuation requires a square operator matching the state".into(),
+        ));
+    }
+    let mut applied = vec![Complex64::new(0.0, 0.0); state.len()];
+    let mut applied_twice = vec![Complex64::new(0.0, 0.0); state.len()];
+    operator.apply(state, &mut applied)?;
+    operator.apply(&applied, &mut applied_twice)?;
+    let mean = inner(state, &applied);
+    Ok(inner(state, &applied_twice) - mean * mean)
 }
 
 /// Reduced density matrix of the first factor of a pure bipartite state.
@@ -312,6 +336,301 @@ fn subsystem_index_map(
     })
 }
 
+/// Tensor-product dimensions selected by an arbitrary retained site set.
+pub fn subsystem_dimensions(
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<(usize, usize)> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    Ok((layout.subsystem_dimension, layout.environment_dimension))
+}
+
+/// Fock-space signs induced by grouping selected fermionic modes into a
+/// subsystem. The returned phase is indexed by the original packed state.
+///
+/// Modes inside the environment and subsystem keep the orders supplied by the
+/// ordinary subsystem layout; only the swaps needed to group the two factors
+/// contribute a sign.
+pub fn fermionic_subsystem_phases(
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<Vec<f64>> {
+    let all_sites = (0..local_dimensions.len()).collect::<Vec<_>>();
+    noncommuting_subsystem_phases(local_dimensions, retained_sites, &[all_sites])
+}
+
+/// One disjoint set of binary modes sharing an exchange phase.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoncommutingGroup {
+    sites: Vec<usize>,
+    exchange_phase: Complex64,
+}
+
+impl NoncommutingGroup {
+    pub fn new(sites: impl Into<Vec<usize>>, exchange_phase: impl Into<Complex64>) -> Result<Self> {
+        let exchange_phase = exchange_phase.into();
+        if !exchange_phase.re.is_finite()
+            || !exchange_phase.im.is_finite()
+            || (exchange_phase.norm() - 1.0).abs() > 1.0e-12
+        {
+            return Err(QmbedError::InvalidOptions(
+                "a noncommuting exchange phase must be finite and have unit magnitude".into(),
+            ));
+        }
+        Ok(Self {
+            sites: sites.into(),
+            exchange_phase,
+        })
+    }
+
+    pub fn sites(&self) -> &[usize] {
+        &self.sites
+    }
+
+    pub const fn exchange_phase(&self) -> Complex64 {
+        self.exchange_phase
+    }
+}
+
+/// Exchange phases induced by regrouping a tensor product with selected
+/// mutually anticommuting site groups.
+///
+/// Sites outside these groups commute. Distinct groups also commute with one
+/// another, while occupied binary sites inside the same group contribute one
+/// minus sign for every order inversion. This is the minimal generalization
+/// needed for mixed spin/boson/fermion user bases without assigning global
+/// fermionic statistics to the entire product space.
+pub fn noncommuting_subsystem_phases(
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[Vec<usize>],
+) -> Result<Vec<f64>> {
+    let groups = noncommuting_groups
+        .iter()
+        .map(|sites| NoncommutingGroup::new(sites.clone(), Complex64::new(-1.0, 0.0)))
+        .collect::<Result<Vec<_>>>()?;
+    noncommuting_subsystem_exchange_phases(local_dimensions, retained_sites, &groups)
+        .map(|phases| phases.into_iter().map(|phase| phase.re).collect::<Vec<_>>())
+}
+
+/// General exchange phases induced by regrouping disjoint binary-mode groups.
+///
+/// Each inversion inside a group contributes that group's unit-modulus phase.
+/// Distinct groups and sites outside all groups commute.
+pub fn noncommuting_subsystem_exchange_phases(
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<Vec<Complex64>> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    let mut retained = vec![false; local_dimensions.len()];
+    for &site in retained_sites {
+        retained[site] = true;
+    }
+    let mut new_order = (0..local_dimensions.len())
+        .filter(|site| !retained[*site])
+        .collect::<Vec<_>>();
+    new_order.extend_from_slice(retained_sites);
+    let mut new_position = vec![0; local_dimensions.len()];
+    for (position, &site) in new_order.iter().enumerate() {
+        new_position[site] = position;
+    }
+    let mut group_for_site = vec![None; local_dimensions.len()];
+    for (group, noncommuting_group) in noncommuting_groups.iter().enumerate() {
+        let mut seen = std::collections::HashSet::with_capacity(noncommuting_group.sites().len());
+        for &site in noncommuting_group.sites() {
+            if site >= local_dimensions.len() {
+                return Err(QmbedError::InvalidSite {
+                    site,
+                    sites: local_dimensions.len(),
+                });
+            }
+            if local_dimensions[site] != 2 {
+                return Err(QmbedError::InvalidOptions(format!(
+                    "noncommuting site {site} must have binary local dimension"
+                )));
+            }
+            if !seen.insert(site) {
+                return Err(QmbedError::InvalidOptions(
+                    "a noncommuting group cannot repeat a site".into(),
+                ));
+            }
+            if group_for_site[site].replace(group).is_some() {
+                return Err(QmbedError::InvalidOptions(
+                    "noncommuting groups must be disjoint".into(),
+                ));
+            }
+        }
+    }
+    let mut strides = Vec::with_capacity(local_dimensions.len());
+    let mut stride = 1_usize;
+    for &dimension in local_dimensions {
+        strides.push(stride);
+        stride = stride
+            .checked_mul(dimension)
+            .ok_or_else(|| QmbedError::DimensionMismatch("Hilbert-space size overflow".into()))?;
+    }
+
+    Ok((0..layout.full_dimension)
+        .map(|state| {
+            let mut inversions = vec![0_u32; noncommuting_groups.len()];
+            for left in 0..local_dimensions.len() {
+                let Some(group) = group_for_site[left] else {
+                    continue;
+                };
+                if (state / strides[left]) % local_dimensions[left] == 0 {
+                    continue;
+                }
+                for right in (left + 1)..local_dimensions.len() {
+                    if group_for_site[right] == Some(group)
+                        && (state / strides[right]) % local_dimensions[right] != 0
+                        && new_position[left] > new_position[right]
+                    {
+                        inversions[group] += 1;
+                    }
+                }
+            }
+            inversions
+                .into_iter()
+                .zip(noncommuting_groups)
+                .fold(Complex64::new(1.0, 0.0), |phase, (count, group)| {
+                    phase * group.exchange_phase().powu(count)
+                })
+        })
+        .collect())
+}
+
+/// Apply arbitrary selected exchange phases to a pure state.
+pub fn apply_noncommuting_subsystem_exchange_phases(
+    state: &mut [Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<()> {
+    let phases = noncommuting_subsystem_exchange_phases(
+        local_dimensions,
+        retained_sites,
+        noncommuting_groups,
+    )?;
+    if state.len() != phases.len() {
+        return Err(QmbedError::DimensionMismatch(
+            "state length does not match the noncommuting subsystem layout".into(),
+        ));
+    }
+    for (value, phase) in state.iter_mut().zip(phases) {
+        *value *= phase;
+    }
+    Ok(())
+}
+
+/// Apply selected noncommuting-group exchange phases to a pure state.
+pub fn apply_noncommuting_subsystem_phases(
+    state: &mut [Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[Vec<usize>],
+) -> Result<()> {
+    let phases =
+        noncommuting_subsystem_phases(local_dimensions, retained_sites, noncommuting_groups)?;
+    if state.len() != phases.len() {
+        return Err(QmbedError::DimensionMismatch(
+            "state length does not match the noncommuting subsystem layout".into(),
+        ));
+    }
+    for (value, phase) in state.iter_mut().zip(phases) {
+        *value *= phase;
+    }
+    Ok(())
+}
+
+/// Apply fermionic subsystem-ordering phases to a packed pure state.
+pub fn apply_fermionic_subsystem_phases(
+    state: &mut [Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<()> {
+    let phases = fermionic_subsystem_phases(local_dimensions, retained_sites)?;
+    if state.len() != phases.len() {
+        return Err(QmbedError::DimensionMismatch(
+            "state length does not match the fermionic subsystem layout".into(),
+        ));
+    }
+    for (value, phase) in state.iter_mut().zip(phases) {
+        *value *= phase;
+    }
+    Ok(())
+}
+
+/// Apply selected noncommuting-group exchange phases to both density axes.
+pub fn apply_noncommuting_subsystem_phases_density(
+    density: &mut [Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[Vec<usize>],
+) -> Result<()> {
+    let phases =
+        noncommuting_subsystem_phases(local_dimensions, retained_sites, noncommuting_groups)?;
+    let dimension = phases.len();
+    if density.len() != dimension.saturating_mul(dimension) {
+        return Err(QmbedError::DimensionMismatch(
+            "density matrix does not match the noncommuting subsystem layout".into(),
+        ));
+    }
+    for row in 0..dimension {
+        for column in 0..dimension {
+            density[row * dimension + column] *= phases[row] * phases[column];
+        }
+    }
+    Ok(())
+}
+
+/// Apply arbitrary selected exchange phases to both density-matrix axes.
+pub fn apply_noncommuting_subsystem_exchange_phases_density(
+    density: &mut [Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<()> {
+    let phases = noncommuting_subsystem_exchange_phases(
+        local_dimensions,
+        retained_sites,
+        noncommuting_groups,
+    )?;
+    let dimension = phases.len();
+    if density.len() != dimension.saturating_mul(dimension) {
+        return Err(QmbedError::DimensionMismatch(
+            "density matrix does not match the noncommuting subsystem layout".into(),
+        ));
+    }
+    for row in 0..dimension {
+        for column in 0..dimension {
+            density[row * dimension + column] *= phases[row] * phases[column].conj();
+        }
+    }
+    Ok(())
+}
+
+/// Apply the same fermionic mode permutation to both density-matrix axes.
+pub fn apply_fermionic_subsystem_phases_density(
+    density: &mut [Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<()> {
+    let phases = fermionic_subsystem_phases(local_dimensions, retained_sites)?;
+    let dimension = phases.len();
+    if density.len() != dimension.saturating_mul(dimension) {
+        return Err(QmbedError::DimensionMismatch(
+            "density matrix does not match the fermionic subsystem layout".into(),
+        ));
+    }
+    for row in 0..dimension {
+        for column in 0..dimension {
+            density[row * dimension + column] *= phases[row] * phases[column];
+        }
+    }
+    Ok(())
+}
+
 /// Reduced density matrix for an arbitrary retained set of mixed-radix sites.
 /// Site zero is the least-significant local digit, matching the basis encodings.
 pub fn partial_trace_subsystem(
@@ -407,10 +726,12 @@ pub enum EntropyOrder {
     Renyi(f64),
 }
 
-fn entropy_from_probabilities(probabilities: Vec<f64>, order: EntropyOrder) -> Result<f64> {
+/// Entropy of an already validated density-matrix spectrum.
+pub fn entropy_from_spectrum(probabilities: &[f64], order: EntropyOrder) -> Result<f64> {
     match order {
         EntropyOrder::VonNeumann => Ok(-probabilities
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|probability| *probability > f64::EPSILON)
             .map(|probability| probability * probability.ln())
             .sum::<f64>()),
@@ -418,7 +739,8 @@ fn entropy_from_probabilities(probabilities: Vec<f64>, order: EntropyOrder) -> R
             if alpha.is_finite() && alpha > 0.0 && (alpha - 1.0).abs() > 1.0e-12 =>
         {
             Ok(probabilities
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|probability| probability.powf(alpha))
                 .sum::<f64>()
                 .ln()
@@ -442,23 +764,11 @@ pub fn entanglement_entropy(
             "Renyi order must be positive, finite, and different from one".into(),
         ));
     }
-    let density = partial_trace(state, subsystem_dimension, environment_dimension)?;
-    let operator = Operator::from_dense(subsystem_dimension, subsystem_dimension, density)?;
-    let spectrum = eigh(&operator)?;
-    let probabilities: Vec<_> = spectrum
-        .eigenvalues
-        .into_iter()
-        .map(|value| {
-            if value < -1.0e-10 {
-                Err(QmbedError::InvalidOptions(
-                    "reduced density matrix is not positive".into(),
-                ))
-            } else {
-                Ok(value.max(0.0))
-            }
-        })
-        .collect::<Result<_>>()?;
-    entropy_from_probabilities(probabilities, order)
+    let probabilities = density_matrix_spectrum(
+        partial_trace(state, subsystem_dimension, environment_dimension)?,
+        subsystem_dimension,
+    )?;
+    entropy_from_spectrum(&probabilities, order)
 }
 
 pub fn entanglement_spectrum_subsystem(
@@ -467,10 +777,72 @@ pub fn entanglement_spectrum_subsystem(
     retained_sites: &[usize],
 ) -> Result<Vec<f64>> {
     let layout = subsystem_index_map(local_dimensions, retained_sites)?;
-    density_spectrum(
+    density_matrix_spectrum(
         partial_trace_subsystem(state, local_dimensions, retained_sites)?,
         layout.subsystem_dimension,
     )
+}
+
+/// Canonical Schmidt spectrum for a pure bipartition.
+///
+/// A pure state has the same nonzero reduced spectrum on both sides of a
+/// bipartition. Computing two density-matrix decompositions independently is
+/// both wasteful and capable of producing last-bit entropy differences. This
+/// routine chooses the smaller factor, with a lexicographic tie-break on
+/// sorted site sets, so complementary calls take the identical numerical
+/// path. Optional noncommuting groups are reordered against that same
+/// canonical factor before the spectrum is evaluated.
+pub fn canonical_schmidt_spectrum_subsystem(
+    state: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[Vec<usize>],
+) -> Result<Vec<f64>> {
+    let groups = noncommuting_groups
+        .iter()
+        .map(|sites| NoncommutingGroup::new(sites.clone(), Complex64::new(-1.0, 0.0)))
+        .collect::<Result<Vec<_>>>()?;
+    canonical_schmidt_spectrum_subsystem_with_exchange_phases(
+        state,
+        local_dimensions,
+        retained_sites,
+        &groups,
+    )
+}
+
+pub fn canonical_schmidt_spectrum_subsystem_with_exchange_phases(
+    state: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    noncommuting_groups: &[NoncommutingGroup],
+) -> Result<Vec<f64>> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    let mut retained = retained_sites.to_vec();
+    retained.sort_unstable();
+    let mut selected = vec![false; local_dimensions.len()];
+    for &site in &retained {
+        selected[site] = true;
+    }
+    let environment = (0..local_dimensions.len())
+        .filter(|site| !selected[*site])
+        .collect::<Vec<_>>();
+    let canonical_sites = if layout.subsystem_dimension < layout.environment_dimension
+        || (layout.subsystem_dimension == layout.environment_dimension && retained <= environment)
+    {
+        retained
+    } else {
+        environment
+    };
+    let mut canonical_state = state.to_vec();
+    if !noncommuting_groups.is_empty() {
+        apply_noncommuting_subsystem_exchange_phases(
+            &mut canonical_state,
+            local_dimensions,
+            &canonical_sites,
+            noncommuting_groups,
+        )?;
+    }
+    entanglement_spectrum_subsystem(&canonical_state, local_dimensions, &canonical_sites)
 }
 
 pub fn entanglement_spectrum_density_subsystem(
@@ -479,7 +851,7 @@ pub fn entanglement_spectrum_density_subsystem(
     retained_sites: &[usize],
 ) -> Result<Vec<f64>> {
     let layout = subsystem_index_map(local_dimensions, retained_sites)?;
-    density_spectrum(
+    density_matrix_spectrum(
         partial_trace_density_subsystem(density, local_dimensions, retained_sites)?,
         layout.subsystem_dimension,
     )
@@ -491,8 +863,8 @@ pub fn entanglement_entropy_subsystem(
     retained_sites: &[usize],
     order: EntropyOrder,
 ) -> Result<f64> {
-    entropy_from_probabilities(
-        entanglement_spectrum_subsystem(state, local_dimensions, retained_sites)?,
+    entropy_from_spectrum(
+        &entanglement_spectrum_subsystem(state, local_dimensions, retained_sites)?,
         order,
     )
 }
@@ -503,8 +875,8 @@ pub fn entanglement_entropy_density(
     environment_dimension: usize,
     order: EntropyOrder,
 ) -> Result<f64> {
-    entropy_from_probabilities(
-        entanglement_spectrum_density(density, subsystem_dimension, environment_dimension)?,
+    entropy_from_spectrum(
+        &entanglement_spectrum_density(density, subsystem_dimension, environment_dimension)?,
         order,
     )
 }
@@ -515,23 +887,58 @@ pub fn entanglement_entropy_density_subsystem(
     retained_sites: &[usize],
     order: EntropyOrder,
 ) -> Result<f64> {
-    entropy_from_probabilities(
-        entanglement_spectrum_density_subsystem(density, local_dimensions, retained_sites)?,
+    entropy_from_spectrum(
+        &entanglement_spectrum_density_subsystem(density, local_dimensions, retained_sites)?,
         order,
     )
 }
 
-fn density_spectrum(density: Vec<Complex64>, dimension: usize) -> Result<Vec<f64>> {
-    let operator = Operator::from_dense(dimension, dimension, density)?;
-    let spectrum = eigh(&operator)?;
-    let mut probabilities = Vec::with_capacity(dimension);
-    for value in spectrum.eigenvalues {
-        if value < -1.0e-10 {
-            return Err(QmbedError::InvalidOptions(
-                "density matrix is not positive semidefinite".into(),
-            ));
+/// Sorted eigenvalue spectrum of a row-major positive semidefinite density matrix.
+pub fn density_matrix_spectrum(density: Vec<Complex64>, dimension: usize) -> Result<Vec<f64>> {
+    if density.len() != dimension.saturating_mul(dimension) {
+        return Err(QmbedError::DimensionMismatch(
+            "density matrix shape does not match its dimension".into(),
+        ));
+    }
+    let mut trace = Complex64::new(0.0, 0.0);
+    let mut scale = 0.0_f64;
+    for row in 0..dimension {
+        trace += density[row * dimension + row];
+        for column in 0..dimension {
+            let value = density[row * dimension + column];
+            if !value.re.is_finite() || !value.im.is_finite() {
+                return Err(QmbedError::InvalidOptions(
+                    "density matrix entries must be finite".into(),
+                ));
+            }
+            scale = scale.max(value.norm());
+            if (value - density[column * dimension + row].conj()).norm() > 1.0e-10 * scale.max(1.0)
+            {
+                return Err(QmbedError::InvalidOptions(
+                    "density matrix must be Hermitian".into(),
+                ));
+            }
         }
-        probabilities.push(value.max(0.0));
+    }
+    let mut probabilities = crate::backend::singular_values(&density, dimension, dimension)?;
+    probabilities.sort_by(f64::total_cmp);
+    let nuclear_norm = probabilities.iter().sum::<f64>();
+    let tolerance =
+        (256.0 * f64::EPSILON * dimension as f64 * nuclear_norm.max(scale).max(1.0)).max(1.0e-10);
+    if trace.im.abs() > tolerance
+        || trace.re < -tolerance
+        || (nuclear_norm - trace.re).abs() > tolerance
+    {
+        if trace.re >= -tolerance && nuclear_norm >= trace.re {
+            let negative_mass = 0.5 * (nuclear_norm - trace.re);
+            return Err(QmbedError::InvalidOptions(format!(
+                "density matrix is not positive semidefinite; negative spectral mass is \
+                 {negative_mass:e}"
+            )));
+        }
+        return Err(QmbedError::InvalidOptions(
+            "density matrix must have a finite nonnegative real trace".into(),
+        ));
     }
     Ok(probabilities)
 }
@@ -541,7 +948,7 @@ pub fn entanglement_spectrum(
     subsystem_dimension: usize,
     environment_dimension: usize,
 ) -> Result<Vec<f64>> {
-    density_spectrum(
+    density_matrix_spectrum(
         partial_trace(state, subsystem_dimension, environment_dimension)?,
         subsystem_dimension,
     )
@@ -552,7 +959,7 @@ pub fn entanglement_spectrum_density(
     subsystem_dimension: usize,
     environment_dimension: usize,
 ) -> Result<Vec<f64>> {
-    density_spectrum(
+    density_matrix_spectrum(
         partial_trace_density(density, subsystem_dimension, environment_dimension)?,
         subsystem_dimension,
     )
@@ -592,6 +999,39 @@ pub fn density_expectation(
         trace += applied[density_column];
     }
     Ok(trace)
+}
+
+/// Density-matrix fluctuation `Tr(ρ A²) - Tr(ρ A)²`.
+///
+/// The density matrix follows the same row-major convention as
+/// [`density_expectation`]. Normalization is deliberately not imposed: callers
+/// may use normalized density matrices or preserve QuSpin's direct linear
+/// algebra semantics for weighted ensembles.
+pub fn density_quantum_fluctuation(
+    operator: &(impl LinearOperator + ?Sized),
+    density: &[Complex64],
+) -> Result<Complex64> {
+    let shape = operator.shape();
+    if shape.0 != shape.1 || density.len() != shape.0.saturating_mul(shape.0) {
+        return Err(QmbedError::DimensionMismatch(
+            "density fluctuation requires a square operator and matching density".into(),
+        ));
+    }
+    let dimension = shape.0;
+    let mean = density_expectation(operator, density)?;
+    let mut column = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut applied = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut applied_twice = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut second = Complex64::new(0.0, 0.0);
+    for density_column in 0..dimension {
+        for row in 0..dimension {
+            column[row] = density[row * dimension + density_column];
+        }
+        operator.apply(&column, &mut applied)?;
+        operator.apply(&applied, &mut applied_twice)?;
+        second += applied_twice[density_column];
+    }
+    Ok(second - mean * mean)
 }
 
 pub fn observables_vs_time(
@@ -728,6 +1168,15 @@ pub struct DiagonalEnsemble {
     pub entropy: f64,
 }
 
+#[derive(Clone, Debug)]
+pub struct DiagonalEnsembleColumn {
+    pub ensemble: DiagonalEnsemble,
+    pub diagonal_entropy: f64,
+    pub observable: Option<f64>,
+    pub temporal_fluctuation: Option<f64>,
+    pub quantum_fluctuation: Option<f64>,
+}
+
 fn summarize_diagonal_probabilities(
     eigenvalues: &[f64],
     mut probabilities: Vec<f64>,
@@ -762,6 +1211,204 @@ fn summarize_diagonal_probabilities(
         energy_variance,
         entropy,
     })
+}
+
+pub fn diagonal_ensemble_from_probabilities(
+    eigenvalues: &[f64],
+    probabilities: &[f64],
+) -> Result<DiagonalEnsemble> {
+    if eigenvalues.len() != probabilities.len()
+        || probabilities
+            .iter()
+            .any(|probability| !probability.is_finite() || *probability < 0.0)
+    {
+        return Err(QmbedError::InvalidOptions(
+            "diagonal probabilities must be finite, nonnegative, and match the spectrum".into(),
+        ));
+    }
+    summarize_diagonal_probabilities(eigenvalues, probabilities.to_vec())
+}
+
+pub fn diagonal_density_matrix(
+    eigenvectors: &[Vec<Complex64>],
+    probabilities: &[f64],
+) -> Result<Vec<Complex64>> {
+    let dimension = eigenvectors.len();
+    if probabilities.len() != dimension
+        || eigenvectors.iter().any(|vector| vector.len() != dimension)
+    {
+        return Err(QmbedError::DimensionMismatch(
+            "diagonal density probabilities and eigenvectors do not match".into(),
+        ));
+    }
+    if probabilities
+        .iter()
+        .any(|probability| !probability.is_finite() || *probability < 0.0)
+    {
+        return Err(QmbedError::InvalidOptions(
+            "diagonal density probabilities must be finite and nonnegative".into(),
+        ));
+    }
+    let mut density = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+    for (probability, vector) in probabilities.iter().zip(eigenvectors) {
+        for row in 0..dimension {
+            for column in 0..dimension {
+                density[row * dimension + column] +=
+                    *probability * vector[row] * vector[column].conj();
+            }
+        }
+    }
+    Ok(density)
+}
+
+fn distribution_entropy(probabilities: &[f64], alpha: f64) -> Result<f64> {
+    if !alpha.is_finite() || alpha < 0.0 {
+        return Err(QmbedError::InvalidOptions(
+            "Renyi alpha must be finite and nonnegative".into(),
+        ));
+    }
+    if (alpha - 1.0).abs() <= f64::EPSILON {
+        return Ok(-probabilities
+            .iter()
+            .filter(|probability| **probability > f64::EPSILON)
+            .map(|probability| probability * probability.ln())
+            .sum::<f64>());
+    }
+    let moment = probabilities
+        .iter()
+        .filter(|probability| **probability > f64::EPSILON)
+        .map(|probability| probability.powf(alpha))
+        .sum::<f64>();
+    if moment <= 0.0 || !moment.is_finite() {
+        return Err(QmbedError::InvalidOptions(
+            "Renyi probability moment is not positive and finite".into(),
+        ));
+    }
+    Ok(moment.ln() / (1.0 - alpha))
+}
+
+/// Analyze one or more diagonal probability distributions in a shared
+/// eigensystem. Optional observable statistics are evaluated matrix-free in
+/// that eigensystem, so stored and matrix-free operators share one path.
+pub fn analyze_diagonal_ensemble(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<Complex64>],
+    probability_columns: &[Vec<f64>],
+    observable: Option<&dyn LinearOperator>,
+    alpha: f64,
+) -> Result<Vec<DiagonalEnsembleColumn>> {
+    let dimension = eigenvalues.len();
+    let mut sorted_eigenvalues = eigenvalues.to_vec();
+    sorted_eigenvalues.sort_by(f64::total_cmp);
+    if sorted_eigenvalues.windows(2).any(|window| {
+        let scale = window[0].abs().max(window[1].abs()).max(1.0);
+        (window[1] - window[0]).abs() <= 1.0e-12 * scale
+    }) {
+        return Err(QmbedError::InvalidOptions(
+            "diagonal-ensemble formulas require a nondegenerate spectrum".into(),
+        ));
+    }
+    if eigenvectors.len() != dimension
+        || eigenvectors.iter().any(|vector| vector.len() != dimension)
+    {
+        return Err(QmbedError::DimensionMismatch(
+            "diagonal-ensemble eigensystem must be square".into(),
+        ));
+    }
+    if probability_columns.is_empty() {
+        return Err(QmbedError::InvalidOptions(
+            "diagonal-ensemble analysis needs at least one probability column".into(),
+        ));
+    }
+
+    type ObservableStatistics = (Vec<f64>, Vec<Vec<f64>>, Vec<f64>);
+    let observable_statistics = observable
+        .map(|observable| -> Result<ObservableStatistics> {
+            if observable.shape() != (dimension, dimension) {
+                return Err(QmbedError::DimensionMismatch(
+                    "diagonal-ensemble observable and eigensystem do not match".into(),
+                ));
+            }
+            let mut applied = Vec::with_capacity(dimension);
+            for vector in eigenvectors {
+                let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+                observable.apply(vector, &mut output)?;
+                applied.push(output);
+            }
+            let mut diagonal = vec![0.0; dimension];
+            let mut squared_elements = vec![vec![0.0; dimension]; dimension];
+            let mut squared_diagonal = vec![0.0; dimension];
+            for row in 0..dimension {
+                for column in 0..dimension {
+                    let element = inner(&eigenvectors[row], &applied[column]);
+                    if row == column {
+                        if element.im.abs() > 1.0e-9 {
+                            return Err(QmbedError::InvalidOptions(
+                                "diagonal-ensemble observable must be Hermitian".into(),
+                            ));
+                        }
+                        diagonal[row] = element.re;
+                    }
+                    let magnitude = element.norm_sqr();
+                    squared_elements[row][column] = magnitude;
+                    squared_diagonal[row] += magnitude;
+                }
+            }
+            Ok((diagonal, squared_elements, squared_diagonal))
+        })
+        .transpose()?;
+
+    probability_columns
+        .iter()
+        .map(|probabilities| {
+            let ensemble = diagonal_ensemble_from_probabilities(eigenvalues, probabilities)?;
+            let diagonal_entropy = distribution_entropy(&ensemble.probabilities, alpha)?;
+            let (observable, temporal_fluctuation, quantum_fluctuation) = if let Some((
+                diagonal,
+                squared_elements,
+                squared_diagonal,
+            )) =
+                &observable_statistics
+            {
+                let expectation = diagonal
+                    .iter()
+                    .zip(&ensemble.probabilities)
+                    .map(|(value, probability)| value * probability)
+                    .sum::<f64>();
+                let mut temporal_variance = 0.0;
+                for (row, squared_row) in squared_elements.iter().enumerate() {
+                    for (column, squared_element) in squared_row.iter().enumerate() {
+                        if row != column {
+                            temporal_variance += ensemble.probabilities[row]
+                                * squared_element
+                                * ensemble.probabilities[column];
+                        }
+                    }
+                }
+                let total_second_moment = squared_diagonal
+                    .iter()
+                    .zip(&ensemble.probabilities)
+                    .map(|(value, probability)| value * probability)
+                    .sum::<f64>();
+                let quantum_variance =
+                    total_second_moment - temporal_variance - expectation.powi(2);
+                (
+                    Some(expectation),
+                    Some(temporal_variance.max(0.0).sqrt()),
+                    Some(quantum_variance.max(0.0).sqrt()),
+                )
+            } else {
+                (None, None, None)
+            };
+            Ok(DiagonalEnsembleColumn {
+                ensemble,
+                diagonal_entropy,
+                observable,
+                temporal_fluctuation,
+                quantum_fluctuation,
+            })
+        })
+        .collect()
 }
 
 pub fn diagonal_ensemble(

@@ -2,13 +2,15 @@ use approx::assert_abs_diff_eq;
 use num_bigint::BigUint;
 use qmbed::Complex64;
 use qmbed::basis::{
-    Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, GeneralBasis, PhotonBasis,
-    SpinBasis1D, SpinfulFermionBasis1D, StateStorage, SymmetrySector, TensorBasis, U256, UserBasis,
-    WideSpinBasis256, basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and,
-    bitwise_leftshift, bitwise_not, bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state,
-    get_basis_type, photon_hspace_dim, python_int_to_basis_int, state_from_biguint,
-    state_to_biguint,
+    Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, ErasedState, GeneralBasis,
+    LatticeSymmetryMap, PackedBasis, PackedPhotonBasis, PackedTensorBasis, PhotonBasis,
+    RepresentativeOrdering, SpinBasis1D, SpinfulFermionBasis1D, StateStorage, SymmetryReducer,
+    SymmetrySector, TensorBasis, U256, UserBasis, WidePackedBasis, WideSpinBasis, WideSpinBasis256,
+    basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and, bitwise_leftshift, bitwise_not,
+    bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state, get_basis_type, photon_hspace_dim,
+    python_int_to_basis_int, state_from_biguint, state_to_biguint,
 };
+use qmbed::interop::WideEdModel;
 use qmbed::measure::project_operator;
 use qmbed::operator::{
     Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm, apply_sector_shift,
@@ -104,6 +106,51 @@ fn closure_symmetry_map_reproduces_the_builtin_translation_sector() {
 }
 
 #[test]
+fn wide_persistent_model_reuses_general_symmetry_and_operator_kernels() {
+    let sites = 200;
+    let parent = WideSpinBasis256::new(sites, Some(1), true).unwrap();
+    let translation = LatticeSymmetryMap::site_permutation(
+        2,
+        (0..sites)
+            .map(|site| (site + 1) % sites)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let reduced = GeneralBasis::from_reducer_with_ordering(
+        parent,
+        SymmetryReducer::new().with_map(translation, 0),
+        RepresentativeOrdering::Maximum,
+    )
+    .unwrap();
+    assert_eq!(reduced.len(), 1);
+
+    let number =
+        OperatorTerm::new("n", (0..sites).map(|site| Coupling::new(1.0, vec![site]))).unwrap();
+    let basis = WidePackedBasis::from(reduced).reversed();
+    let model = WideEdModel::new(basis, [number]);
+    assert_eq!(model.states().unwrap()[0].width_bits(), sites);
+    let operator = model.materialize(MatrixFormat::Dense).unwrap();
+    assert_abs_diff_eq!(operator.to_dense()[0].re, 1.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(operator.to_dense()[0].im, 0.0, epsilon = 1.0e-12);
+
+    let physical_high = ErasedState::from_decimal(
+        sites,
+        &state_to_biguint(U256::zero().with_bit(sites - 1, true).unwrap()).to_string(),
+    )
+    .unwrap();
+    let transitions = model
+        .bra_ket_terms(
+            [OperatorTerm::new("n", [Coupling::new(1.0, vec![sites - 1])]).unwrap()],
+            &[physical_high],
+        )
+        .unwrap();
+    assert_eq!(transitions[0].len(), 1);
+    assert_eq!(transitions[0][0].bra, physical_high);
+    assert_eq!(transitions[0][0].ket, physical_high);
+    assert_eq!(transitions[0][0].matrix_element, Complex64::new(1.0, 0.0));
+}
+
+#[test]
 fn cross_sector_builder_reduces_into_the_target_symmetry_sector() {
     let translation = || {
         ClosureSymmetryMap::new(4, |state: u128| {
@@ -188,6 +235,28 @@ fn tensor_basis_applies_each_factor_without_kronecker_materialization() {
 }
 
 #[test]
+fn packed_tensor_basis_supports_recursive_factor_grammar_without_nested_types() {
+    let factor = || PackedBasis::from(SpinBasis1D::builder(1).pauli(true).build().unwrap());
+    let tensor = PackedTensorBasis::new([factor(), factor(), factor()]).unwrap();
+    assert_eq!(tensor.dimensions(), [2, 2, 2]);
+    let operator = OperatorBuilder::on(&tensor)
+        .terms([
+            OperatorTerm::new("z||", [Coupling::new(1.0, vec![0])]).unwrap(),
+            OperatorTerm::new("|z|", [Coupling::new(1.0, vec![0])]).unwrap(),
+            OperatorTerm::new("||z", [Coupling::new(1.0, vec![0])]).unwrap(),
+        ])
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let mut diagonal: Vec<_> = operator
+        .diagonal()
+        .into_iter()
+        .map(|value| value.re)
+        .collect();
+    diagonal.sort_by(f64::total_cmp);
+    assert_eq!(diagonal, [-3.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 3.0]);
+}
+
+#[test]
 fn photon_basis_enforces_total_excitation_and_exchange_dynamics() {
     let matter = SpinBasis1D::builder(1).build().unwrap();
     let photon = BosonBasis1D::builder(1, 3).build().unwrap();
@@ -208,6 +277,86 @@ fn photon_basis_enforces_total_excitation_and_exchange_dynamics() {
     let dense = exchange.to_dense();
     assert_abs_diff_eq!(dense[1].re, 1.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(dense[2].re, 1.0, epsilon = 1.0e-12);
+}
+
+#[test]
+fn packed_photon_basis_uses_stable_product_states_and_universal_additive_sectors() {
+    let matter = PackedBasis::from(SpinBasis1D::builder(2).build().unwrap());
+    let fixed = PackedPhotonBasis::new(matter.clone(), 2, Some(2)).unwrap();
+    let full = PackedPhotonBasis::new(matter, 2, None).unwrap();
+    assert_eq!(fixed.len(), 4);
+    assert_eq!(
+        (0..fixed.len())
+            .map(|index| fixed.state(index).unwrap())
+            .collect::<Vec<_>>(),
+        vec![2, 4, 7, 9],
+    );
+    let packed = PackedBasis::from(fixed.clone());
+    for index in 0..packed.len() {
+        assert_eq!(
+            packed
+                .additive_quantum_number(packed.state(index).unwrap())
+                .unwrap(),
+            2,
+        );
+    }
+
+    let projector = BasisProjector::between(&fixed, &full).unwrap();
+    let lifted = projector
+        .lifted(&[
+            Complex64::new(1.0, 0.0),
+            Complex64::new(2.0, 0.0),
+            Complex64::new(3.0, 0.0),
+            Complex64::new(4.0, 0.0),
+        ])
+        .unwrap();
+    assert_eq!(lifted.len(), 12);
+    assert_eq!(lifted[2], Complex64::new(1.0, 0.0));
+    assert_eq!(lifted[4], Complex64::new(2.0, 0.0));
+    assert_eq!(lifted[7], Complex64::new(3.0, 0.0));
+    assert_eq!(lifted[9], Complex64::new(4.0, 0.0));
+
+    let exchange = OperatorBuilder::on(&fixed)
+        .terms([
+            OperatorTerm::new("+|-", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
+            OperatorTerm::new("-|+", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
+        ])
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert!(exchange.nnz() > 0);
+}
+
+#[test]
+fn packed_photon_projection_composes_matter_symmetry_with_total_excitation() {
+    let translation = ClosureSymmetryMap::new(2, |state: u128| {
+        Ok((
+            ((state << 1) & 0b11) | (state >> 1),
+            Complex64::new(1.0, 0.0),
+        ))
+    })
+    .unwrap();
+    let reduced_matter = GeneralBasis::new(
+        SpinBasis1D::builder(2).build().unwrap(),
+        SymmetrySector::new().with_map(translation, 0),
+    )
+    .unwrap();
+    let reduced = PackedPhotonBasis::new(PackedBasis::from(reduced_matter), 1, Some(1)).unwrap();
+    let full = PackedPhotonBasis::new(
+        PackedBasis::from(SpinBasis1D::builder(2).build().unwrap()),
+        1,
+        None,
+    )
+    .unwrap();
+    let projector = BasisProjector::between(&reduced, &full).unwrap();
+    assert_eq!(projector.shape(), (8, 2));
+    let lifted = projector
+        .lifted(&[Complex64::new(0.3, -0.2), Complex64::new(-0.7, 0.4)])
+        .unwrap();
+    let recovered = projector.projected(&lifted).unwrap();
+    assert_abs_diff_eq!(recovered[0].re, 0.3, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(recovered[0].im, -0.2, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(recovered[1].re, -0.7, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(recovered[1].im, 0.4, epsilon = 1.0e-12);
 }
 
 #[test]
@@ -270,6 +419,38 @@ fn wide_integer_helpers_and_photon_utilities_cover_python_helper_semantics() {
 }
 
 #[test]
+fn runtime_erased_states_preserve_logical_width_across_storage_classes() {
+    let left =
+        ErasedState::from_decimal(600, &(BigUint::from(1_u8) << 599_usize).to_string()).unwrap();
+    let right = ErasedState::from_decimal(600, "3").unwrap();
+    assert_eq!(left.storage(), StateStorage::U1024);
+    assert_eq!(
+        left.bitwise_or(&right).unwrap().to_biguint(),
+        (BigUint::from(1_u8) << 599_usize) + BigUint::from(3_u8)
+    );
+    assert_eq!(
+        right.left_shift(598).unwrap().to_biguint(),
+        BigUint::from(3_u8) << 598_usize
+    );
+    assert_eq!(right.bitwise_not().unwrap().bitwise_not().unwrap(), right);
+    assert_eq!(right.bitwise_not().unwrap().to_biguint().bits(), 600);
+
+    let byte = ErasedState::from_decimal(8, "1").unwrap();
+    assert_eq!(byte.bitwise_not().unwrap().to_decimal(), "254");
+    assert_eq!(byte.left_shift(8).unwrap().to_decimal(), "0");
+
+    let basis = WideSpinBasis::<16>::new(400, Some(1), false).unwrap();
+    assert_eq!(
+        state_to_biguint(basis.state(0).unwrap()),
+        BigUint::from(1_u8)
+    );
+    assert_eq!(
+        state_to_biguint(basis.state(399).unwrap()),
+        BigUint::from(1_u8) << 399_usize
+    );
+}
+
+#[test]
 fn user_basis_can_defer_state_enumeration_until_materialization() {
     let calls = Arc::new(AtomicUsize::new(0));
     let factory_calls = calls.clone();
@@ -294,6 +475,15 @@ fn spinful_sector_unions_and_majorana_operators_obey_clifford_algebra() {
     assert_eq!(union.len(), 4);
 
     let basis = SpinfulFermionBasis1D::builder(1).build().unwrap();
+    assert_eq!(
+        (0..basis.len())
+            .map(|index| basis.state(index).unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 2, 1, 3],
+    );
+    for index in 0..basis.len() {
+        assert_eq!(basis.index(basis.state(index).unwrap()).unwrap(), index);
+    }
     let x = OperatorBuilder::on(&basis)
         .term(OperatorTerm::new("x|", [Coupling::new(1.0, vec![0])]).unwrap())
         .build(MatrixFormat::Dense)
@@ -319,6 +509,20 @@ fn spinful_sector_unions_and_majorana_operators_obey_clifford_algebra() {
             .unwrap()
             .nnz(),
         0
+    );
+    let ixy = x
+        .product(&y)
+        .unwrap()
+        .scaled(Complex64::new(0.0, 1.0))
+        .unwrap();
+    assert_eq!(
+        ixy.diagonal(),
+        vec![
+            Complex64::new(-1.0, 0.0),
+            Complex64::new(-1.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(1.0, 0.0),
+        ]
     );
 }
 

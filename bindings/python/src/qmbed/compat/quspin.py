@@ -11,6 +11,8 @@ from ..model import (
     eigsh as native_eigsh,
 )
 
+TARGET_QUSPIN_VERSION = "1.0.1"
+
 _SYMBOLS = {
     "I": LocalOperator.IDENTITY,
     "n": LocalOperator.NUMBER,
@@ -26,16 +28,23 @@ def operator_term(
     operator: str,
     couplings: Iterable[Coupling],
 ) -> OperatorSpec:
-    if operator.count("|") > 1:
-        raise ValueError("a spinful operator may contain only one separator")
-    split = operator.find("|")
-    split = None if split < 0 else split
+    splits = []
+    local_count = 0
+    for symbol in operator:
+        if symbol == "|":
+            splits.append(local_count)
+        else:
+            local_count += 1
     local = tuple(
         _SYMBOLS.get(symbol, f"custom:{symbol}")
         for symbol in operator
         if symbol != "|"
     )
-    return OperatorSpec(OpProduct(local, split), tuple(couplings))
+    if len(splits) == 1:
+        product = OpProduct(local, split=splits[0])
+    else:
+        product = OpProduct(local, splits=tuple(splits))
+    return OperatorSpec(product, tuple(couplings))
 
 
 def terms_from_static(static: Iterable[Sequence]) -> tuple[OperatorSpec, ...]:
@@ -43,7 +52,9 @@ def terms_from_static(static: Iterable[Sequence]) -> tuple[OperatorSpec, ...]:
     for operator, coupling_rows in static:
         couplings = []
         for coefficient, *sites in coupling_rows:
-            couplings.append(Coupling(complex(coefficient), tuple(sites)))
+            couplings.append(
+                Coupling(complex(coefficient), tuple(int(site) for site in sites))
+            )
         terms.append(operator_term(operator, couplings))
     return tuple(terms)
 

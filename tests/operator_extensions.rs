@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
-use qmbed::basis::SpinBasis1D;
+use qmbed::basis::{SpinBasis1D, SpinfulFermionBasis1D};
 use qmbed::operator::{
     AssemblyChecks, Coupling, DynamicTerm, ExpGrid, ExpOp, Hamiltonian, LinearOperator,
     MatrixFormat, Operator, OperatorBuilder, OperatorTerm, QuantumComponent, QuantumLinearOperator,
@@ -10,6 +10,7 @@ use qmbed::operator::{
     get_matvec_function, is_exp_op, is_hamiltonian, is_quantum_linear_operator,
     is_quantum_operator, matmat, matvec, rmatmat, rmatvec,
 };
+use qmbed::solve::eigh;
 use qmbed::{Complex64, QmbedError};
 
 fn assert_complex_close(actual: Complex64, expected: Complex64) {
@@ -114,6 +115,39 @@ fn quantum_operator_uses_required_and_default_parameters() {
         .evaluate(&HashMap::new(), MatrixFormat::Dense)
         .unwrap_err();
     assert!(matches!(missing, QmbedError::InvalidOptions(_)));
+}
+
+#[test]
+fn spinful_basis_accepts_unified_orbital_labels_without_losing_sector_checks() {
+    let basis = SpinfulFermionBasis1D::builder(2)
+        .particles(1, 1)
+        .build()
+        .unwrap();
+    let component_checks = AssemblyChecks {
+        hermiticity: false,
+        particle_conservation: true,
+        symmetry_compatibility: true,
+    };
+    let unified_down = OperatorBuilder::on(&basis)
+        .term(OperatorTerm::new("+-", [Coupling::new(1.0, vec![2, 3])]).unwrap())
+        .checks(component_checks)
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let split_down = OperatorBuilder::on(&basis)
+        .term(OperatorTerm::new("|+-", [Coupling::new(1.0, vec![0, 1])]).unwrap())
+        .checks(component_checks)
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert_eq!(unified_down.triplets(), split_down.triplets());
+
+    let cross_species = OperatorTerm::new("+-", [Coupling::new(1.0, vec![0, 2])]).unwrap();
+    assert!(matches!(
+        OperatorBuilder::on(&basis)
+            .term(cross_species)
+            .checks(component_checks)
+            .build(MatrixFormat::Csc),
+        Err(QmbedError::InvalidSector(_))
+    ));
 }
 
 #[test]
@@ -407,4 +441,45 @@ fn assembly_particle_check_rejects_sector_leakage_and_can_be_explicitly_disabled
         .build(MatrixFormat::Csc)
         .unwrap();
     assert_eq!(projected.nnz(), 0);
+}
+
+#[test]
+fn assembly_particle_check_accounts_for_cancellation_across_the_operator_sum() {
+    let basis = SpinBasis1D::builder(4).up(2).pauli(false).build().unwrap();
+    let coupling = Coupling::new(0.5, vec![0, 1]);
+    let cartesian = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new("xx", [coupling.clone()]).unwrap(),
+            OperatorTerm::new("yy", [coupling]).unwrap(),
+        ])
+        .build(MatrixFormat::Dense)
+        .unwrap();
+    let ladder = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new("+-", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
+            OperatorTerm::new("-+", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
+        ])
+        .build(MatrixFormat::Dense)
+        .unwrap();
+    assert_eq!(cartesian.to_dense(), ladder.to_dense());
+
+    let residual_leakage = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new("xx", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
+            OperatorTerm::new("yy", [Coupling::new(0.25, vec![0, 1])]).unwrap(),
+        ])
+        .build(MatrixFormat::Dense)
+        .unwrap_err();
+    assert!(matches!(residual_leakage, QmbedError::InvalidSector(_)));
+}
+
+#[test]
+fn dense_eigendecomposition_defines_the_empty_sector_spectrum() {
+    let empty = Operator::from_dense(0, 0, Vec::new()).unwrap();
+    let spectrum = eigh(&empty).unwrap();
+    assert!(spectrum.eigenvalues.is_empty());
+    assert!(spectrum.eigenvectors.is_empty());
+    assert!(spectrum.residuals.is_empty());
+    assert_eq!(spectrum.iterations, 0);
+    assert!(spectrum.converged);
 }

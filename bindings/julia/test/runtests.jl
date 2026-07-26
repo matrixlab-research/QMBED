@@ -5,8 +5,8 @@ const coupling = Coupling(1.0, [0, 1])
 const half_coupling = Coupling(0.5, [0, 1])
 const terms = OperatorSpec[
     OperatorSpec(OpProduct([ZOp, ZOp]), [coupling]),
-    QMBED.Compat.QuSpin.operator_term("+-", [half_coupling]),
-    QMBED.Compat.QuSpin.operator_term("-+", [half_coupling]),
+    OperatorSpec(OpProduct([RaisingOp, LoweringOp]), [half_coupling]),
+    OperatorSpec(OpProduct([LoweringOp, RaisingOp]), [half_coupling]),
 ]
 const result = eigsh(SpinBasis(sites=2), terms, EigshOptions(eigenpairs=2))
 

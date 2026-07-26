@@ -6,7 +6,6 @@
 /// it does not contain a second implementation or a model-specific execution
 /// path.
 pub mod quspin {
-    use crate::QmbedError;
     use crate::operator::{Coupling, LocalOperator, OpProduct, OperatorTerm};
 
     pub use crate::archive;
@@ -24,15 +23,11 @@ pub mod quspin {
     /// compatibility boundary.
     pub fn parse_operator_product(operator: impl AsRef<str>) -> Result<OpProduct> {
         let operator = operator.as_ref();
-        let mut split = None;
+        let mut splits = Vec::new();
         let mut local = Vec::with_capacity(operator.chars().count());
         for symbol in operator.chars() {
             if symbol == '|' {
-                if split.replace(local.len()).is_some() {
-                    return Err(QmbedError::InvalidOperator(
-                        "a spinful operator may contain only one species separator".into(),
-                    ));
-                }
+                splits.push(local.len());
                 continue;
             }
             let typed = match symbol {
@@ -47,7 +42,7 @@ pub mod quspin {
             };
             local.push(typed);
         }
-        OpProduct::with_split(local, split)
+        OpProduct::with_splits(local, splits)
     }
 
     pub fn operator_term(

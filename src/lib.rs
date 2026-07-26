@@ -9,6 +9,7 @@ pub mod block;
 pub mod compat;
 pub mod dynamics;
 pub mod error;
+pub mod interop;
 pub mod measure;
 pub mod operator;
 pub mod runtime;

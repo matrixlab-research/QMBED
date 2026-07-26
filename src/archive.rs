@@ -264,6 +264,7 @@ pub struct OperatorArchiveEntry {
 #[derive(Clone, Debug, Default)]
 pub struct OperatorArchive {
     entries: BTreeMap<String, OperatorArchiveEntry>,
+    metadata: BTreeMap<String, String>,
 }
 
 impl OperatorArchive {
@@ -308,6 +309,51 @@ impl OperatorArchive {
         self.entries
             .iter()
             .map(|(name, entry)| (name.as_str(), entry))
+    }
+
+    /// Attach small, language-neutral metadata to the archive.
+    ///
+    /// Metadata is deliberately scalar text rather than executable
+    /// serialization. This keeps archives safe to inspect and lets frontends
+    /// preserve contracts such as declared scalar dtype or a basis-schema
+    /// version without embedding pickled language objects.
+    pub fn insert_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        let value = value.into();
+        if key.is_empty()
+            || key
+                .chars()
+                .any(|character| !(character.is_ascii_alphanumeric() || "_.-".contains(character)))
+        {
+            return Err(QmbedError::Archive(
+                "archive metadata keys may contain only ASCII letters, digits, `_`, `-`, and `.`"
+                    .into(),
+            ));
+        }
+        if value
+            .chars()
+            .any(|character| matches!(character, '\t' | '\r' | '\n'))
+        {
+            return Err(QmbedError::Archive(
+                "archive metadata values may not contain tabs or newlines".into(),
+            ));
+        }
+        self.metadata.insert(key, value);
+        Ok(())
+    }
+
+    pub fn metadata(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     pub fn from_quantum_operator(operator: &QuantumOperator) -> Result<Self> {
@@ -419,6 +465,14 @@ pub fn save_zip(path: impl AsRef<Path>, entries: &OperatorArchive) -> Result<()>
     archive
         .write_all(manifest.as_bytes())
         .map_err(archive_error)?;
+    archive
+        .start_file("metadata.tsv", options)
+        .map_err(archive_error)?;
+    for (key, value) in &entries.metadata {
+        archive
+            .write_all(format!("{key}\t{value}\n").as_bytes())
+            .map_err(archive_error)?;
+    }
     archive.finish().map_err(archive_error)?;
     Ok(())
 }
@@ -445,6 +499,18 @@ pub fn load_zip(path: impl AsRef<Path>) -> Result<OperatorArchive> {
         text
     };
     let mut result = OperatorArchive::new();
+    let has_metadata = archive.file_names().any(|name| name == "metadata.tsv");
+    if has_metadata {
+        let mut entry = archive.by_name("metadata.tsv").map_err(archive_error)?;
+        let mut text = String::new();
+        entry.read_to_string(&mut text).map_err(archive_error)?;
+        for line in text.lines() {
+            let (key, value) = line
+                .split_once('\t')
+                .ok_or_else(|| QmbedError::Archive("invalid archive metadata row".into()))?;
+            result.insert_metadata(key, value)?;
+        }
+    }
     for (index, line) in manifest.lines().enumerate() {
         let fields: Vec<_> = line.split('\t').collect();
         if fields.len() != 7 {
