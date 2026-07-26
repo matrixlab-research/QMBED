@@ -1,6 +1,7 @@
 /target/
 **/Cargo.lock
 !/Cargo.lock
+!/bindings/capi/Cargo.lock
 *.profraw
 __pycache__/
 *.py[cod]
