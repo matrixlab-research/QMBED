@@ -31,6 +31,11 @@ pub struct ReductionImage<State> {
 }
 
 impl<State> ReductionImage<State> {
+    /// Validate and store the canonical representative, unit phase, and orbit size.
+    ///
+    /// The phase must be finite with unit magnitude and `orbit_size` must be
+    /// positive. These invariants make [`ReductionImage::amplitude`] safe to
+    /// use in projectors and cross-sector assembly.
     pub fn new(representative: State, phase: Complex64, orbit_size: usize) -> Result<Self> {
         if orbit_size == 0 || !phase.re.is_finite() || !phase.im.is_finite() {
             return Err(QmbedError::InternalState(
@@ -49,14 +54,17 @@ impl<State> ReductionImage<State> {
         })
     }
 
+    /// Return the canonical state labelling the reduced-basis vector.
     pub const fn representative(&self) -> &State {
         &self.representative
     }
 
+    /// Return the unit-modulus physical-to-canonical phase.
     pub const fn phase(&self) -> Complex64 {
         self.phase
     }
 
+    /// Return the number of physical states in the symmetry orbit.
     pub const fn orbit_size(&self) -> usize {
         self.orbit_size
     }
@@ -69,11 +77,22 @@ impl<State> ReductionImage<State> {
 
 /// Finite Hilbert-space basis and its local operator semantics.
 pub trait Basis: Send + Sync {
+    /// Integer-like state representation used by this basis.
     type State: Copy + Eq + Send + Sync;
 
+    /// Return the number of vectors in the basis.
     fn len(&self) -> usize;
+    /// Return the encoded state at a basis index.
+    ///
+    /// Implementations return [`QmbedError::StateNotInBasis`] for an invalid
+    /// row rather than panicking.
     fn state(&self, index: usize) -> Result<Self::State>;
+    /// Locate an encoded state in the basis.
     fn index(&self, state: Self::State) -> Result<usize>;
+    /// Apply one local operator string to one encoded state.
+    ///
+    /// The result is `None` when the action is exactly zero. Bases whose
+    /// actions branch override [`Basis::apply_local_transitions`].
     fn apply_local(
         &self,
         state: Self::State,
@@ -229,6 +248,7 @@ pub trait Basis: Send + Sync {
         self.operator_preserves_particle_sector(operator)
     }
 
+    /// Return whether the basis contains no vectors.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -961,9 +981,12 @@ fn operator_chars(operator: &str, sites: &[usize]) -> Result<SmallVec<[char; 8]>
 /// operators.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SpinNormalization {
+    /// Conventional angular-momentum operators `Sx`, `Sy`, `Sz`, and `S±`.
     #[default]
     AngularMomentum,
+    /// Scale every non-identity spin-half action by two.
     Pauli,
+    /// Scale Cartesian spin-half actions as Pauli matrices but retain unit ladder actions.
     PauliCartesian,
 }
 
@@ -989,6 +1012,10 @@ pub struct SpinBasis1D {
 }
 
 impl SpinBasis1D {
+    /// Start a spin-basis builder for `sites` lattice positions.
+    ///
+    /// The default is an unrestricted spin-half basis with angular-momentum
+    /// normalization and no spatial symmetry reduction.
     pub fn builder(sites: usize) -> SpinBasisBuilder {
         SpinBasisBuilder {
             sites,
@@ -1001,14 +1028,17 @@ impl SpinBasis1D {
         }
     }
 
+    /// Return the number of lattice sites.
     pub const fn sites(&self) -> usize {
         self.sites
     }
 
+    /// Return twice the local spin quantum number.
     pub const fn spin_twice(&self) -> u16 {
         self.spin_twice
     }
 
+    /// Return the selected additive spin-occupation sector, if unique.
     pub const fn up(&self) -> Option<usize> {
         self.up
     }
@@ -1018,18 +1048,22 @@ impl SpinBasis1D {
         self.particle_sectors.as_deref()
     }
 
+    /// Report whether a Pauli-scaled spin-half convention is active.
     pub const fn pauli(&self) -> bool {
         !matches!(self.normalization, SpinNormalization::AngularMomentum)
     }
 
+    /// Return the exact local spin-operator normalization.
     pub const fn normalization(&self) -> SpinNormalization {
         self.normalization
     }
 
+    /// Return the canonical translation-momentum sector, if selected.
     pub const fn momentum(&self) -> Option<usize> {
         self.momentum
     }
 
+    /// Return the reflection eigenvalue, if selected.
     pub const fn parity(&self) -> Option<i8> {
         self.parity
     }
@@ -1175,6 +1209,7 @@ impl SpinBasis1D {
     }
 }
 
+/// Builder for full, conserved, or symmetry-reduced spin-chain bases.
 #[derive(Clone, Debug)]
 pub struct SpinBasisBuilder {
     sites: usize,
@@ -1187,17 +1222,22 @@ pub struct SpinBasisBuilder {
 }
 
 impl SpinBasisBuilder {
+    /// Select the local spin as twice its quantum number.
+    ///
+    /// For example, `1` selects spin one half and `2` selects spin one.
     pub const fn spin_twice(mut self, spin_twice: u16) -> Self {
         self.spin_twice = spin_twice;
         self
     }
 
+    /// Restrict the basis to one additive spin-occupation sector.
     pub fn up(mut self, up: usize) -> Self {
         self.up = Some(up);
         self.particle_sectors = None;
         self
     }
 
+    /// Alias for [`SpinBasisBuilder::up`].
     pub fn magnetization(mut self, up: usize) -> Self {
         self.up = Some(up);
         self.particle_sectors = None;
@@ -1211,16 +1251,22 @@ impl SpinBasisBuilder {
         self
     }
 
+    /// Select a translation-momentum sector.
+    ///
+    /// Negative values are canonicalized modulo the lattice length when the
+    /// basis is built.
     pub const fn momentum(mut self, momentum: i32) -> Self {
         self.momentum = Some(momentum);
         self
     }
 
+    /// Select a reflection sector with eigenvalue `-1` or `1`.
     pub const fn parity(mut self, parity: i8) -> Self {
         self.parity = Some(parity);
         self
     }
 
+    /// Select Cartesian Pauli normalization for a spin-half basis.
     pub const fn pauli(mut self, pauli: bool) -> Self {
         self.normalization = if pauli {
             SpinNormalization::PauliCartesian
@@ -1230,11 +1276,16 @@ impl SpinBasisBuilder {
         self
     }
 
+    /// Select an explicit local spin normalization.
     pub const fn normalization(mut self, normalization: SpinNormalization) -> Self {
         self.normalization = normalization;
         self
     }
 
+    /// Validate the requested sectors and enumerate the resulting basis.
+    ///
+    /// Fixed additive sectors are generated combinatorially. Translation and
+    /// parity filters are then applied to physical orbits.
     pub fn build(self) -> Result<SpinBasis1D> {
         if self.spin_twice == 0 {
             return Err(QmbedError::InvalidSector(
@@ -1526,6 +1577,10 @@ pub struct BosonBasis1D {
 }
 
 impl BosonBasis1D {
+    /// Start a boson-basis builder with a finite local occupation cutoff.
+    ///
+    /// `states_per_site` permits occupations from zero through one less than
+    /// the supplied value.
     pub fn builder(sites: usize, states_per_site: usize) -> BosonBasisBuilder {
         BosonBasisBuilder {
             sites,
@@ -1535,10 +1590,12 @@ impl BosonBasis1D {
         }
     }
 
+    /// Return the number of lattice sites.
     pub const fn sites(&self) -> usize {
         self.sites
     }
 
+    /// Return the fixed total particle number, if selected.
     pub const fn particles(&self) -> Option<usize> {
         self.particles
     }
@@ -1548,6 +1605,7 @@ impl BosonBasis1D {
         self.particle_sectors.as_deref()
     }
 
+    /// Return the number of allowed local occupation states.
     pub const fn states_per_site(&self) -> usize {
         self.states_per_site
     }
@@ -1594,6 +1652,7 @@ impl BosonBasis1D {
     }
 }
 
+/// Builder for a full or fixed-particle bosonic lattice basis.
 #[derive(Clone, Debug)]
 pub struct BosonBasisBuilder {
     sites: usize,
@@ -1603,6 +1662,7 @@ pub struct BosonBasisBuilder {
 }
 
 impl BosonBasisBuilder {
+    /// Restrict the basis to a fixed total boson number.
     pub fn particles(mut self, particles: usize) -> Self {
         self.particles = Some(particles);
         self.particle_sectors = None;
@@ -1616,6 +1676,7 @@ impl BosonBasisBuilder {
         self
     }
 
+    /// Validate the cutoff and enumerate the requested bosonic sector.
     pub fn build(self) -> Result<BosonBasis1D> {
         if self.sites == 0 || self.states_per_site == 0 {
             return Err(QmbedError::InvalidSector(
@@ -1726,6 +1787,7 @@ pub struct SpinlessFermionBasis1D {
 }
 
 impl SpinlessFermionBasis1D {
+    /// Start a spinless-fermion basis builder.
     pub fn builder(sites: usize) -> SpinlessFermionBasisBuilder {
         SpinlessFermionBasisBuilder {
             sites,
@@ -1735,10 +1797,12 @@ impl SpinlessFermionBasis1D {
         }
     }
 
+    /// Return the number of fermionic orbitals.
     pub const fn sites(&self) -> usize {
         self.sites
     }
 
+    /// Return the fixed particle number, if selected.
     pub const fn particles(&self) -> Option<usize> {
         self.particles
     }
@@ -1748,6 +1812,7 @@ impl SpinlessFermionBasis1D {
         self.particle_sectors.as_deref()
     }
 
+    /// Return the canonical translation-momentum sector, if selected.
     pub const fn momentum(&self) -> Option<usize> {
         self.momentum
     }
@@ -1788,6 +1853,7 @@ impl SpinlessFermionBasis1D {
     }
 }
 
+/// Builder for full, fixed-number, or momentum-reduced spinless Fock spaces.
 #[derive(Clone, Debug)]
 pub struct SpinlessFermionBasisBuilder {
     sites: usize,
@@ -1797,6 +1863,7 @@ pub struct SpinlessFermionBasisBuilder {
 }
 
 impl SpinlessFermionBasisBuilder {
+    /// Restrict the basis to a fixed fermion number.
     pub fn particles(mut self, particles: usize) -> Self {
         self.particles = Some(particles);
         self.particle_sectors = None;
@@ -1810,11 +1877,13 @@ impl SpinlessFermionBasisBuilder {
         self
     }
 
+    /// Select a translation-momentum sector.
     pub const fn momentum(mut self, momentum: i32) -> Self {
         self.momentum = Some(momentum);
         self
     }
 
+    /// Validate the sector and enumerate the spinless-fermion basis.
     pub fn build(self) -> Result<SpinlessFermionBasis1D> {
         let particle_sectors = self
             .particle_sectors
@@ -2065,6 +2134,7 @@ pub struct SpinfulFermionBasis1D {
 }
 
 impl SpinfulFermionBasis1D {
+    /// Start a two-species fermion basis builder.
     pub fn builder(sites: usize) -> SpinfulFermionBasisBuilder {
         SpinfulFermionBasisBuilder {
             sites,
@@ -2075,22 +2145,27 @@ impl SpinfulFermionBasis1D {
         }
     }
 
+    /// Return the number of spatial sites per species.
     pub const fn sites(&self) -> usize {
         self.sites
     }
 
+    /// Return the fixed up-species particle number, if unique.
     pub const fn particles_up(&self) -> Option<usize> {
         self.particles_up
     }
 
+    /// Return the fixed down-species particle number, if unique.
     pub const fn particles_down(&self) -> Option<usize> {
         self.particles_down
     }
 
+    /// Return the selected union of `(up, down)` particle sectors.
     pub fn particle_sectors(&self) -> Option<&[(usize, usize)]> {
         self.particle_sectors.as_deref()
     }
 
+    /// Return the site-local occupation filter, if configured.
     pub const fn local_occupation_constraint(&self) -> Option<&LocalOccupationConstraint> {
         self.local_occupation_constraint.as_ref()
     }
@@ -2138,6 +2213,7 @@ impl SpinfulFermionBasis1D {
     }
 }
 
+/// Builder for full or number-conserving two-species fermion spaces.
 #[derive(Clone, Debug)]
 pub struct SpinfulFermionBasisBuilder {
     sites: usize,
@@ -2148,16 +2224,19 @@ pub struct SpinfulFermionBasisBuilder {
 }
 
 impl SpinfulFermionBasisBuilder {
+    /// Restrict only the up-species particle number.
     pub const fn particles_up(mut self, particles: usize) -> Self {
         self.particles_up = Some(particles);
         self
     }
 
+    /// Restrict only the down-species particle number.
     pub const fn particles_down(mut self, particles: usize) -> Self {
         self.particles_down = Some(particles);
         self
     }
 
+    /// Restrict both species to one fixed `(up, down)` sector.
     pub fn particles(mut self, up: usize, down: usize) -> Self {
         self.particles_up = Some(up);
         self.particles_down = Some(down);
@@ -2180,6 +2259,7 @@ impl SpinfulFermionBasisBuilder {
         self
     }
 
+    /// Validate species sectors and enumerate the spinful Fock basis.
     pub fn build(self) -> Result<SpinfulFermionBasis1D> {
         if self.sites > 64 {
             return Err(QmbedError::UnsupportedBackend(
@@ -3181,6 +3261,11 @@ pub struct ClosureSymmetryMap<State> {
 }
 
 impl<State> ClosureSymmetryMap<State> {
+    /// Wrap a finite-order state action as a symmetry generator.
+    ///
+    /// `period` is the smallest known positive power returning every state to
+    /// itself. The callback returns the mapped state and physical
+    /// unit-modulus phase.
     pub fn new<F>(period: usize, action: F) -> Result<Self>
     where
         F: Fn(State) -> Result<(State, Complex64)> + Send + Sync + 'static,
@@ -3235,6 +3320,7 @@ impl<State> std::fmt::Debug for SymmetryReducer<State> {
 }
 
 impl<State> SymmetryReducer<State> {
+    /// Create a reducer with no generators and an empty shared orbit cache.
     pub fn new() -> Self {
         Self {
             generators: Vec::new(),
@@ -3242,6 +3328,11 @@ impl<State> SymmetryReducer<State> {
         }
     }
 
+    /// Add a finite symmetry generator and its one-dimensional character sector.
+    ///
+    /// Adding a generator defines a different group action, so the returned
+    /// reducer starts with a fresh cache. Clones made after construction share
+    /// cached orbit traces.
     pub fn with_map<M>(mut self, map: M, sector: i32) -> Self
     where
         M: SymmetryMap<State> + 'static,
@@ -3256,14 +3347,20 @@ impl<State> SymmetryReducer<State> {
         self
     }
 
+    /// Return the number of configured finite generators.
     pub fn generators(&self) -> usize {
         self.generators.len()
     }
 
+    /// Return the number of canonical orbit traces currently cached.
+    ///
+    /// This diagnostic is safe to call across cloned reducers. A poisoned
+    /// cache reports zero rather than exposing lock internals.
     pub fn cached_orbits(&self) -> usize {
         self.orbit_cache.read().map_or(0, |cache| cache.len())
     }
 
+    /// Discard every cached orbit trace shared by clones of this reducer.
     pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.orbit_cache.write() {
             cache.clear();

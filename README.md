@@ -2,42 +2,44 @@
 
 **MATRIX / SIM · Quantum Many-Body Exact Diagonalization**
 
-`qmbed` is a Rust-native exact-diagonalization toolkit derived from real
-many-body workflows. Its native API is organized around mathematical
-capabilities rather than Python class layout: a basis defines states and local
-transitions, and every stored or matrix-free map implements one rectangular
-`LinearOperator` interface. QuSpin-derived spellings remain available under
-`qmbed::compat::quspin` during migration.
+[![Rust core](https://github.com/matrixlab-research/QMBED/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/ci.yml)
+[![Language bindings](https://github.com/matrixlab-research/QMBED/actions/workflows/bindings.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/bindings.yml)
+[![Documentation](https://github.com/matrixlab-research/QMBED/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/docs.yml)
+[![Paper workflows](https://github.com/matrixlab-research/QMBED-benchmark/actions/workflows/rust-contract.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED-benchmark/actions/workflows/rust-contract.yml)
+[![Release](https://img.shields.io/github/v/release/matrixlab-research/QMBED)](https://github.com/matrixlab-research/QMBED/releases)
+[![License](https://img.shields.io/github/license/matrixlab-research/QMBED)](https://github.com/matrixlab-research/QMBED/blob/main/LICENSE)
 
-## Implemented capability surface
+QMBED is a Rust-native exact-diagonalization toolkit for quantum many-body
+workflows. Rust, Python, and Julia all reach the same basis, operator, solver,
+and measurement implementation. Optimized routes are selected from
+mathematical capabilities—such as sparse storage, conserved sectors, or finite
+symmetry orbits—rather than model names.
 
-- Spin, boson, spinless/spinful fermion, arbitrary finite-symmetry, tensor,
-  photon, callback-defined, and fixed-width wide-state bases.
-- Higher spin, translation/parity sectors, fermionic momentum sectors,
-  multi-sector spinful spaces, Majorana operators, branching user actions,
-  projectors with leakage checks, and streamed source-to-target sector changes.
-- Dense, CSC, CSR, DIA, and matrix-free operators; static, driven, and named
-  parameterized Hamiltonians; fixed-pattern parameter-scan plans; nonzero-driven
-  sparse algebra; reusable exponential grid/right action and low-level matvec
-  plans; and safe versioned dense/sparse archives.
-- Dense and selected Hermitian eigensolvers, shift-invert, fully
-  reorthogonalized and thick-restarted Lanczos, locked Ritz vectors, reusable
-  invariant-subspace workspaces, static/callable/batched/density evolution,
-  FTLM/LTLM, reusable exponential plans, and cached shift-invert plans.
-- Shared symmetry-orbit caches; Floquet systems with a single-materialization
-  spectrum boundary; block operators; spectral and dynamical response;
-  expectation values; arbitrary-site partial traces; pure/mixed entanglement;
-  diagonal ensembles; level statistics; subspace tracking; and Lindblad
-  generators.
+**[Documentation](https://matrixlab-research.github.io/QMBED/) ·
+[Rust API](https://matrixlab-research.github.io/QMBED/rust/api/qmbed/) ·
+[Python API](https://matrixlab-research.github.io/QMBED/python/api/) ·
+[Julia API](https://matrixlab-research.github.io/QMBED/julia/api/) ·
+[Benchmarks](https://github.com/matrixlab-research/QMBED-benchmark)**
 
-The four fixed-width state types (`U256`, `U1024`, `U4096`, `U16384`) are
-available independently of the small-system `u128` path and round-trip through
-arbitrary-precision `BigUint` values. Optimized assembly is selected by
-mathematical capabilities such as stored transitions or finite orbits, never
-by model names. Fixed-particle basis enumeration scales with the requested
-sector dimension instead of scanning the full parent Hilbert space.
+## Choose an interface
 
-## Minimal example
+| Interface | Intended use | API policy |
+|---|---|---|
+| [Rust](https://matrixlab-research.github.io/QMBED/rust/) | Native applications and reusable simulation components | Complete typed core |
+| [Python](https://matrixlab-research.github.io/QMBED/python/) | Python workflows and QuSpin migration | Native `qmbed` API plus versioned `quspin` compatibility |
+| [Julia](https://matrixlab-research.github.io/QMBED/julia/) | Julia-native scientific workflows | Native `QMBED` API only |
+
+All site indices are zero based. Python and Julia bindings are thin request
+builders over `qmbed-capi`; they do not reimplement assembly or solvers.
+
+## Rust quick start
+
+The current release can be used directly from Git:
+
+```toml
+[dependencies]
+qmbed = { git = "https://github.com/matrixlab-research/QMBED", tag = "v0.1.0" }
+```
 
 ```rust
 use qmbed::basis::SpinBasis1D;
@@ -56,68 +58,82 @@ let low_energy = eigsh(&hamiltonian, EigshOptions::smallest_algebraic(4))?;
 # Ok::<(), qmbed::QmbedError>(())
 ```
 
-QuSpin operator strings remain accepted by `OperatorTerm::new` and by the
-explicit functions in `qmbed::compat::quspin`. They are parsed once into the
-same `OpProduct` used above; they do not select a second assembler.
+Python and Julia source-install instructions and equivalent examples are in
+the [getting-started guide](https://matrixlab-research.github.io/QMBED/getting-started/).
+The language packages are not yet published to PyPI or the Julia General
+registry.
 
-Thin [Python and Julia bindings](bindings/README.md) construct the same typed
-request through a shared C ABI. Python offers a versioned
-`qmbed.compat.quspin` migration surface, tested against an unchanged snapshot
-of the official QuSpin tests. Julia deliberately exposes only native QMBED
-types and does not carry a second compatibility API.
+## What is implemented
 
-The same `OperatorBuilder::between(source, target)` path constructs a
-rectangular probe between particle-number or symmetry sectors. The same
-operator can be converted among stored formats or consumed matrix-free by
-Krylov algorithms.
+- Spin, boson, spinless/spinful fermion, photon, tensor, callback-defined,
+  symmetry-reduced, and fixed-width wide-state bases.
+- Dense, CSC, CSR, DIA, and matrix-free operators, including rectangular
+  operators between particle or symmetry sectors.
+- Dense Hermitian eigensolvers, shift-invert, restarted Lanczos, reusable
+  eigensolver workspaces, Krylov evolution, FTLM/LTLM, and exponential-action
+  plans.
+- Floquet spectra, spectral and dynamical response, expectation values,
+  subsystem density matrices, entanglement, diagonal ensembles, state tracking,
+  and Lindblad generators.
+- Reusable parameter-scan operator plans and shared symmetry-orbit caches.
 
-## Runtime and numerical backend boundaries
+The four fixed-width state types (`U256`, `U1024`, `U4096`, and `U16384`) are
+independent of the small-system `u128` path. Fixed-particle enumeration scales
+with the requested sector instead of scanning the full parent Hilbert space.
+See the [capability guide](https://matrixlab-research.github.io/QMBED/capabilities/)
+for module-level details and current boundaries.
 
-Physics-facing basis and operator types depend only on the `LinearOperator`
-contract. `qmbed::runtime` adds a second narrow waist for owned vectors and
-coarse operations such as `apply`, `axpy`, `dotc`, and host transfer. The
-built-in `CpuRuntime` is single-rank; an `ExecutionProfile` that requests a GPU
-or multiple MPI ranks fails explicitly until an implementation of the same
-`Runtime` contract is installed. No model name crosses this boundary.
-`ExecutionProfile::throughput(n)` enables bounded shared-memory execution for
-independent batches such as `ExpmMultiplyParallel::apply_batch_with_runtime`;
-results retain input order. The serial profile uses the same path with one
-worker.
+## Architecture
 
-Dense eigendecomposition, matrix products, and sparse shifted factorization
-remain isolated in an internal numerical backend module. Krylov iterations
-call one reusable factorization or dense kernel rather than dispatching inside
-element or matvec loops. Real CSC Hamiltonians retain real arithmetic through
-both the factorization and shift-invert Lanczos path; complex operators use the
-same public solver contract.
+```text
+Rust API ───────────────────────────────┐
+                                       │
+Python native / QuSpin compatibility ─ C ABI ─ QMBED core ─ LinearOperator
+                                       │                    ├─ stored sparse/dense
+Julia native API ───────────────────── C ABI                └─ matrix-free
+```
 
-## Benchmark and verification boundary
+The physics-facing narrow waist is `LinearOperator`. A second `Runtime`
+boundary owns vectors and coarse operations. The built-in runtime is
+single-rank CPU; GPU and MPI profiles fail explicitly until a backend
+implementing that same contract is installed. Dense eigendecomposition,
+matrix products, and shifted sparse factorization remain isolated behind the
+numerical backend. More detail is available in
+[Architecture](https://matrixlab-research.github.io/QMBED/architecture/).
 
-The public suite contains deterministic numerical properties and regressions.
-The public
-[QMBED Benchmark](https://github.com/matrixlab-research/QMBED-benchmark)
-repository adds independent numerical oracles and twelve medium-size workflows
-derived from published many-body calculations. These are reported separately:
+## Verification and benchmarks
 
-1. public surface and properties;
-2. independent numerical oracles;
-3. complete paper-workflow composition;
-4. representative sparse and symmetry-reduced scale.
+The repository CI checks formatting, Clippy, unit and integration tests,
+paper-scale visible contracts, the shared C boundary, Python compatibility,
+Julia bindings, and all three documentation builds.
 
-A green API-presence test alone is not treated as parity. The complete design
-and acceptance criteria are maintained in QMBED Benchmark's
-`rust/full-taskdoc/` documents. The original frozen clean-room task for the
-23-symbol workflow core remains available separately:
+Independent verification lives in
+[QMBED Benchmark](https://github.com/matrixlab-research/QMBED-benchmark). It
+runs twelve medium-size, paper-shaped workflows on the same single-thread
+runner, with one warm-up, five measured samples, and workflow-specific
+residual, norm, or unitarity checks. The benchmark times basis construction,
+Hamiltonian assembly, solver or evolution, and observable evaluation end to
+end; it is not a microbenchmark or a claim of reproducing every paper.
 
-- [motivation](https://github.com/matrixlab-research/quspin-rust-task/blob/main/MOTIVATION.md)
-- [API contract](https://github.com/matrixlab-research/quspin-rust-task/blob/main/CONTRACT.md)
-- [visible examples](https://github.com/matrixlab-research/quspin-rust-task/blob/main/TESTS.md)
+See [Verification](https://matrixlab-research.github.io/QMBED/verification/)
+for the exact test boundary and local commands.
 
-## Local gates
+## Contributing
 
 ```bash
 cargo fmt --check
-cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 cargo test --release --test visible_contract -- --ignored --test-threads=1
 ```
+
+Documentation build commands are documented in
+[Contributing to the docs](https://matrixlab-research.github.io/QMBED/contributing/).
+
+## License
+
+QMBED is available under the
+[MIT License](https://github.com/matrixlab-research/QMBED/blob/main/LICENSE).
+The frozen upstream
+QuSpin compatibility tests and compatibility package retain their upstream
+BSD-3-Clause notices.

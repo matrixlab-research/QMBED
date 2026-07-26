@@ -1,3 +1,10 @@
+"""
+Native Julia request types for the shared QMBED Rust exact-diagonalization
+core.
+
+All site indices are zero based so an operator request has identical meaning
+in Julia, Python, Rust, and the language-neutral C schema.
+"""
 module QMBED
 
 using JSON3
@@ -8,6 +15,13 @@ export OpProduct, OperatorSpec, SpinBasis, SpinfulFermionBasis
 export SpinlessFermionBasis, eigsh
 export IdentityOp, NumberOp, ZOp, RaisingOp, LoweringOp, XOp, YOp
 
+"""
+    LocalOperator
+
+Built-in one-site actions recognized by QMBED's universal operator assembler.
+The enum values are `IdentityOp`, `NumberOp`, `ZOp`, `RaisingOp`,
+`LoweringOp`, `XOp`, and `YOp`.
+"""
 @enum LocalOperator begin
     IdentityOp
     NumberOp
@@ -28,6 +42,13 @@ const _operator_names = Dict(
     YOp => "y",
 )
 
+"""
+    OpProduct(operators; split=nothing)
+
+Ordered product of local actions. `operators` follows the same order as the
+zero-based sites in each [`Coupling`](@ref). For a spinful product, `split`
+marks the boundary between up- and down-species actions.
+"""
 struct OpProduct
     operators::Vector{Union{LocalOperator,String}}
     split::Union{Nothing,Int}
@@ -36,6 +57,13 @@ end
 OpProduct(operators; split=nothing) =
     OpProduct(Union{LocalOperator,String}[operator for operator in operators], split)
 
+"""
+    Coupling(coefficient, sites)
+
+One complex coefficient and the zero-based sites on which an
+[`OpProduct`](@ref) acts. The number and order of `sites` must match the
+product's local actions.
+"""
 struct Coupling
     coefficient::ComplexF64
     sites::Vector{Int}
@@ -44,6 +72,12 @@ end
 Coupling(coefficient::Number, sites::AbstractVector{<:Integer}) =
     Coupling(ComplexF64(coefficient), Int[site for site in sites])
 
+"""
+    OperatorSpec(product, couplings)
+
+A reusable local [`OpProduct`](@ref) and all couplings multiplying it. The Rust
+core validates the arity and assembles the sum in the requested storage format.
+"""
 struct OperatorSpec
     product::OpProduct
     couplings::Vector{Coupling}
@@ -52,8 +86,27 @@ end
 OperatorSpec(product::OpProduct, couplings::AbstractVector{<:Coupling}) =
     OperatorSpec(product, Coupling[c for c in couplings])
 
+"""
+    BasisSpec
+
+Abstract parent of immutable Julia basis requests accepted by [`eigsh`](@ref).
+"""
 abstract type BasisSpec end
 
+"""
+    SpinBasis(; sites, spin_twice=1, up=nothing, momentum=nothing,
+              parity=nothing, pauli=false)
+
+One-dimensional spin basis.
+
+# Keywords
+- `sites`: number of lattice sites.
+- `spin_twice`: twice the local spin quantum number; `1` means spin one half.
+- `up`: fixed total raising-quantum count, or `nothing`.
+- `momentum`: translation momentum sector, or `nothing`.
+- `parity`: reflection eigenvalue, normally `-1` or `1`.
+- `pauli`: use Pauli instead of angular-momentum normalization.
+"""
 Base.@kwdef struct SpinBasis <: BasisSpec
     sites::Int
     spin_twice::Int = 1
@@ -63,24 +116,53 @@ Base.@kwdef struct SpinBasis <: BasisSpec
     pauli::Bool = false
 end
 
+"""
+    BosonBasis(; sites, states_per_site, particles=nothing)
+
+Bosonic lattice basis with local occupations from zero through
+`states_per_site - 1`. Set `particles` to restrict the total boson number.
+"""
 Base.@kwdef struct BosonBasis <: BasisSpec
     sites::Int
     states_per_site::Int
     particles::Union{Nothing,Int} = nothing
 end
 
+"""
+    SpinlessFermionBasis(; sites, particles=nothing, momentum=nothing)
+
+Spinless-fermion Fock basis with optional fixed particle number and
+translation momentum sector.
+"""
 Base.@kwdef struct SpinlessFermionBasis <: BasisSpec
     sites::Int
     particles::Union{Nothing,Int} = nothing
     momentum::Union{Nothing,Int} = nothing
 end
 
+"""
+    SpinfulFermionBasis(; sites, particles_up=nothing, particles_down=nothing)
+
+Two-species fermion basis with independent fixed-number sectors for the up and
+down species.
+"""
 Base.@kwdef struct SpinfulFermionBasis <: BasisSpec
     sites::Int
     particles_up::Union{Nothing,Int} = nothing
     particles_down::Union{Nothing,Int} = nothing
 end
 
+"""
+    EigshOptions(; eigenpairs, target="smallest_algebraic", shift=nothing,
+                 krylov_dimension=nothing, tolerance=1e-10,
+                 max_iterations=1000, seed=0, eigenvectors=false)
+
+Controls a selected Hermitian eigensolve.
+
+`target` accepts the QMBED spectral target names. Use `target="shift"` together
+with `shift` for interior eigenpairs. `krylov_dimension=nothing` selects the
+core default; `seed` makes the initial vector deterministic.
+"""
 Base.@kwdef struct EigshOptions
     eigenpairs::Int
     target::String = "smallest_algebraic"
@@ -92,6 +174,19 @@ Base.@kwdef struct EigshOptions
     eigenvectors::Bool = false
 end
 
+"""
+    Eigensystem
+
+Result of a QMBED eigensolve.
+
+# Fields
+- `dimension`: Hilbert-space dimension.
+- `eigenvalues`: ordered real eigenvalues or Ritz values.
+- `residuals`: norms of `H*v - λ*v`.
+- `iterations`: solver iteration count.
+- `converged`: whether every requested residual met the tolerance.
+- `eigenvectors`: returned vectors, or `nothing` when not requested.
+"""
 struct Eigensystem
     dimension::Int
     eigenvalues::Vector{Float64}
@@ -199,6 +294,23 @@ function _solver_request(options::EigshOptions)
     )
 end
 
+"""
+    eigsh(basis, terms, options; format="csc") -> Eigensystem
+
+Assemble a Hermitian Hamiltonian from typed local terms and compute selected
+eigenpairs in the shared Rust core.
+
+# Arguments
+- `basis`: a concrete [`BasisSpec`](@ref).
+- `terms`: vector of [`OperatorSpec`](@ref) values to sum.
+- `options`: spectral target and convergence controls.
+- `format`: materialization route, normally `"csc"`; supported alternatives
+  are selected by the Rust core.
+
+The returned residuals provide numerical evidence for each eigenpair. Invalid
+bases, operator arities, formats, or solver options raise a Julia error
+containing the structured QMBED failure.
+"""
 function eigsh(
     basis::BasisSpec,
     terms::AbstractVector{OperatorSpec},

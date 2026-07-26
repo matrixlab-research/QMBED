@@ -1,0 +1,12 @@
+:root {
+  --md-primary-fg-color: #2459a9;
+  --md-accent-fg-color: #1776d2;
+}
+
+.md-header__title {
+  font-weight: 650;
+}
+
+.grid.cards > ul > li {
+  border-radius: 0.65rem;
+}

@@ -1,0 +1,98 @@
+name: documentation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/docs.yml"
+      - "bindings/julia/**"
+      - "bindings/python/**"
+      - "ci/check_docs.py"
+      - "ci/test_check_docs.py"
+      - "docs/**"
+      - "mkdocs.yml"
+      - "README.md"
+      - "src/**"
+      - "Cargo.toml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docs.yml"
+      - "bindings/julia/**"
+      - "bindings/python/**"
+      - "ci/check_docs.py"
+      - "ci/test_check_docs.py"
+      - "docs/**"
+      - "mkdocs.yml"
+      - "README.md"
+      - "src/**"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Rust, Python, and Julia docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.10"
+      - name: Test documentation tooling
+        working-directory: ci
+        run: python -m unittest test_check_docs.py -v
+      - name: Install Python documentation dependencies
+        run: |
+          python -m pip install -r docs/requirements.txt
+          python -m pip install -e bindings/python
+      - name: Build guides and Python API
+        run: python -m mkdocs build --strict --site-dir site
+      - name: Build Rust API from source doc comments
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: |
+          cargo doc --no-deps
+          mkdir -p site/rust/api
+          cp -R target/doc/. site/rust/api/
+          cp docs/rustdoc-index.html site/rust/api/index.html
+      - name: Instantiate Julia documentation environment
+        run: julia --project=bindings/julia/docs -e 'using Pkg; Pkg.develop(path="bindings/julia"); Pkg.instantiate()'
+      - name: Build Julia API from source docstrings
+        run: |
+          julia --project=bindings/julia/docs bindings/julia/docs/make.jl
+          mkdir -p site/julia/api
+          cp -R bindings/julia/docs/build/. site/julia/api/
+      - name: Validate assembled internal links
+        run: python ci/check_docs.py site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    name: Deploy GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
