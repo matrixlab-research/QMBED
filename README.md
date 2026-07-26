@@ -25,7 +25,7 @@ symmetry orbits—rather than model names.
 
 | Interface | Intended use | API policy |
 |---|---|---|
-| [Rust](https://matrixlab-research.github.io/QMBED/rust/) | Native applications and reusable simulation components | Complete typed core |
+| [Rust](https://matrixlab-research.github.io/QMBED/rust/) | Native applications and reusable simulation components | One canonical typed API |
 | [Python](https://matrixlab-research.github.io/QMBED/python/) | Python workflows and QuSpin migration | Native `qmbed` API plus versioned `quspin` compatibility |
 | [Julia](https://matrixlab-research.github.io/QMBED/julia/) | Julia-native scientific workflows | Native `QMBED` API only |
 
@@ -63,6 +63,11 @@ the [getting-started guide](https://matrixlab-research.github.io/QMBED/getting-s
 The language packages are not yet published to PyPI or the Julia General
 registry.
 
+Rust intentionally has no migration namespace or duplicate compatibility
+aliases. See the
+[Rust API stability policy](https://matrixlab-research.github.io/QMBED/rust/api-stability/)
+for the canonical names and extension rules.
+
 ## What is implemented
 
 - Spin, boson, spinless/spinful fermion, photon, tensor, callback-defined,
@@ -75,6 +80,8 @@ registry.
 - Floquet spectra, spectral and dynamical response, expectation values,
   subsystem density matrices, entanglement, diagonal ensembles, state tracking,
   and Lindblad generators.
+- Matrix-free selected Floquet quasienergies, sector-native wide-state
+  entanglement contractions, and portable ordered basis manifests.
 - Reusable parameter-scan operator plans and shared symmetry-orbit caches.
 
 The four fixed-width state types (`U256`, `U1024`, `U4096`, and `U16384`) are
@@ -103,9 +110,10 @@ numerical backend. More detail is available in
 
 ## Verification and benchmarks
 
-The repository CI checks formatting, Clippy, unit and integration tests,
-paper-scale visible contracts, the shared C boundary, Python compatibility,
-Julia bindings, and all three documentation builds.
+The repository CI checks formatting, Clippy, Rust 1.85, macOS/Windows
+portability, public-API semver compatibility, crates.io packaging, unit and
+integration tests, paper-scale visible contracts, the shared C boundary,
+Python compatibility, Julia bindings, and all three documentation builds.
 
 Independent verification lives in
 [QMBED Benchmark](https://github.com/matrixlab-research/QMBED-benchmark). It

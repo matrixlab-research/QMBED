@@ -327,6 +327,7 @@ impl LinearOperator for ExpmMultiplyParallel {
 
 /// Spectral region requested from a selected Hermitian eigensolver.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum SpectrumTarget {
     /// Algebraically smallest eigenvalues.
     SmallestAlgebraic,
@@ -344,6 +345,7 @@ pub enum SpectrumTarget {
 
 /// Controls target selection, search-space size, and convergence for [`eigsh`].
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct EigshOptions {
     /// Number of requested eigenpairs; must be smaller than the dimension.
     pub eigenpairs: usize,
@@ -370,16 +372,54 @@ fn use_dense_eigsh(dimension: usize, options: &EigshOptions) -> bool {
 }
 
 impl EigshOptions {
-    /// Construct default controls for the algebraically lowest eigenpairs.
-    pub fn smallest_algebraic(eigenpairs: usize) -> Self {
+    /// Construct solver controls for an arbitrary spectral target.
+    pub fn new(eigenpairs: usize, target: SpectrumTarget) -> Self {
         Self {
             eigenpairs,
-            target: SpectrumTarget::SmallestAlgebraic,
+            target,
             krylov_dimension: None,
             tolerance: 1.0e-10,
             max_iterations: 1_000,
             seed: 0,
         }
+    }
+
+    /// Construct default controls for the algebraically lowest eigenpairs.
+    pub fn smallest_algebraic(eigenpairs: usize) -> Self {
+        Self::new(eigenpairs, SpectrumTarget::SmallestAlgebraic)
+    }
+
+    /// Construct default controls for eigenpairs nearest a real shift.
+    pub fn near_shift(eigenpairs: usize, shift: f64) -> Self {
+        Self::new(eigenpairs, SpectrumTarget::Shift(shift))
+    }
+
+    /// Set the optional Lanczos or restart window dimension.
+    #[must_use]
+    pub fn with_krylov_dimension(mut self, dimension: usize) -> Self {
+        self.krylov_dimension = Some(dimension);
+        self
+    }
+
+    /// Set the required residual norm.
+    #[must_use]
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
+    /// Set the maximum Lanczos or restart iteration budget.
+    #[must_use]
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Set the deterministic initial-vector seed.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
     }
 
     fn validate(&self, dimension: usize) -> Result<()> {
@@ -487,6 +527,7 @@ impl EigshWorkspace {
 
 /// Controls whether [`eigh_with_options`] retains the complete eigenvector matrix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct EighOptions {
     /// Return eigenvectors when `true`; values and residuals are always returned.
     pub return_eigenvectors: bool,
@@ -497,6 +538,20 @@ impl Default for EighOptions {
         Self {
             return_eigenvectors: true,
         }
+    }
+}
+
+impl EighOptions {
+    /// Construct controls which retain or discard the full eigenvector matrix.
+    pub const fn new(return_eigenvectors: bool) -> Self {
+        Self {
+            return_eigenvectors,
+        }
+    }
+
+    /// Compute eigenvalues and residual evidence without returning vectors.
+    pub const fn values_only() -> Self {
+        Self::new(false)
     }
 }
 
@@ -1280,10 +1335,10 @@ where
     let mut output = vec![Complex64::new(0.0, 0.0); dimension];
     let mut reorthogonalization_passes = 0;
     let mut conditional_second_passes = 0;
-    if let SpectrumTarget::Shift(shift) = options.target
-        && shifted_solver.is_none()
-    {
-        shifted_solver = operator.shifted_solver(shift)?;
+    if let SpectrumTarget::Shift(shift) = options.target {
+        if shifted_solver.is_none() {
+            shifted_solver = operator.shifted_solver(shift)?;
+        }
     }
 
     for iteration in 0..krylov_dimension {
@@ -2398,6 +2453,7 @@ where
 
 /// Time grid and adaptive Krylov controls for state evolution.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct EvolutionOptions {
     /// Finite nondecreasing output times measured from the initial state.
     pub times: Vec<f64>,
@@ -2412,6 +2468,45 @@ pub struct EvolutionOptions {
 }
 
 impl EvolutionOptions {
+    /// Construct Hamiltonian evolution controls on the supplied output grid.
+    pub fn new(times: impl Into<Vec<f64>>) -> Self {
+        Self {
+            times: times.into(),
+            krylov_dimension: 30,
+            tolerance: 1.0e-10,
+            max_substeps: 10_000,
+            hamiltonian: true,
+        }
+    }
+
+    /// Set the maximum dimension of each Krylov projection.
+    #[must_use]
+    pub fn with_krylov_dimension(mut self, dimension: usize) -> Self {
+        self.krylov_dimension = dimension;
+        self
+    }
+
+    /// Set the local error tolerance.
+    #[must_use]
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
+    /// Set the maximum accepted and rejected trial intervals.
+    #[must_use]
+    pub fn with_max_substeps(mut self, max_substeps: usize) -> Self {
+        self.max_substeps = max_substeps;
+        self
+    }
+
+    /// Select Hamiltonian (`exp(-iHt)`) or direct-generator evolution.
+    #[must_use]
+    pub fn with_hamiltonian(mut self, hamiltonian: bool) -> Self {
+        self.hamiltonian = hamiltonian;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.times.is_empty()
             || self.times.iter().any(|time| !time.is_finite())
@@ -2468,6 +2563,7 @@ pub struct StateBatchTrajectory {
 
 /// Dimension and breakdown tolerance for a Lanczos decomposition.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct LanczosOptions {
     /// Maximum number of orthonormal Krylov vectors.
     pub krylov_dimension: usize,
@@ -2476,6 +2572,21 @@ pub struct LanczosOptions {
 }
 
 impl LanczosOptions {
+    /// Construct a decomposition request with the default breakdown tolerance.
+    pub const fn new(krylov_dimension: usize) -> Self {
+        Self {
+            krylov_dimension,
+            tolerance: 1.0e-12,
+        }
+    }
+
+    /// Set the norm-breakdown and Hermiticity tolerance.
+    #[must_use]
+    pub const fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.krylov_dimension == 0 || !self.tolerance.is_finite() || self.tolerance <= 0.0 {
             return Err(QmbedError::InvalidOptions(
@@ -2744,33 +2855,6 @@ where
         eigenvalues,
         eigenvectors,
     })
-}
-
-/// Compatibility controls for exponential-action time grids.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExpmOptions {
-    /// Requested output times.
-    pub times: Vec<f64>,
-    /// Maximum Krylov dimension per interval.
-    pub krylov_dimension: usize,
-    /// Local error tolerance.
-    pub tolerance: f64,
-    /// Maximum interval-splitting budget.
-    pub max_substeps: usize,
-    /// Apply Hamiltonian convention `exp(-i H t)` when true.
-    pub hamiltonian: bool,
-}
-
-impl From<ExpmOptions> for EvolutionOptions {
-    fn from(options: ExpmOptions) -> Self {
-        Self {
-            times: options.times,
-            krylov_dimension: options.krylov_dimension,
-            tolerance: options.tolerance,
-            max_substeps: options.max_substeps,
-            hamiltonian: options.hamiltonian,
-        }
-    }
 }
 
 struct LanczosProjection {
@@ -3337,12 +3421,12 @@ where
 pub fn expm_multiply<O>(
     operator: &O,
     initial: &[Complex64],
-    options: ExpmOptions,
+    options: EvolutionOptions,
 ) -> Result<StateTrajectory>
 where
     O: LinearOperator + ?Sized,
 {
-    evolve(operator, initial, options.into())
+    evolve(operator, initial, options)
 }
 
 pub fn expm_lanczos<O>(
@@ -4135,15 +4219,45 @@ where
     })
 }
 
+/// Time grid and explicit-step controls for a caller-defined right-hand side.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct RhsEvolutionOptions {
+    /// Finite nondecreasing output times.
     pub times: Vec<f64>,
+    /// Maximum Runge--Kutta step.
     pub max_step: f64,
+    /// Maximum integration substeps.
     pub max_substeps: usize,
+    /// Normalize each returned state.
     pub normalize: bool,
 }
 
 impl RhsEvolutionOptions {
+    /// Construct callable-RHS integration controls.
+    pub fn new(times: impl Into<Vec<f64>>, max_step: f64) -> Self {
+        Self {
+            times: times.into(),
+            max_step,
+            max_substeps: 100_000,
+            normalize: false,
+        }
+    }
+
+    /// Set the maximum number of integration substeps.
+    #[must_use]
+    pub fn with_max_substeps(mut self, max_substeps: usize) -> Self {
+        self.max_substeps = max_substeps;
+        self
+    }
+
+    /// Normalize each accepted output state.
+    #[must_use]
+    pub fn with_normalization(mut self, normalize: bool) -> Self {
+        self.normalize = normalize;
+        self
+    }
+
     fn validate(&self, initial_time: f64) -> Result<()> {
         if !initial_time.is_finite()
             || self.times.is_empty()

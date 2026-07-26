@@ -2,14 +2,14 @@ use approx::assert_abs_diff_eq;
 use qmbed::Complex64;
 use qmbed::basis::{
     Basis, BasisProjector, BosonBasis1D, GeneralBasis, LatticeSymmetryMap, PackedBasis,
-    SpinBasis1D, SpinNormalization, SymmetrySector,
+    SpinBasis1D, SpinNormalization, SymmetryReducer,
 };
 use qmbed::interop::{OperatorAction, PackedEdModel, PackedOperatorModel, PackedTermComponent};
 use qmbed::operator::{
     AssemblyChecks, Coupling, LinearOperator, LocalOperator, MatrixFormat, OpProduct, Operator,
     OperatorBuilder, OperatorSpec, QuantumComponent,
 };
-use qmbed::solve::{EighOptions, EigshOptions, EvolutionOptions, SpectrumTarget};
+use qmbed::solve::{EighOptions, EigshOptions, EvolutionOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,14 +55,10 @@ fn packed_operator_model_passes_the_caller_initial_vector_to_eigsh() {
         .eigsh_with_initial(
             &HashMap::new(),
             MatrixFormat::Csc,
-            EigshOptions {
-                eigenpairs: 1,
-                target: SpectrumTarget::SmallestAlgebraic,
-                krylov_dimension: Some(2),
-                tolerance: 1.0e-12,
-                max_iterations: 2,
-                seed: 0,
-            },
+            EigshOptions::smallest_algebraic(1)
+                .with_krylov_dimension(2)
+                .with_tolerance(1.0e-12)
+                .with_max_iterations(2),
             &initial,
         )
         .unwrap();
@@ -147,11 +143,7 @@ fn packed_model_reuses_one_spec_for_states_matrix_and_eigh() {
     assert_eq!(model.dimension(), 4);
     assert_eq!(model.states().unwrap(), vec![0, 1, 2, 3]);
     let operator = model.materialize(MatrixFormat::Csc).unwrap();
-    let result = model
-        .eigh(EighOptions {
-            return_eigenvectors: false,
-        })
-        .unwrap();
+    let result = model.eigh(EighOptions::values_only()).unwrap();
 
     assert_eq!(operator.shape(), (4, 4));
     assert_eq!(result.eigenvalues.len(), 4);
@@ -315,7 +307,7 @@ fn packed_models_project_between_explicit_parent_spaces() {
     let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
     let reduced = GeneralBasis::new(
         SpinBasis1D::builder(4).up(2).build().unwrap(),
-        SymmetrySector::new().with_map(translation, 1),
+        SymmetryReducer::new().with_map(translation, 1),
     )
     .unwrap();
     let reduced = PackedEdModel::new(reduced, []);
@@ -515,13 +507,10 @@ fn packed_model_evolution_reuses_the_static_operator_for_column_batches() {
                 vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
                 vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
             ],
-            EvolutionOptions {
-                times: vec![0.0, std::f64::consts::FRAC_PI_4],
-                krylov_dimension: 8,
-                tolerance: 1.0e-12,
-                max_substeps: 100,
-                hamiltonian: true,
-            },
+            EvolutionOptions::new(vec![0.0, std::f64::consts::FRAC_PI_4])
+                .with_krylov_dimension(8)
+                .with_tolerance(1.0e-12)
+                .with_max_substeps(100),
         )
         .unwrap();
 
@@ -584,14 +573,7 @@ fn packed_operator_model_unifies_direct_matrices_and_named_coefficients() {
             Complex64::new(5.0, 0.0)
         ]
     );
-    let spectrum = model
-        .eigh(
-            &parameters,
-            EighOptions {
-                return_eigenvectors: false,
-            },
-        )
-        .unwrap();
+    let spectrum = model.eigh(&parameters, EighOptions::values_only()).unwrap();
     assert_eq!(spectrum.eigenvalues, [-1.0, 2.0, 5.0]);
     let applied = model
         .apply_batch(
@@ -647,13 +629,7 @@ fn packed_operator_model_drives_internal_steps_in_physical_time() {
         .evolve_time_dependent_batch(
             &[initial],
             2.0,
-            EvolutionOptions {
-                times: vec![2.0, 2.5],
-                krylov_dimension: 16,
-                tolerance: 1.0e-10,
-                max_substeps: 10_000,
-                hamiltonian: true,
-            },
+            EvolutionOptions::new(vec![2.0, 2.5]).with_krylov_dimension(16),
             |time, coefficients| {
                 coefficients[0] = Complex64::new(time, 0.0);
                 Ok(())

@@ -2,7 +2,7 @@ use qmbed::Complex64;
 use qmbed::basis::{
     Basis, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap,
     LocalOccupationConstraint, PackedBasis, RepresentativeOrdering, SpinBasis1D,
-    SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetryMap, SymmetryReducer, SymmetrySector,
+    SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetryMap, SymmetryReducer,
 };
 
 #[test]
@@ -17,7 +17,7 @@ fn runtime_translation_matches_the_builtin_spin_sector() {
     )
     .unwrap();
     let general =
-        GeneralBasis::new(parent, SymmetrySector::new().with_map(translation, 1)).unwrap();
+        GeneralBasis::new(parent, SymmetryReducer::new().with_map(translation, 1)).unwrap();
     let builtin = SpinBasis1D::builder(sites)
         .up(3)
         .momentum(1)
@@ -71,7 +71,7 @@ fn additive_sector_unions_share_the_normal_basis_and_symmetry_paths() {
                     .particle_sectors(selected)
                     .build()
                     .unwrap(),
-                SymmetrySector::new().with_map(translation.clone(), momentum),
+                SymmetryReducer::new().with_map(translation.clone(), momentum),
             )
             .unwrap()
             .len()
@@ -114,7 +114,7 @@ fn local_binary_species_constraints_compose_with_sector_and_symmetry_reduction()
                     .local_occupation_constraint(no_double.clone())
                     .build()
                     .unwrap(),
-                SymmetrySector::new().with_map(translation.clone(), momentum),
+                SymmetryReducer::new().with_map(translation.clone(), momentum),
             )
             .unwrap()
             .len()
@@ -161,7 +161,7 @@ fn generated_group_closure_supports_noncommuting_trivial_characters() {
     let reflection = LatticeSymmetryMap::site_permutation(2, vec![3, 2, 1, 0]).unwrap();
     let dihedral = GeneralBasis::new(
         SpinBasis1D::builder(sites).build().unwrap(),
-        SymmetrySector::new()
+        SymmetryReducer::new()
             .with_map(translation, 0)
             .with_map(reflection, 0),
     )
@@ -224,7 +224,7 @@ fn inconsistent_generator_phases_remove_incompatible_orbits() {
     let reflection = LatticeSymmetryMap::site_permutation(2, vec![3, 2, 1, 0]).unwrap();
     let incompatible = GeneralBasis::new(
         SpinBasis1D::builder(4).build().unwrap(),
-        SymmetrySector::new()
+        SymmetryReducer::new()
             .with_map(translation, 1)
             .with_map(reflection, 0),
     )
@@ -380,7 +380,7 @@ fn malformed_runtime_maps_are_rejected_before_basis_construction() {
 fn a_valid_empty_symmetry_sector_is_representable() {
     let parent = SpinBasis1D::builder(4).up(0).build().unwrap();
     let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
-    let empty = GeneralBasis::new(parent, SymmetrySector::new().with_map(translation, 1)).unwrap();
+    let empty = GeneralBasis::new(parent, SymmetryReducer::new().with_map(translation, 1)).unwrap();
 
     assert_eq!(empty.len(), 0);
     assert!(empty.is_empty());

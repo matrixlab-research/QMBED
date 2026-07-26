@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
 use qmbed::dynamics::{
-    CallableDriveStep, DriveStep, Floquet, FloquetTimeVector, analyze_floquet_unitary,
-    dynamical_correlator,
+    CallableDriveStep, DriveStep, Floquet, FloquetSpectrumOptions, FloquetTimeVector,
+    analyze_floquet_unitary, dynamical_correlator,
 };
 use qmbed::operator::{
     Dynamic, DynamicComponent, Hamiltonian, LinearOperator, MatrixFormat, Operator,
@@ -71,6 +71,55 @@ fn floquet_analysis_reuses_one_propagator_and_supports_kicked_periods() {
     let effective = analysis.effective_hamiltonian.to_dense();
     assert_abs_diff_eq!(effective[0].re, -0.25, epsilon = 1.0e-12);
     assert_abs_diff_eq!(effective[3].re, 0.25, epsilon = 1.0e-12);
+}
+
+#[test]
+fn selected_floquet_spectrum_uses_matrix_free_period_actions() {
+    let dimension = 129;
+    let mut energies = vec![-2.0; dimension];
+    energies[..3].copy_from_slice(&[0.31, 0.2, 0.45]);
+    let hamiltonian = Operator::from_triplets(
+        dimension,
+        dimension,
+        energies
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, energy)| (index, index, Complex64::new(energy, 0.0))),
+        MatrixFormat::Csc,
+    )
+    .unwrap();
+    let floquet = Floquet::new([DriveStep::new(Arc::new(hamiltonian), 1.0).unwrap()]).unwrap();
+    let mut seed = vec![Complex64::new(0.0, 0.0); dimension];
+    seed[0] = Complex64::new(0.6, 0.2);
+    seed[7] = Complex64::new(-0.3, 0.7);
+    let mut forward = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut restored = vec![Complex64::new(0.0, 0.0); dimension];
+    floquet.apply_period(&seed, &mut forward).unwrap();
+    floquet
+        .apply_adjoint_period(&forward, &mut restored)
+        .unwrap();
+    assert!(
+        seed.iter()
+            .zip(restored)
+            .all(|(expected, actual)| (*expected - actual).norm() < 1.0e-10)
+    );
+    let target = 0.31;
+    let selected = floquet
+        .selected_eigensystem(
+            FloquetSpectrumOptions::new(3, target)
+                .with_search_dimension(5)
+                .with_krylov_dimension(12)
+                .with_tolerance(1.0e-11)
+                .with_max_iterations(2_000),
+        )
+        .unwrap();
+    let mut expected = energies.clone();
+    expected.sort_by(|left, right| (left - target).abs().total_cmp(&(right - target).abs()));
+    for (actual, expected) in selected.quasienergies.iter().zip(expected) {
+        assert_abs_diff_eq!(actual, &expected, epsilon = 1.0e-8);
+    }
+    assert!(selected.residuals.iter().all(|residual| *residual < 1.0e-8));
 }
 
 #[test]
@@ -187,13 +236,10 @@ fn dynamical_correlator_matches_a_two_level_lehmann_phase() {
         &[Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
         &sigma_x,
         &sigma_x,
-        EvolutionOptions {
-            times: times.clone(),
-            krylov_dimension: 8,
-            tolerance: 1.0e-12,
-            max_substeps: 100,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(times.clone())
+            .with_krylov_dimension(8)
+            .with_tolerance(1.0e-12)
+            .with_max_substeps(100),
     )
     .unwrap();
     for (value, time) in values.iter().zip(times) {

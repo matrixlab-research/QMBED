@@ -1,5 +1,6 @@
 use approx::assert_abs_diff_eq;
 use qmbed::Complex64;
+use qmbed::basis::U256;
 use qmbed::measure::{
     EntropyOrder, NoncommutingGroup, analyze_diagonal_ensemble, apply_fermionic_subsystem_phases,
     apply_noncommuting_subsystem_exchange_phases,
@@ -9,10 +10,11 @@ use qmbed::measure::{
     diagonal_ensemble_density, diagonal_ensemble_observable, ed_density_vs_time, ed_state_vs_time,
     energy_window_indices, entanglement_entropy, entanglement_entropy_batch,
     entanglement_entropy_density, entanglement_entropy_density_subsystem,
-    entanglement_entropy_subsystem, entanglement_spectrum, entanglement_spectrum_density,
-    entanglement_spectrum_subsystem, entropy_from_spectrum, expectation, ints_to_array,
-    kl_divergence, matrix_element, mean_level_spacing, observables_vs_time, partial_trace,
-    partial_trace_density, partial_trace_density_subsystem, partial_trace_subsystem,
+    entanglement_entropy_sector, entanglement_entropy_subsystem, entanglement_spectrum,
+    entanglement_spectrum_density, entanglement_spectrum_subsystem, entropy_from_spectrum,
+    expectation, ints_to_array, kl_divergence, matrix_element, mean_level_spacing,
+    observables_vs_time, partial_trace, partial_trace_density, partial_trace_density_subsystem,
+    partial_trace_sector_density, partial_trace_sector_state, partial_trace_subsystem,
     quantum_fluctuation, raw_quantum_fluctuation, states_to_array,
 };
 use qmbed::operator::Operator;
@@ -109,6 +111,46 @@ fn partial_trace_and_entropy_distinguish_product_and_bell_states() {
         2.0_f64.ln(),
         epsilon = 1.0e-12
     );
+}
+
+#[test]
+fn sector_native_partial_trace_handles_two_hundred_sites_without_a_parent_space() {
+    let left = U256::zero()
+        .with_bit(0, true)
+        .unwrap()
+        .with_bit(199, true)
+        .unwrap();
+    let right = U256::zero()
+        .with_bit(1, true)
+        .unwrap()
+        .with_bit(198, true)
+        .unwrap();
+    let amplitude = 1.0 / 2.0_f64.sqrt();
+    let state = [
+        Complex64::new(amplitude, 0.0),
+        Complex64::new(amplitude, 0.0),
+    ];
+    let basis = [left, right];
+    let reduced = partial_trace_sector_state(&state, &basis, 200, &[0], &[]).unwrap();
+    assert_abs_diff_eq!(reduced[0].re, 0.5, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(reduced[3].re, 0.5, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(reduced[1].norm(), 0.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(
+        entanglement_entropy_sector(&state, &basis, 200, &[0], &[], EntropyOrder::VonNeumann,)
+            .unwrap(),
+        2.0_f64.ln(),
+        epsilon = 1.0e-12
+    );
+
+    let density = state
+        .iter()
+        .flat_map(|left| state.iter().map(move |right| *left * right.conj()))
+        .collect::<Vec<_>>();
+    let mixed = partial_trace_sector_density(&density, &basis, 200, &[0], &[]).unwrap();
+    for (actual, expected) in mixed.iter().zip(reduced) {
+        assert_abs_diff_eq!(actual.re, expected.re, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(actual.im, expected.im, epsilon = 1.0e-12);
+    }
 }
 
 #[test]

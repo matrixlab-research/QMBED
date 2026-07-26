@@ -8,8 +8,8 @@ use crate::operator::{
     LinearOperator, MatrixFormat, Operator, TimeDependentOperator, materialize_dense,
 };
 use crate::solve::{
-    EvolutionOptions, evolve, evolve_time_dependent, expm_action, hermitian_eigenpairs_all,
-    lanczos_spectral_measure,
+    EigshOptions, EvolutionOptions, SpectrumTarget, eigsh, evolve, evolve_time_dependent,
+    expm_action, hermitian_eigenpairs_all, lanczos_spectral_measure,
 };
 use crate::{QmbedError, Result};
 
@@ -105,13 +105,9 @@ impl Floquet {
         Ok(Self {
             steps,
             dimension,
-            evolution: EvolutionOptions {
-                times: vec![0.0],
-                krylov_dimension: 64,
-                tolerance: 1.0e-12,
-                max_substeps: 10_000,
-                hamiltonian: true,
-            },
+            evolution: EvolutionOptions::new([0.0])
+                .with_krylov_dimension(64)
+                .with_tolerance(1.0e-12),
             analysis_period: None,
         })
     }
@@ -134,13 +130,9 @@ impl Floquet {
         Ok(Self {
             steps,
             dimension,
-            evolution: EvolutionOptions {
-                times: vec![0.0],
-                krylov_dimension: 64,
-                tolerance: 1.0e-12,
-                max_substeps: 10_000,
-                hamiltonian: true,
-            },
+            evolution: EvolutionOptions::new([0.0])
+                .with_krylov_dimension(64)
+                .with_tolerance(1.0e-12),
             analysis_period: None,
         })
     }
@@ -197,6 +189,40 @@ impl Floquet {
                         })?;
                 }
             }
+        }
+        output.copy_from_slice(&state);
+        Ok(())
+    }
+
+    /// Apply the adjoint one-period propagator without materializing it.
+    ///
+    /// The reverse-time action is exact for the static piecewise-constant
+    /// protocol represented by [`DriveStep`]. Callable drives currently fail
+    /// explicitly because their adjoint requires reverse-time evaluation of
+    /// the original time-dependent generator.
+    pub fn apply_adjoint_period(
+        &self,
+        input: &[Complex64],
+        output: &mut [Complex64],
+    ) -> Result<()> {
+        if input.len() != self.dimension || output.len() != self.dimension {
+            return Err(QmbedError::DimensionMismatch(
+                "Floquet input or output length does not match".into(),
+            ));
+        }
+        let mut state = input.to_vec();
+        for step in self.steps.iter().rev() {
+            let FloquetStep::Static(step) = step else {
+                return Err(QmbedError::UnsupportedBackend(
+                    "matrix-free Floquet adjoints currently require static drive steps".into(),
+                ));
+            };
+            state = expm_action(
+                step.hamiltonian.as_ref(),
+                &state,
+                -step.duration,
+                &self.evolution,
+            )?;
         }
         output.copy_from_slice(&state);
         Ok(())
@@ -259,6 +285,129 @@ impl Floquet {
         floquet_eigensystem_from_dense(&dense_unitary, self.dimension, period)
     }
 
+    /// Compute selected Floquet eigenpairs near one target quasienergy without
+    /// materializing the complete period propagator.
+    ///
+    /// The method solves the Hermitian phase filter
+    /// `Re(exp(-i*target_phase) U)` with the ordinary matrix-free eigensolver,
+    /// then diagonalizes `U` inside the converged candidate subspace. The
+    /// second step separates phase branches that share one cosine-filter
+    /// value.
+    pub fn selected_eigensystem(
+        &self,
+        options: FloquetSpectrumOptions,
+    ) -> Result<FloquetEigensystem> {
+        options.validate(self.dimension)?;
+        let period = self.period();
+        if !period.is_finite() || period <= 0.0 {
+            return Err(QmbedError::InvalidOptions(
+                "selected Floquet spectra require a finite positive period".into(),
+            ));
+        }
+        if self
+            .steps
+            .iter()
+            .any(|step| matches!(step, FloquetStep::Callable(_)))
+        {
+            return Err(QmbedError::UnsupportedBackend(
+                "selected matrix-free Floquet spectra currently require static drive steps".into(),
+            ));
+        }
+        let search_dimension = options.resolved_search_dimension(self.dimension);
+        let target_phase = -options.target_quasienergy * period;
+        let filter = FloquetPhaseFilter {
+            floquet: self,
+            target_phase,
+        };
+        let mut eigsh_options =
+            EigshOptions::new(search_dimension, SpectrumTarget::LargestAlgebraic)
+                .with_tolerance(options.tolerance)
+                .with_max_iterations(options.max_iterations)
+                .with_seed(options.seed);
+        if let Some(krylov_dimension) = options.krylov_dimension {
+            eigsh_options = eigsh_options.with_krylov_dimension(krylov_dimension);
+        }
+        let candidates = eigsh(&filter, eigsh_options)?;
+        let rank = candidates.eigenvectors.len();
+        let mut applied_columns = Vec::with_capacity(rank);
+        for vector in &candidates.eigenvectors {
+            let mut applied = vec![Complex64::new(0.0, 0.0); self.dimension];
+            self.apply_period(vector, &mut applied)?;
+            applied_columns.push(applied);
+        }
+        let mut projected = vec![Complex64::new(0.0, 0.0); rank * rank];
+        for row in 0..rank {
+            for column in 0..rank {
+                projected[row * rank + column] = candidates.eigenvectors[row]
+                    .iter()
+                    .zip(&applied_columns[column])
+                    .map(|(left, right)| left.conj() * *right)
+                    .sum();
+            }
+        }
+        let projected_eigensystem = backend::complex_eigenpairs(&projected, rank)?;
+        let mut selected = Vec::with_capacity(rank);
+        for coefficients in projected_eigensystem.eigenvectors {
+            let mut vector = vec![Complex64::new(0.0, 0.0); self.dimension];
+            for (coefficient, candidate) in coefficients.iter().zip(&candidates.eigenvectors) {
+                for (value, basis_value) in vector.iter_mut().zip(candidate) {
+                    *value += *coefficient * *basis_value;
+                }
+            }
+            let norm = vector.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt();
+            if !norm.is_finite() || norm <= f64::EPSILON {
+                continue;
+            }
+            for value in &mut vector {
+                *value /= norm;
+            }
+            let mut applied = vec![Complex64::new(0.0, 0.0); self.dimension];
+            self.apply_period(&vector, &mut applied)?;
+            let rayleigh = vector
+                .iter()
+                .zip(&applied)
+                .map(|(left, right)| left.conj() * *right)
+                .sum::<Complex64>();
+            if !rayleigh.re.is_finite()
+                || !rayleigh.im.is_finite()
+                || rayleigh.norm() <= f64::EPSILON
+            {
+                continue;
+            }
+            let eigenvalue = rayleigh / rayleigh.norm();
+            let quasienergy = -eigenvalue.arg() / period;
+            let residual = applied
+                .iter()
+                .zip(&vector)
+                .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
+                .sum::<f64>()
+                .sqrt();
+            let distance = wrapped_phase(eigenvalue.arg() - target_phase).abs();
+            selected.push((distance, quasienergy, eigenvalue, vector, residual));
+        }
+        selected.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+        if selected.len() < options.eigenpairs {
+            return Err(QmbedError::NonConvergence {
+                iterations: candidates.iterations,
+                residual: selected
+                    .iter()
+                    .map(|entry| entry.4)
+                    .fold(f64::INFINITY, f64::min),
+            });
+        }
+        selected.truncate(options.eigenpairs);
+        Ok(FloquetEigensystem {
+            quasienergies: selected.iter().map(|entry| entry.1).collect(),
+            eigenvalues: selected.iter().map(|entry| entry.2).collect(),
+            eigenvectors: selected.iter().map(|entry| entry.3.clone()).collect(),
+            residuals: selected.into_iter().map(|entry| entry.4).collect(),
+        })
+    }
+
     /// Construct the principal-branch effective Hamiltonian.
     pub fn effective_hamiltonian(&self, format: MatrixFormat) -> Result<Operator> {
         let eigensystem = self.eigensystem()?;
@@ -315,6 +464,43 @@ impl Floquet {
     }
 }
 
+fn wrapped_phase(value: f64) -> f64 {
+    (value + PI).rem_euclid(2.0 * PI) - PI
+}
+
+struct FloquetPhaseFilter<'a> {
+    floquet: &'a Floquet,
+    target_phase: f64,
+}
+
+impl LinearOperator for FloquetPhaseFilter<'_> {
+    fn shape(&self) -> (usize, usize) {
+        (self.floquet.dimension, self.floquet.dimension)
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if input.len() != self.floquet.dimension || output.len() != self.floquet.dimension {
+            return Err(QmbedError::DimensionMismatch(
+                "Floquet phase-filter vector length does not match".into(),
+            ));
+        }
+        let mut forward = vec![Complex64::new(0.0, 0.0); self.floquet.dimension];
+        let mut adjoint = vec![Complex64::new(0.0, 0.0); self.floquet.dimension];
+        self.floquet.apply_period(input, &mut forward)?;
+        self.floquet.apply_adjoint_period(input, &mut adjoint)?;
+        let forward_phase = Complex64::from_polar(0.5, -self.target_phase);
+        let adjoint_phase = Complex64::from_polar(0.5, self.target_phase);
+        for ((value, forward), adjoint) in output.iter_mut().zip(forward).zip(adjoint) {
+            *value = forward_phase * forward + adjoint_phase * adjoint;
+        }
+        Ok(())
+    }
+}
+
 impl FloquetStep {
     fn shape(&self) -> (usize, usize) {
         match self {
@@ -342,6 +528,117 @@ pub struct FloquetEigensystem {
     pub eigenvectors: Vec<Vec<Complex64>>,
     /// Norm of `U v - λ v` for each pair.
     pub residuals: Vec<f64>,
+}
+
+/// Controls a matrix-free Floquet eigensolve near one target quasienergy.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FloquetSpectrumOptions {
+    /// Number of returned Floquet eigenpairs.
+    pub eigenpairs: usize,
+    /// Target quasienergy on the principal branch.
+    pub target_quasienergy: f64,
+    /// Candidate phase-filter subspace size before projected unitary
+    /// diagonalization.
+    pub search_dimension: Option<usize>,
+    /// Optional Lanczos restart window used by the Hermitian phase filter.
+    pub krylov_dimension: Option<usize>,
+    /// Required Hermitian-filter residual tolerance.
+    pub tolerance: f64,
+    /// Maximum eigensolver iteration budget.
+    pub max_iterations: usize,
+    /// Deterministic initial-vector seed.
+    pub seed: u64,
+}
+
+impl FloquetSpectrumOptions {
+    /// Construct controls for `eigenpairs` nearest `target_quasienergy`.
+    pub fn new(eigenpairs: usize, target_quasienergy: f64) -> Self {
+        Self {
+            eigenpairs,
+            target_quasienergy,
+            search_dimension: None,
+            krylov_dimension: None,
+            tolerance: 1.0e-10,
+            max_iterations: 1_000,
+            seed: 0,
+        }
+    }
+
+    /// Set the number of phase-filter candidates retained for projected
+    /// unitary diagonalization.
+    #[must_use]
+    pub fn with_search_dimension(mut self, dimension: usize) -> Self {
+        self.search_dimension = Some(dimension);
+        self
+    }
+
+    /// Set the optional Lanczos/restart window.
+    #[must_use]
+    pub fn with_krylov_dimension(mut self, dimension: usize) -> Self {
+        self.krylov_dimension = Some(dimension);
+        self
+    }
+
+    /// Set the required phase-filter tolerance.
+    #[must_use]
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
+    /// Set the maximum eigensolver iteration budget.
+    #[must_use]
+    pub fn with_max_iterations(mut self, iterations: usize) -> Self {
+        self.max_iterations = iterations;
+        self
+    }
+
+    /// Set the deterministic initial-vector seed.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    fn resolved_search_dimension(&self, dimension: usize) -> usize {
+        self.search_dimension
+            .unwrap_or_else(|| self.eigenpairs.saturating_mul(2).max(self.eigenpairs + 4))
+            .min(dimension - 1)
+    }
+
+    fn validate(&self, dimension: usize) -> Result<()> {
+        if self.eigenpairs == 0 || self.eigenpairs >= dimension {
+            return Err(QmbedError::InvalidOptions(
+                "Floquet eigenpairs must be positive and smaller than the dimension".into(),
+            ));
+        }
+        if !self.target_quasienergy.is_finite()
+            || !self.tolerance.is_finite()
+            || self.tolerance <= 0.0
+            || self.max_iterations == 0
+        {
+            return Err(QmbedError::InvalidOptions(
+                "invalid Floquet target or numerical controls".into(),
+            ));
+        }
+        let search_dimension = self.resolved_search_dimension(dimension);
+        if search_dimension < self.eigenpairs {
+            return Err(QmbedError::InvalidOptions(
+                "Floquet search_dimension must cover every requested eigenpair".into(),
+            ));
+        }
+        if self
+            .krylov_dimension
+            .is_some_and(|krylov| krylov <= search_dimension || krylov > dimension)
+        {
+            return Err(QmbedError::InvalidOptions(
+                "Floquet krylov_dimension must exceed the search dimension and fit the operator"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One-materialization Floquet unitary and its complete spectrum.
@@ -604,16 +901,48 @@ impl LinearOperator for Floquet {
     }
 }
 
+/// Frequency grid and Lanczos controls for broadened spectral functions.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SpectrumOptions {
+    /// Frequencies at which the response is evaluated.
     pub frequencies: Vec<f64>,
+    /// Reference-state energy subtracted from the resolvent.
     pub reference_energy: f64,
+    /// Positive Lorentzian broadening.
     pub broadening: f64,
+    /// Maximum Krylov dimension.
     pub krylov_dimension: usize,
+    /// Continued-fraction termination tolerance.
     pub tolerance: f64,
 }
 
 impl SpectrumOptions {
+    /// Construct spectral-function controls for a frequency grid.
+    pub fn new(frequencies: impl Into<Vec<f64>>, reference_energy: f64, broadening: f64) -> Self {
+        Self {
+            frequencies: frequencies.into(),
+            reference_energy,
+            broadening,
+            krylov_dimension: 64,
+            tolerance: 1.0e-10,
+        }
+    }
+
+    /// Set the maximum Krylov dimension.
+    #[must_use]
+    pub fn with_krylov_dimension(mut self, dimension: usize) -> Self {
+        self.krylov_dimension = dimension;
+        self
+    }
+
+    /// Set the continued-fraction termination tolerance.
+    #[must_use]
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.frequencies.is_empty()
             || self.frequencies.iter().any(|value| !value.is_finite())

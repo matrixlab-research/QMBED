@@ -1,7 +1,7 @@
 name = "QMBED"
 uuid = "62ad6bd4-1cf7-4c17-89f6-eeb78f221d91"
 authors = ["Matrix Lab"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"

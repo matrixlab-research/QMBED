@@ -10,9 +10,9 @@ use qmbed::basis::{
 use qmbed::dynamics::{DriveStep, Floquet, SpectrumOptions, spectral_function};
 use qmbed::measure::{Subspace, subspace_fidelity};
 use qmbed::operator::{
-    Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorTerm,
+    Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorSpec,
 };
-use qmbed::solve::{EigshOptions, EvolutionOptions, SpectrumTarget, eigsh, evolve};
+use qmbed::solve::{EigshOptions, EvolutionOptions, eigsh, evolve};
 use qmbed::workflow::LindbladGenerator;
 use qmbed::{Complex64, QmbedError, Result};
 
@@ -20,7 +20,7 @@ fn c(value: f64) -> Complex64 {
     Complex64::new(value, 0.0)
 }
 
-fn periodic_heisenberg_terms(sites: usize) -> [OperatorTerm; 3] {
+fn periodic_heisenberg_terms(sites: usize) -> [OperatorSpec; 3] {
     let mut zz = Vec::with_capacity(sites);
     let mut forward = Vec::with_capacity(sites);
     let mut backward = Vec::with_capacity(sites);
@@ -31,9 +31,9 @@ fn periodic_heisenberg_terms(sites: usize) -> [OperatorTerm; 3] {
         backward.push(Coupling::new(0.5, vec![site, next]));
     }
     [
-        OperatorTerm::new("zz", zz).unwrap(),
-        OperatorTerm::new("+-", forward).unwrap(),
-        OperatorTerm::new("-+", backward).unwrap(),
+        OperatorSpec::new("zz", zz).unwrap(),
+        OperatorSpec::new("+-", forward).unwrap(),
+        OperatorSpec::new("-+", backward).unwrap(),
     ]
 }
 
@@ -170,14 +170,10 @@ fn spin_translation_sector_uses_normalized_orbit_representatives() {
     assert!(hamiltonian.is_hermitian(1.0e-12));
     let result = eigsh(
         &hamiltonian,
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: None,
-            tolerance: 1.0e-12,
-            max_iterations: 100,
-            seed: 5,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(100)
+            .with_seed(5),
     )
     .unwrap();
     assert_abs_diff_eq!(result.eigenvalues[0], -2.0, epsilon = 1.0e-12);
@@ -204,14 +200,11 @@ fn paper_scale_translation_xxz_sector_stays_sparse() {
     assert!(hamiltonian.nnz() < 60_000);
     let result = eigsh(
         &hamiltonian,
-        EigshOptions {
-            eigenpairs: 4,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(96),
-            tolerance: 1.0e-8,
-            max_iterations: 128,
-            seed: 31,
-        },
+        EigshOptions::smallest_algebraic(4)
+            .with_krylov_dimension(96)
+            .with_tolerance(1.0e-8)
+            .with_max_iterations(128)
+            .with_seed(31),
     )
     .unwrap();
     assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
@@ -226,21 +219,21 @@ fn paper_scale_xxz_lanczos_quench_preserves_norm() {
     let bonds = 0..(sites - 1);
     let hamiltonian = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "+-",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(0.5, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "-+",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(0.5, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "zz",
                 bonds.map(|site| Coupling::new(0.8, vec![site, site + 1])),
             )
@@ -256,13 +249,9 @@ fn paper_scale_xxz_lanczos_quench_preserves_norm() {
     let trajectory = evolve(
         &hamiltonian,
         &initial,
-        EvolutionOptions {
-            times: vec![0.7],
-            krylov_dimension: 80,
-            tolerance: 1.0e-10,
-            max_substeps: 100,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(vec![0.7])
+            .with_krylov_dimension(80)
+            .with_max_substeps(100),
     )
     .unwrap();
     let norm = trajectory.states[0]
@@ -287,7 +276,7 @@ fn paper_scale_pxp_revival_uses_the_universal_user_basis_path() {
     assert_eq!(basis.len(), 103_682);
     let hamiltonian = OperatorBuilder::on(&basis)
         .term(
-            OperatorTerm::new("x", (0..sites).map(|site| Coupling::new(1.0, vec![site]))).unwrap(),
+            OperatorSpec::new("x", (0..sites).map(|site| Coupling::new(1.0, vec![site]))).unwrap(),
         )
         .build(MatrixFormat::Csc)
         .unwrap();
@@ -299,13 +288,10 @@ fn paper_scale_pxp_revival_uses_the_universal_user_basis_path() {
     let trajectory = evolve(
         &hamiltonian,
         &initial,
-        EvolutionOptions {
-            times: vec![0.0, 2.4, 4.8, 7.2, 9.6],
-            krylov_dimension: 100,
-            tolerance: 1.0e-9,
-            max_substeps: 100,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(vec![0.0, 2.4, 4.8, 7.2, 9.6])
+            .with_krylov_dimension(100)
+            .with_tolerance(1.0e-9)
+            .with_max_substeps(100),
     )
     .unwrap();
     let mut fidelities = Vec::new();
@@ -329,26 +315,26 @@ fn paper_scale_bose_hubbard_mott_quench_uses_residual_controlled_krylov_restarts
     let bonds = 0..(sites - 1);
     let hamiltonian = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "+-",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-0.1, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "-+",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-0.1, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "nn",
                 (0..sites).map(|site| Coupling::new(0.5, vec![site, site])),
             )
             .unwrap(),
-            OperatorTerm::new("n", (0..sites).map(|site| Coupling::new(-0.5, vec![site]))).unwrap(),
+            OperatorSpec::new("n", (0..sites).map(|site| Coupling::new(-0.5, vec![site]))).unwrap(),
         ])
         .build(MatrixFormat::Csc)
         .unwrap();
@@ -358,13 +344,10 @@ fn paper_scale_bose_hubbard_mott_quench_uses_residual_controlled_krylov_restarts
     let trajectory = evolve(
         &hamiltonian,
         &initial,
-        EvolutionOptions {
-            times: vec![0.0, 25.0, 50.0, 100.0, 200.0],
-            krylov_dimension: 100,
-            tolerance: 1.0e-9,
-            max_substeps: 1_000,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(vec![0.0, 25.0, 50.0, 100.0, 200.0])
+            .with_krylov_dimension(100)
+            .with_tolerance(1.0e-9)
+            .with_max_substeps(1_000),
     )
     .unwrap();
     let mut returns = Vec::new();
@@ -388,33 +371,33 @@ fn paper_scale_spinful_hubbard_low_energy_residuals() {
     let bonds = 0..(sites - 1);
     let hamiltonian = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "+-|",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "-+|",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "|+-",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "|-+",
                 bonds.map(|site| Coupling::new(1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "n|n",
                 (0..sites).map(|site| Coupling::new(4.0, vec![site, site])),
             )
@@ -424,14 +407,11 @@ fn paper_scale_spinful_hubbard_low_energy_residuals() {
         .unwrap();
     let result = eigsh(
         &hamiltonian,
-        EigshOptions {
-            eigenpairs: 6,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(160),
-            tolerance: 1.0e-9,
-            max_iterations: 192,
-            seed: 37,
-        },
+        EigshOptions::smallest_algebraic(6)
+            .with_krylov_dimension(160)
+            .with_tolerance(1.0e-9)
+            .with_max_iterations(192)
+            .with_seed(37),
     )
     .unwrap();
     assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
@@ -450,21 +430,21 @@ fn paper_scale_interacting_ssh_low_energy_residuals() {
     let bonds = 0..(sites - 1);
     let hamiltonian = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "+-",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-hopping(site), vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "-+",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(hopping(site), vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "nn",
                 bonds.map(|site| Coupling::new(2.0, vec![site, site + 1])),
             )
@@ -474,14 +454,11 @@ fn paper_scale_interacting_ssh_low_energy_residuals() {
         .unwrap();
     let result = eigsh(
         &hamiltonian,
-        EigshOptions {
-            eigenpairs: 6,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(160),
-            tolerance: 1.0e-9,
-            max_iterations: 192,
-            seed: 41,
-        },
+        EigshOptions::smallest_algebraic(6)
+            .with_krylov_dimension(160)
+            .with_tolerance(1.0e-9)
+            .with_max_iterations(192)
+            .with_seed(41),
     )
     .unwrap();
     assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
@@ -497,12 +474,12 @@ fn paper_scale_tfim_tracks_degenerate_subspaces() {
     for (field_index, field) in [0.8, 0.9, 1.0, 1.1, 1.2].into_iter().enumerate() {
         let hamiltonian = OperatorBuilder::on(&basis)
             .terms([
-                OperatorTerm::new(
+                OperatorSpec::new(
                     "zz",
                     (0..sites).map(|site| Coupling::new(-1.0, vec![site, (site + 1) % sites])),
                 )
                 .unwrap(),
-                OperatorTerm::new(
+                OperatorSpec::new(
                     "x",
                     (0..sites).map(|site| Coupling::new(-field, vec![site])),
                 )
@@ -512,14 +489,11 @@ fn paper_scale_tfim_tracks_degenerate_subspaces() {
             .unwrap();
         let result = eigsh(
             &hamiltonian,
-            EigshOptions {
-                eigenpairs: 2,
-                target: SpectrumTarget::SmallestAlgebraic,
-                krylov_dimension: Some(100),
-                tolerance: 1.0e-9,
-                max_iterations: 128,
-                seed: 43 + field_index as u64,
-            },
+            EigshOptions::smallest_algebraic(2)
+                .with_krylov_dimension(100)
+                .with_tolerance(1.0e-9)
+                .with_max_iterations(128)
+                .with_seed(43 + field_index as u64),
         )
         .unwrap();
         assert!(result.residuals.iter().all(|residual| *residual < 3.0e-7));
@@ -561,7 +535,7 @@ fn paper_scale_mbl_uses_reusable_sparse_shift_invert() {
     ];
     let mut terms = periodic_heisenberg_terms(sites).to_vec();
     terms.push(
-        OperatorTerm::new(
+        OperatorSpec::new(
             "z",
             fields
                 .into_iter()
@@ -576,14 +550,11 @@ fn paper_scale_mbl_uses_reusable_sparse_shift_invert() {
         .unwrap();
     let result = eigsh(
         &hamiltonian,
-        EigshOptions {
-            eigenpairs: 6,
-            target: SpectrumTarget::Shift(0.0),
-            krylov_dimension: Some(32),
-            tolerance: 1.0e-9,
-            max_iterations: 5_000,
-            seed: 47,
-        },
+        EigshOptions::near_shift(6, 0.0)
+            .with_krylov_dimension(32)
+            .with_tolerance(1.0e-9)
+            .with_max_iterations(5_000)
+            .with_seed(47),
     )
     .unwrap();
     let combined_residual = result
@@ -603,7 +574,7 @@ fn paper_scale_floquet_builds_a_unitary_full_period_map() {
     assert_eq!(basis.len(), 512);
     let zz = OperatorBuilder::on(&basis)
         .term(
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "zz",
                 (0..sites).map(|site| Coupling::new(0.9, vec![site, (site + 1) % sites])),
             )
@@ -613,7 +584,7 @@ fn paper_scale_floquet_builds_a_unitary_full_period_map() {
         .unwrap();
     let x = OperatorBuilder::on(&basis)
         .term(
-            OperatorTerm::new("x", (0..sites).map(|site| Coupling::new(0.73, vec![site]))).unwrap(),
+            OperatorSpec::new("x", (0..sites).map(|site| Coupling::new(0.73, vec![site]))).unwrap(),
         )
         .build(MatrixFormat::Csc)
         .unwrap();
@@ -658,28 +629,28 @@ fn paper_scale_spinful_hubbard_current_quench_is_dynamic() {
     let kinetic_terms = || {
         let bonds = 0..(sites - 1);
         [
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "+-|",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "-+|",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "|+-",
                 bonds
                     .clone()
                     .map(|site| Coupling::new(-1.0, vec![site, site + 1])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "|-+",
                 bonds.map(|site| Coupling::new(1.0, vec![site, site + 1])),
             )
@@ -687,7 +658,7 @@ fn paper_scale_spinful_hubbard_current_quench_is_dynamic() {
         ]
     };
     let interaction = || {
-        OperatorTerm::new(
+        OperatorSpec::new(
             "n|n",
             (0..sites).map(|site| Coupling::new(8.0, vec![site, site])),
         )
@@ -696,13 +667,13 @@ fn paper_scale_spinful_hubbard_current_quench_is_dynamic() {
     let mut biased_terms = kinetic_terms().to_vec();
     biased_terms.push(interaction());
     biased_terms.extend([
-        OperatorTerm::new(
+        OperatorSpec::new(
             "n|",
             (0..sites)
                 .map(|site| Coupling::new(if site < sites / 2 { -1.5 } else { 1.5 }, vec![site])),
         )
         .unwrap(),
-        OperatorTerm::new(
+        OperatorSpec::new(
             "|n",
             (0..sites)
                 .map(|site| Coupling::new(if site < sites / 2 { -1.5 } else { 1.5 }, vec![site])),
@@ -715,14 +686,11 @@ fn paper_scale_spinful_hubbard_current_quench_is_dynamic() {
         .unwrap();
     let ground = eigsh(
         &biased,
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(200),
-            tolerance: 1.0e-9,
-            max_iterations: 240,
-            seed: 53,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_krylov_dimension(200)
+            .with_tolerance(1.0e-9)
+            .with_max_iterations(240)
+            .with_seed(53),
     )
     .unwrap();
     let initial = &ground.eigenvectors[0];
@@ -736,23 +704,20 @@ fn paper_scale_spinful_hubbard_current_quench_is_dynamic() {
     let minus_i = Complex64::new(0.0, -1.0);
     let current = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new("+-|", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
-            OperatorTerm::new("-+|", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
-            OperatorTerm::new("|+-", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
-            OperatorTerm::new("|-+", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
+            OperatorSpec::new("+-|", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
+            OperatorSpec::new("-+|", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
+            OperatorSpec::new("|+-", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
+            OperatorSpec::new("|-+", [Coupling::new(minus_i, vec![center, center + 1])]).unwrap(),
         ])
         .build(MatrixFormat::Csc)
         .unwrap();
     let trajectory = evolve(
         &unbiased,
         initial,
-        EvolutionOptions {
-            times: vec![0.0, 0.5, 1.0, 1.5, 2.0],
-            krylov_dimension: 100,
-            tolerance: 1.0e-9,
-            max_substeps: 100,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(vec![0.0, 0.5, 1.0, 1.5, 2.0])
+            .with_krylov_dimension(100)
+            .with_tolerance(1.0e-9)
+            .with_max_substeps(100),
     )
     .unwrap();
     let mut maximum_current = 0.0_f64;
@@ -777,7 +742,7 @@ fn paper_scale_conb_dynamical_structure_factor_uses_krylov_measure() {
     let basis = SpinBasis1D::builder(sites).pauli(false).build().unwrap();
     let transverse_field = 3.21 * 0.057_883_8 * 7.0 / 2.88;
     let bonds = |distance: usize, coefficient: f64, operator: &str| {
-        OperatorTerm::new(
+        OperatorSpec::new(
             operator,
             (0..sites)
                 .map(move |site| Coupling::new(coefficient, vec![site, (site + distance) % sites])),
@@ -792,7 +757,7 @@ fn paper_scale_conb_dynamical_structure_factor_uses_krylov_measure() {
             bonds(2, 0.135, "zz"),
             bonds(2, 0.003, "xx"),
             bonds(2, 0.003, "yy"),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "x",
                 (0..sites).map(|site| Coupling::new(-transverse_field, vec![site])),
             )
@@ -802,19 +767,16 @@ fn paper_scale_conb_dynamical_structure_factor_uses_krylov_measure() {
         .unwrap();
     let ground = eigsh(
         &hamiltonian,
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(180),
-            tolerance: 1.0e-9,
-            max_iterations: 220,
-            seed: 59,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_krylov_dimension(180)
+            .with_tolerance(1.0e-9)
+            .with_max_iterations(220)
+            .with_seed(59),
     )
     .unwrap();
     let spin_q = OperatorBuilder::on(&basis)
         .term(
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "z",
                 (0..sites)
                     .map(|site| Coupling::new(if site % 2 == 0 { 1.0 } else { -1.0 }, vec![site])),
@@ -827,13 +789,15 @@ fn paper_scale_conb_dynamical_structure_factor_uses_krylov_measure() {
         &hamiltonian,
         &ground.eigenvectors[0],
         &spin_q,
-        SpectrumOptions {
-            frequencies: (0..=80).map(|index| 4.0 * index as f64 / 80.0).collect(),
-            reference_energy: ground.eigenvalues[0],
-            broadening: 0.05,
-            krylov_dimension: 100,
-            tolerance: 1.0e-9,
-        },
+        SpectrumOptions::new(
+            (0..=80)
+                .map(|index| 4.0 * index as f64 / 80.0)
+                .collect::<Vec<_>>(),
+            ground.eigenvalues[0],
+            0.05,
+        )
+        .with_krylov_dimension(100)
+        .with_tolerance(1.0e-9),
     )
     .unwrap();
     assert!(ground.residuals[0] < 3.0e-7);
@@ -875,21 +839,21 @@ fn paper_scale_triangular_particle_addition_crosses_number_sectors() {
     assert_eq!(bonds.len(), 54);
     let hamiltonian_terms = || {
         [
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "+-",
                 bonds
                     .iter()
                     .map(|&(left, right)| Coupling::new(-1.0, vec![left, right])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "-+",
                 bonds
                     .iter()
                     .map(|&(left, right)| Coupling::new(1.0, vec![left, right])),
             )
             .unwrap(),
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "nn",
                 bonds
                     .iter()
@@ -908,18 +872,15 @@ fn paper_scale_triangular_particle_addition_crosses_number_sectors() {
         .unwrap();
     let ground = eigsh(
         &source_hamiltonian,
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(200),
-            tolerance: 1.0e-9,
-            max_iterations: 240,
-            seed: 61,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_krylov_dimension(200)
+            .with_tolerance(1.0e-9)
+            .with_max_iterations(240)
+            .with_seed(61),
     )
     .unwrap();
     let probe = OperatorBuilder::between(&source_basis, &target_basis)
-        .term(OperatorTerm::new("+", [Coupling::new(1.0, vec![sites / 2])]).unwrap())
+        .term(OperatorSpec::new("+", [Coupling::new(1.0, vec![sites / 2])]).unwrap())
         .build(MatrixFormat::Csc)
         .unwrap();
     let mut created = vec![c(0.0); target_basis.len()];
@@ -929,15 +890,15 @@ fn paper_scale_triangular_particle_addition_crosses_number_sectors() {
         &target_hamiltonian,
         &ground.eigenvectors[0],
         &probe,
-        SpectrumOptions {
-            frequencies: (0..=80)
+        SpectrumOptions::new(
+            (0..=80)
                 .map(|index| -4.0 + 16.0 * index as f64 / 80.0)
-                .collect(),
-            reference_energy: ground.eigenvalues[0],
-            broadening: 0.1,
-            krylov_dimension: 100,
-            tolerance: 1.0e-9,
-        },
+                .collect::<Vec<_>>(),
+            ground.eigenvalues[0],
+            0.1,
+        )
+        .with_krylov_dimension(100)
+        .with_tolerance(1.0e-9),
     )
     .unwrap();
     assert!(ground.residuals[0] < 3.0e-7);
@@ -976,7 +937,7 @@ fn user_basis_visible_anchor_uses_universal_contract() -> Result<()> {
 
 #[test]
 fn terms_couplings_and_formats_are_explicit() {
-    let term = OperatorTerm::new(
+    let term = OperatorSpec::new(
         "zz",
         [
             Coupling::new(1.0, vec![0, 1]),
@@ -1016,9 +977,9 @@ fn linear_operator_is_rectangular_capable() {
 fn heisenberg_dimer(format: MatrixFormat) -> Operator {
     let basis = SpinBasis1D::builder(2).pauli(false).build().unwrap();
     let terms = [
-        OperatorTerm::new("zz", [Coupling::new(1.0, vec![0, 1])]).unwrap(),
-        OperatorTerm::new("+-", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
-        OperatorTerm::new("-+", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
+        OperatorSpec::new("zz", [Coupling::new(1.0, vec![0, 1])]).unwrap(),
+        OperatorSpec::new("+-", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
+        OperatorSpec::new("-+", [Coupling::new(0.5, vec![0, 1])]).unwrap(),
     ];
     OperatorBuilder::on(&basis)
         .terms(terms)
@@ -1033,14 +994,10 @@ fn universal_builder_and_eigsh_match_the_dimer_anchor() {
     assert!(operator.is_hermitian(1.0e-12));
     let result = eigsh(
         &operator,
-        EigshOptions {
-            eigenpairs: 2,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: None,
-            tolerance: 1.0e-12,
-            max_iterations: 100,
-            seed: 7,
-        },
+        EigshOptions::smallest_algebraic(2)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(100)
+            .with_seed(7),
     )
     .unwrap();
     assert_abs_diff_eq!(result.eigenvalues[0], -0.75, epsilon = 1.0e-12);
@@ -1087,14 +1044,11 @@ fn lanczos_backend_avoids_dense_materialization_for_large_operators() {
     };
     let result = eigsh(
         &operator,
-        EigshOptions {
-            eigenpairs: 3,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(160),
-            tolerance: 1.0e-8,
-            max_iterations: 192,
-            seed: 17,
-        },
+        EigshOptions::smallest_algebraic(3)
+            .with_krylov_dimension(160)
+            .with_tolerance(1.0e-8)
+            .with_max_iterations(192)
+            .with_seed(17),
     )
     .unwrap();
     assert_abs_diff_eq!(result.eigenvalues[0], 0.0, epsilon = 1.0e-7);
@@ -1117,14 +1071,11 @@ fn sparse_shift_invert_finds_interior_eigenpairs() {
     .unwrap();
     let result = eigsh(
         &operator,
-        EigshOptions {
-            eigenpairs: 2,
-            target: SpectrumTarget::Shift(0.3),
-            krylov_dimension: Some(24),
-            tolerance: 1.0e-8,
-            max_iterations: 512,
-            seed: 23,
-        },
+        EigshOptions::near_shift(2, 0.3)
+            .with_krylov_dimension(24)
+            .with_tolerance(1.0e-8)
+            .with_max_iterations(512)
+            .with_seed(23),
     )
     .unwrap();
     assert_abs_diff_eq!(result.eigenvalues[0], 0.0, epsilon = 1.0e-7);
@@ -1143,7 +1094,7 @@ fn cross_sector_builder_has_target_by_source_shape() {
         .build()
         .unwrap();
     let probe = OperatorBuilder::between(&source, &target)
-        .term(OperatorTerm::new("+", [Coupling::new(1.0, vec![2])]).unwrap())
+        .term(OperatorSpec::new("+", [Coupling::new(1.0, vec![2])]).unwrap())
         .build(MatrixFormat::Csc)
         .unwrap();
     assert_eq!(probe.shape(), (6, 4));
@@ -1154,13 +1105,10 @@ fn evolution_and_floquet_match_diagonal_visible_anchors() {
     let diagonal =
         Arc::new(Operator::from_dense(2, 2, vec![c(0.0), c(0.0), c(0.0), c(2.0)]).unwrap());
     let initial = vec![c(1.0 / 2.0_f64.sqrt()), c(1.0 / 2.0_f64.sqrt())];
-    let options = EvolutionOptions {
-        times: vec![0.0, PI / 2.0],
-        krylov_dimension: 64,
-        tolerance: 1.0e-12,
-        max_substeps: 100,
-        hamiltonian: true,
-    };
+    let options = EvolutionOptions::new(vec![0.0, PI / 2.0])
+        .with_krylov_dimension(64)
+        .with_tolerance(1.0e-12)
+        .with_max_substeps(100);
     let trajectory = evolve(diagonal.as_ref(), &initial, options).unwrap();
     assert_abs_diff_eq!(trajectory.states[0][1].re, initial[1].re, epsilon = 1.0e-12);
     assert_abs_diff_eq!(
@@ -1189,13 +1137,9 @@ fn spectrum_visible_anchor_is_one_lorentzian_pole() {
         &hamiltonian,
         &[c(1.0)],
         &probe,
-        SpectrumOptions {
-            frequencies: vec![1.0],
-            reference_energy: 0.0,
-            broadening: 0.5,
-            krylov_dimension: 8,
-            tolerance: 1.0e-12,
-        },
+        SpectrumOptions::new(vec![1.0], 0.0, 0.5)
+            .with_krylov_dimension(8)
+            .with_tolerance(1.0e-12),
     )
     .unwrap();
     assert_abs_diff_eq!(spectrum[0], FRAC_2_PI, epsilon = 1.0e-12);
@@ -1229,13 +1173,11 @@ fn lindblad_amplitude_damping_preserves_trace() {
     let trajectory = evolve(
         &generator,
         &initial_density_column_major,
-        EvolutionOptions {
-            times: vec![LN_2],
-            krylov_dimension: 64,
-            tolerance: 1.0e-12,
-            max_substeps: 100,
-            hamiltonian: false,
-        },
+        EvolutionOptions::new(vec![LN_2])
+            .with_krylov_dimension(64)
+            .with_tolerance(1.0e-12)
+            .with_max_substeps(100)
+            .with_hamiltonian(false),
     )
     .unwrap();
     let density = &trajectory.states[0];

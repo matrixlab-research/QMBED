@@ -5,7 +5,7 @@ use qmbed::basis::{
     Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, ErasedState, GeneralBasis,
     LatticeSymmetryMap, PackedBasis, PackedPhotonBasis, PackedTensorBasis, PhotonBasis,
     RepresentativeOrdering, SpinBasis1D, SpinfulFermionBasis1D, StateStorage, SymmetryReducer,
-    SymmetrySector, TensorBasis, U256, UserBasis, WidePackedBasis, WideSpinBasis, WideSpinBasis256,
+    TensorBasis, U256, UserBasis, WidePackedBasis, WideSpinBasis, WideSpinBasis256,
     basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and, bitwise_leftshift, bitwise_not,
     bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state, get_basis_type, photon_hspace_dim,
     python_int_to_basis_int, state_from_biguint, state_to_biguint,
@@ -13,13 +13,13 @@ use qmbed::basis::{
 use qmbed::interop::WideEdModel;
 use qmbed::measure::project_operator;
 use qmbed::operator::{
-    Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm, apply_sector_shift,
+    Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorSpec, apply_sector_shift,
     bra_ket_transitions,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn periodic_heisenberg(sites: usize) -> Vec<OperatorTerm> {
+fn periodic_heisenberg(sites: usize) -> Vec<OperatorSpec> {
     let mut zz = Vec::new();
     let mut plus_minus = Vec::new();
     let mut minus_plus = Vec::new();
@@ -30,9 +30,9 @@ fn periodic_heisenberg(sites: usize) -> Vec<OperatorTerm> {
         minus_plus.push(Coupling::new(0.5, vec![site, next]));
     }
     vec![
-        OperatorTerm::new("zz", zz).unwrap(),
-        OperatorTerm::new("+-", plus_minus).unwrap(),
-        OperatorTerm::new("-+", minus_plus).unwrap(),
+        OperatorSpec::new("zz", zz).unwrap(),
+        OperatorSpec::new("+-", plus_minus).unwrap(),
+        OperatorSpec::new("-+", minus_plus).unwrap(),
     ]
 }
 
@@ -47,7 +47,7 @@ fn closure_symmetry_map_reproduces_the_builtin_translation_sector() {
     })
     .unwrap();
     let general =
-        GeneralBasis::new(parent, SymmetrySector::new().with_map(translation, 1)).unwrap();
+        GeneralBasis::new(parent, SymmetryReducer::new().with_map(translation, 1)).unwrap();
     let builtin = SpinBasis1D::builder(4).up(2).momentum(1).build().unwrap();
     assert_eq!(general.len(), builtin.len());
     for index in 0..general.len() {
@@ -70,7 +70,7 @@ fn closure_symmetry_map_reproduces_the_builtin_translation_sector() {
             .unwrap()
     );
     let local_z = OperatorBuilder::on(general.parent())
-        .term(OperatorTerm::new("z", [Coupling::new(1.0, vec![0])]).unwrap())
+        .term(OperatorSpec::new("z", [Coupling::new(1.0, vec![0])]).unwrap())
         .build(MatrixFormat::Csc)
         .unwrap();
     assert!(projector.symmetry_leakage_norm(&local_z).unwrap() > 1.0e-6);
@@ -125,7 +125,7 @@ fn wide_persistent_model_reuses_general_symmetry_and_operator_kernels() {
     assert_eq!(reduced.len(), 1);
 
     let number =
-        OperatorTerm::new("n", (0..sites).map(|site| Coupling::new(1.0, vec![site]))).unwrap();
+        OperatorSpec::new("n", (0..sites).map(|site| Coupling::new(1.0, vec![site]))).unwrap();
     let basis = WidePackedBasis::from(reduced).reversed();
     let model = WideEdModel::new(basis, [number]);
     assert_eq!(model.states().unwrap()[0].width_bits(), sites);
@@ -140,7 +140,7 @@ fn wide_persistent_model_reuses_general_symmetry_and_operator_kernels() {
     .unwrap();
     let transitions = model
         .bra_ket_terms(
-            [OperatorTerm::new("n", [Coupling::new(1.0, vec![sites - 1])]).unwrap()],
+            [OperatorSpec::new("n", [Coupling::new(1.0, vec![sites - 1])]).unwrap()],
             &[physical_high],
         )
         .unwrap();
@@ -163,12 +163,12 @@ fn cross_sector_builder_reduces_into_the_target_symmetry_sector() {
     };
     let source = GeneralBasis::new(
         SpinBasis1D::builder(4).up(0).build().unwrap(),
-        SymmetrySector::new().with_map(translation(), 0),
+        SymmetryReducer::new().with_map(translation(), 0),
     )
     .unwrap();
     let target = GeneralBasis::new(
         SpinBasis1D::builder(4).up(1).build().unwrap(),
-        SymmetrySector::new().with_map(translation(), 1),
+        SymmetryReducer::new().with_map(translation(), 1),
     )
     .unwrap();
     let couplings = (0..4)
@@ -179,7 +179,7 @@ fn cross_sector_builder_reduces_into_the_target_symmetry_sector() {
             )
         })
         .collect::<Vec<_>>();
-    let term = OperatorTerm::new("+", couplings).unwrap();
+    let term = OperatorSpec::new("+", couplings).unwrap();
     let reduced = OperatorBuilder::between(&source, &target)
         .term(term.clone())
         .build(MatrixFormat::Csc)
@@ -223,7 +223,7 @@ fn tensor_basis_applies_each_factor_without_kronecker_materialization() {
     let tensor = TensorBasis::new(spin, boson).unwrap();
     assert_eq!(tensor.len(), 4);
     let number_weighted_spin = OperatorBuilder::on(&tensor)
-        .term(OperatorTerm::new("z|n", [Coupling::new(1.0, vec![0, 0])]).unwrap())
+        .term(OperatorSpec::new("z|n", [Coupling::new(1.0, vec![0, 0])]).unwrap())
         .build(MatrixFormat::Csc)
         .unwrap();
     let diagonal = number_weighted_spin.diagonal();
@@ -241,9 +241,9 @@ fn packed_tensor_basis_supports_recursive_factor_grammar_without_nested_types() 
     assert_eq!(tensor.dimensions(), [2, 2, 2]);
     let operator = OperatorBuilder::on(&tensor)
         .terms([
-            OperatorTerm::new("z||", [Coupling::new(1.0, vec![0])]).unwrap(),
-            OperatorTerm::new("|z|", [Coupling::new(1.0, vec![0])]).unwrap(),
-            OperatorTerm::new("||z", [Coupling::new(1.0, vec![0])]).unwrap(),
+            OperatorSpec::new("z||", [Coupling::new(1.0, vec![0])]).unwrap(),
+            OperatorSpec::new("|z|", [Coupling::new(1.0, vec![0])]).unwrap(),
+            OperatorSpec::new("||z", [Coupling::new(1.0, vec![0])]).unwrap(),
         ])
         .build(MatrixFormat::Csc)
         .unwrap();
@@ -268,8 +268,8 @@ fn photon_basis_enforces_total_excitation_and_exchange_dynamics() {
     assert_eq!(basis.total_excitations(), Some(1));
     let exchange = OperatorBuilder::on(&basis)
         .terms([
-            OperatorTerm::new("+|-", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
-            OperatorTerm::new("-|+", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
+            OperatorSpec::new("+|-", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
+            OperatorSpec::new("-|+", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
         ])
         .build(MatrixFormat::Csc)
         .unwrap();
@@ -318,8 +318,8 @@ fn packed_photon_basis_uses_stable_product_states_and_universal_additive_sectors
 
     let exchange = OperatorBuilder::on(&fixed)
         .terms([
-            OperatorTerm::new("+|-", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
-            OperatorTerm::new("-|+", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
+            OperatorSpec::new("+|-", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
+            OperatorSpec::new("-|+", [Coupling::new(1.0, vec![0, 0])]).unwrap(),
         ])
         .build(MatrixFormat::Csc)
         .unwrap();
@@ -337,7 +337,7 @@ fn packed_photon_projection_composes_matter_symmetry_with_total_excitation() {
     .unwrap();
     let reduced_matter = GeneralBasis::new(
         SpinBasis1D::builder(2).build().unwrap(),
-        SymmetrySector::new().with_map(translation, 0),
+        SymmetryReducer::new().with_map(translation, 0),
     )
     .unwrap();
     let reduced = PackedPhotonBasis::new(PackedBasis::from(reduced_matter), 1, Some(1)).unwrap();
@@ -375,7 +375,7 @@ fn wide_user_basis_actions_reach_beyond_u128() {
         .build()
         .unwrap();
     let number = OperatorBuilder::on(&basis)
-        .term(OperatorTerm::new("n", [Coupling::new(1.0, vec![200])]).unwrap())
+        .term(OperatorSpec::new("n", [Coupling::new(1.0, vec![200])]).unwrap())
         .build(MatrixFormat::Csc)
         .unwrap();
     assert_eq!(number.diagonal()[0], Complex64::new(0.0, 0.0));
@@ -485,11 +485,11 @@ fn spinful_sector_unions_and_majorana_operators_obey_clifford_algebra() {
         assert_eq!(basis.index(basis.state(index).unwrap()).unwrap(), index);
     }
     let x = OperatorBuilder::on(&basis)
-        .term(OperatorTerm::new("x|", [Coupling::new(1.0, vec![0])]).unwrap())
+        .term(OperatorSpec::new("x|", [Coupling::new(1.0, vec![0])]).unwrap())
         .build(MatrixFormat::Dense)
         .unwrap();
     let y = OperatorBuilder::on(&basis)
-        .term(OperatorTerm::new("y|", [Coupling::new(1.0, vec![0])]).unwrap())
+        .term(OperatorSpec::new("y|", [Coupling::new(1.0, vec![0])]).unwrap())
         .build(MatrixFormat::Dense)
         .unwrap();
     assert_eq!(x.adjoint().unwrap().to_dense(), x.to_dense());
@@ -559,7 +559,7 @@ fn branching_and_parallel_user_basis_paths_preserve_transition_semantics() {
         .build()
         .unwrap();
     let matrix = OperatorBuilder::on(&qutrit)
-        .term(OperatorTerm::new("a", [Coupling::new(1.0, vec![0])]).unwrap())
+        .term(OperatorSpec::new("a", [Coupling::new(1.0, vec![0])]).unwrap())
         .checks(qmbed::operator::AssemblyChecks {
             hermiticity: false,
             particle_conservation: false,
@@ -586,7 +586,7 @@ fn wide_spin_basis_assembles_high_site_actions_without_u128_conversion() {
     let source = basis.index(high).unwrap();
     let lowering =
         OperatorBuilder::between(&basis, &WideSpinBasis256::new(201, Some(0), false).unwrap())
-            .term(OperatorTerm::new("-", [Coupling::new(1.0, vec![200])]).unwrap())
+            .term(OperatorSpec::new("-", [Coupling::new(1.0, vec![200])]).unwrap())
             .build(MatrixFormat::Csc)
             .unwrap();
     assert_eq!(lowering.shape(), (1, 201));

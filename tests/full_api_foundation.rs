@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
 use qmbed::basis::{Basis, SpinBasis1D, SpinlessFermionBasis1D};
 use qmbed::operator::{
-    Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorTerm,
+    Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorSpec,
 };
 use qmbed::solve::{
     EighOptions, EigshOptions, SpectrumTarget, eigh, eigh_with_options, eigsh, eigsh_values,
@@ -11,7 +11,7 @@ use qmbed::{Complex64, QmbedError};
 
 fn single_site_operator(basis: &SpinBasis1D, operator: &str) -> Vec<Complex64> {
     OperatorBuilder::on(basis)
-        .term(OperatorTerm::new(operator, [Coupling::new(1.0, vec![0])]).unwrap())
+        .term(OperatorSpec::new(operator, [Coupling::new(1.0, vec![0])]).unwrap())
         .build(MatrixFormat::Dense)
         .unwrap()
         .to_dense()
@@ -84,7 +84,7 @@ fn higher_spin_fixed_magnetization_and_translation_sectors_are_enumerated() {
 
     let hamiltonian = OperatorBuilder::on(&momentum_zero)
         .term(
-            OperatorTerm::new(
+            OperatorSpec::new(
                 "zz",
                 [
                     Coupling::new(1.0, vec![0, 1]),
@@ -129,21 +129,17 @@ fn dense_eigensolvers_support_complex_hermitian_operators() {
 
     let partial = eigsh(
         &sigma_y,
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: None,
-            tolerance: 1.0e-12,
-            max_iterations: 20,
-            seed: 9,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(20)
+            .with_seed(9),
     )
     .unwrap();
     assert_abs_diff_eq!(partial.eigenvalues[0], -1.0, epsilon = 1.0e-12);
     assert!(partial.residuals[0] < 1.0e-12);
 }
 
-fn periodic_heisenberg(sites: usize) -> Vec<OperatorTerm> {
+fn periodic_heisenberg(sites: usize) -> Vec<OperatorSpec> {
     let mut zz = Vec::new();
     let mut plus_minus = Vec::new();
     let mut minus_plus = Vec::new();
@@ -154,9 +150,9 @@ fn periodic_heisenberg(sites: usize) -> Vec<OperatorTerm> {
         minus_plus.push(Coupling::new(0.5, vec![site, next]));
     }
     vec![
-        OperatorTerm::new("zz", zz).unwrap(),
-        OperatorTerm::new("+-", plus_minus).unwrap(),
-        OperatorTerm::new("-+", minus_plus).unwrap(),
+        OperatorSpec::new("zz", zz).unwrap(),
+        OperatorSpec::new("+-", plus_minus).unwrap(),
+        OperatorSpec::new("-+", minus_plus).unwrap(),
     ]
 }
 
@@ -201,7 +197,7 @@ fn parity_sectors_reconstruct_the_full_spin_spectrum() {
     assert!(matches!(incompatible, QmbedError::IncompatibleSymmetry(_)));
 }
 
-fn periodic_spinless_hopping(sites: usize) -> Vec<OperatorTerm> {
+fn periodic_spinless_hopping(sites: usize) -> Vec<OperatorSpec> {
     let mut forward = Vec::new();
     let mut backward = Vec::new();
     for site in 0..sites {
@@ -210,8 +206,8 @@ fn periodic_spinless_hopping(sites: usize) -> Vec<OperatorTerm> {
         backward.push(Coupling::new(1.0, vec![site, next]));
     }
     vec![
-        OperatorTerm::new("+-", forward).unwrap(),
-        OperatorTerm::new("-+", backward).unwrap(),
+        OperatorSpec::new("+-", forward).unwrap(),
+        OperatorSpec::new("-+", backward).unwrap(),
     ]
 }
 
@@ -255,14 +251,10 @@ fn spinless_momentum_sectors_reconstruct_the_full_spectrum() {
 fn target_values(operator: &Operator, target: SpectrumTarget, eigenpairs: usize) -> Vec<f64> {
     eigsh(
         operator,
-        EigshOptions {
-            eigenpairs,
-            target,
-            krylov_dimension: None,
-            tolerance: 1.0e-12,
-            max_iterations: 50,
-            seed: 3,
-        },
+        EigshOptions::new(eigenpairs, target)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(50)
+            .with_seed(3),
     )
     .unwrap()
     .eigenvalues
@@ -295,13 +287,7 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
     {
         assert_abs_diff_eq!(actual, expected, epsilon = 1.0e-12);
     }
-    let without_vectors = eigh_with_options(
-        &operator,
-        EighOptions {
-            return_eigenvectors: false,
-        },
-    )
-    .unwrap();
+    let without_vectors = eigh_with_options(&operator, EighOptions::values_only()).unwrap();
     assert!(without_vectors.eigenvectors.is_empty());
     assert_eq!(without_vectors.eigenvalues.len(), 5);
     for (actual, expected) in eigsh_values(&operator, EigshOptions::smallest_algebraic(2))
@@ -348,14 +334,10 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
     selected_subspace[128] = Complex64::new(1.0, 0.0);
     let selected = eigsh_with_initial(
         &large,
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(2),
-            tolerance: 1.0e-12,
-            max_iterations: 2,
-            seed: 0,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_krylov_dimension(2)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(2),
         &selected_subspace,
     )
     .unwrap();

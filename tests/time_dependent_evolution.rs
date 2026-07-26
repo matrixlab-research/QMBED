@@ -7,13 +7,7 @@ use qmbed::solve::{
 };
 
 fn options(times: Vec<f64>) -> EvolutionOptions {
-    EvolutionOptions {
-        times,
-        krylov_dimension: 24,
-        tolerance: 1.0e-10,
-        max_substeps: 10_000,
-        hamiltonian: true,
-    }
+    EvolutionOptions::new(times).with_krylov_dimension(24)
 }
 
 fn sigma_z_drive() -> Hamiltonian<Dynamic> {
@@ -96,12 +90,7 @@ fn static_and_dynamic_batches_equal_independent_columns() {
 
 #[test]
 fn callable_rhs_and_density_modes_preserve_their_physical_invariants() {
-    let rhs_options = RhsEvolutionOptions {
-        times: vec![0.0, 0.2, 1.0],
-        max_step: 0.002,
-        max_substeps: 2_000,
-        normalize: false,
-    };
+    let rhs_options = RhsEvolutionOptions::new(vec![0.0, 0.2, 1.0], 0.002).with_max_substeps(2_000);
     let trajectory = evolve_rhs(
         &[Complex64::new(1.0, 0.0)],
         0.0,

@@ -4,11 +4,10 @@ use approx::assert_abs_diff_eq;
 use qmbed::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
 use qmbed::runtime::{CpuRuntime, ExecutionProfile};
 use qmbed::solve::{
-    EigshOptions, EigshWorkspace, ExpmActionPlan, ExpmMultiplyParallel, ExpmOptions,
-    LanczosOptions, ShiftInvertPlan, SpectrumTarget, eigsh, eigsh_with_workspace,
-    evolve_with_diagnostics, expm_multiply, ftlm_observable_iteration, ftlm_static_iteration,
-    lanczos_full, lanczos_iter, lanczos_ritz, linear_combination_qt, ltlm_observable_iteration,
-    ltlm_static_iteration,
+    EigshOptions, EigshWorkspace, EvolutionOptions, ExpmActionPlan, ExpmMultiplyParallel,
+    LanczosOptions, ShiftInvertPlan, eigsh, eigsh_with_workspace, evolve_with_diagnostics,
+    expm_multiply, ftlm_observable_iteration, ftlm_static_iteration, lanczos_full, lanczos_iter,
+    lanczos_ritz, linear_combination_qt, ltlm_observable_iteration, ltlm_static_iteration,
 };
 use qmbed::{Complex64, QmbedError};
 
@@ -50,14 +49,11 @@ fn real_operator_capability_drives_large_sparse_eigsh() {
 
     let result = eigsh(
         &operator,
-        EigshOptions {
-            eigenpairs: 2,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(8),
-            tolerance: 1.0e-12,
-            max_iterations: 32,
-            seed: 7,
-        },
+        EigshOptions::smallest_algebraic(2)
+            .with_krylov_dimension(8)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(32)
+            .with_seed(7),
     )
     .unwrap();
     assert_abs_diff_eq!(result.eigenvalues[0], -2.0, epsilon = 1.0e-12);
@@ -80,14 +76,11 @@ fn eigsh_never_relabels_a_loose_ritz_pair_as_converged() {
         .collect::<Vec<_>>();
     let result = eigsh(
         &diagonal(&values),
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: Some(2),
-            tolerance: 1.0e-12,
-            max_iterations: 2,
-            seed: 7,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_krylov_dimension(2)
+            .with_tolerance(1.0e-12)
+            .with_max_iterations(2)
+            .with_seed(7),
     );
     assert!(matches!(result, Err(QmbedError::NonConvergence { .. })));
 }
@@ -99,14 +92,9 @@ fn automatic_eigsh_expands_the_krylov_space_within_the_iteration_budget() {
         .collect::<Vec<_>>();
     let result = eigsh(
         &diagonal(&values),
-        EigshOptions {
-            eigenpairs: 1,
-            target: SpectrumTarget::SmallestAlgebraic,
-            krylov_dimension: None,
-            tolerance: 1.0e-16,
-            max_iterations: 1_000,
-            seed: 7,
-        },
+        EigshOptions::smallest_algebraic(1)
+            .with_tolerance(1.0e-16)
+            .with_seed(7),
     )
     .unwrap();
     assert_abs_diff_eq!(result.eigenvalues[0], 0.0, epsilon = 1.0e-13);
@@ -121,14 +109,10 @@ fn thick_restart_and_workspace_reuse_a_complete_invariant_subspace() {
         .map(|index| index as f64 / 299.0)
         .collect::<Vec<_>>();
     let operator = diagonal(&values);
-    let options = EigshOptions {
-        eigenpairs: 3,
-        target: SpectrumTarget::SmallestAlgebraic,
-        krylov_dimension: Some(16),
-        tolerance: 1.0e-10,
-        max_iterations: 1_000,
-        seed: 19,
-    };
+    let options = EigshOptions::smallest_algebraic(3)
+        .with_krylov_dimension(16)
+        .with_tolerance(1.0e-10)
+        .with_seed(19);
     let mut workspace = EigshWorkspace::new();
     let first = eigsh_with_workspace(&operator, options.clone(), &mut workspace).unwrap();
     assert!(first.iterations > 16);
@@ -154,14 +138,11 @@ fn large_workspace_window_keeps_the_tridiagonal_lanczos_path() {
         })
         .collect::<Vec<_>>();
     let operator = diagonal(&values);
-    let options = EigshOptions {
-        eigenpairs: 3,
-        target: SpectrumTarget::SmallestAlgebraic,
-        krylov_dimension: Some(100),
-        tolerance: 1.0e-10,
-        max_iterations: 100,
-        seed: 23,
-    };
+    let options = EigshOptions::smallest_algebraic(3)
+        .with_krylov_dimension(100)
+        .with_tolerance(1.0e-10)
+        .with_max_iterations(100)
+        .with_seed(23);
     let mut workspace = EigshWorkspace::new();
     let first = eigsh_with_workspace(&operator, options.clone(), &mut workspace).unwrap();
     let second = eigsh_with_workspace(&operator, options, &mut workspace).unwrap();
@@ -180,10 +161,7 @@ fn public_lanczos_full_and_iterator_return_the_same_tridiagonalization() {
         Complex64::new(2.0, 0.0),
         Complex64::new(-1.0, 0.0),
     ];
-    let options = LanczosOptions {
-        krylov_dimension: 3,
-        tolerance: 1.0e-13,
-    };
+    let options = LanczosOptions::new(3).with_tolerance(1.0e-13);
     let full = lanczos_full(&operator, &initial, options.clone()).unwrap();
     let streamed: Vec<_> = lanczos_iter(&operator, &initial, options)
         .unwrap()
@@ -214,10 +192,7 @@ fn ritz_decomposition_reconstructs_general_complex_exponential_actions() {
     let ritz = lanczos_ritz(
         &operator,
         &initial,
-        LanczosOptions {
-            krylov_dimension: 3,
-            tolerance: 1.0e-13,
-        },
+        LanczosOptions::new(3).with_tolerance(1.0e-13),
     )
     .unwrap();
     let coefficient = Complex64::new(-0.2, 0.3);
@@ -276,13 +251,10 @@ fn expm_multiply_reuses_the_existing_trajectory_contract() {
     let trajectory = expm_multiply(
         &operator,
         &initial,
-        ExpmOptions {
-            times: vec![0.0, 0.25, 0.5],
-            krylov_dimension: 8,
-            tolerance: 1.0e-12,
-            max_substeps: 100,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(vec![0.0, 0.25, 0.5])
+            .with_krylov_dimension(8)
+            .with_tolerance(1.0e-12)
+            .with_max_substeps(100),
     )
     .unwrap();
     assert_eq!(trajectory.states.len(), 3);
@@ -300,13 +272,7 @@ fn hermitian_evolution_adapts_a_small_krylov_space_to_the_requested_tolerance() 
     let (trajectory, diagnostics) = evolve_with_diagnostics(
         &operator,
         &initial,
-        qmbed::solve::EvolutionOptions {
-            times: vec![0.0, 1.0, 5.0],
-            krylov_dimension: 8,
-            tolerance: 1.0e-10,
-            max_substeps: 10_000,
-            hamiltonian: true,
-        },
+        EvolutionOptions::new(vec![0.0, 1.0, 5.0]).with_krylov_dimension(8),
     )
     .unwrap();
     assert!(diagnostics.lanczos_projections > 1);
@@ -333,10 +299,7 @@ fn thermal_lanczos_matches_an_exact_two_level_trace() {
         Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
         Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
     ];
-    let options = LanczosOptions {
-        krylov_dimension: 2,
-        tolerance: 1.0e-13,
-    };
+    let options = LanczosOptions::new(2).with_tolerance(1.0e-13);
     let beta = 0.7;
     let ftlm = ftlm_static_iteration(&operator, &initial, &[0.0, beta], options.clone()).unwrap();
     let ltlm = ltlm_static_iteration(&operator, &initial, &[0.0, beta], options).unwrap();
@@ -363,10 +326,7 @@ fn thermal_lanczos_matches_an_exact_two_level_trace() {
     let identity = diagonal(&[1.0, 1.0]);
     let observables: Vec<(String, &dyn LinearOperator)> =
         vec![("H".to_string(), &operator), ("I".to_string(), &identity)];
-    let observable_options = LanczosOptions {
-        krylov_dimension: 2,
-        tolerance: 1.0e-13,
-    };
+    let observable_options = LanczosOptions::new(2).with_tolerance(1.0e-13);
     let ftlm_observables = ftlm_observable_iteration(
         &operator,
         &initial,

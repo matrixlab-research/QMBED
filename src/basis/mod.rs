@@ -17,6 +17,29 @@ use crate::{QmbedError, Result};
 /// automatically.
 pub type LocalTransitions<State> = SmallVec<[(State, Complex64); 2]>;
 
+/// Integer-like binary occupation state used by sector-native subsystem
+/// contractions.
+///
+/// The trait deliberately exposes only one bit query.  Subsystem algorithms
+/// therefore work with packed `u128`, fixed-width wide states, and the
+/// runtime-erased state without depending on their storage representation.
+pub trait BinaryState: Copy + Eq + Hash {
+    /// Return whether the binary mode at `index` is occupied.
+    fn bit(&self, index: usize) -> Result<bool>;
+}
+
+impl BinaryState for u128 {
+    fn bit(&self, index: usize) -> Result<bool> {
+        if index >= u128::BITS as usize {
+            return Err(QmbedError::InvalidSite {
+                site: index,
+                sites: u128::BITS as usize,
+            });
+        }
+        Ok(*self & (1_u128 << index) != 0)
+    }
+}
+
 /// Canonical image of one physical state under a basis reduction.
 ///
 /// `phase / sqrt(orbit_size)` is the coefficient of `state` in the normalized
@@ -3389,10 +3412,6 @@ impl<State> Default for SymmetryReducer<State> {
     }
 }
 
-/// Backward-compatible name for a reducer configured with one sector
-/// character per generator.
-pub type SymmetrySector<State> = SymmetryReducer<State>;
-
 /// Result of reducing one physical state without materializing a basis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SymmetryOrbit<State> {
@@ -4099,7 +4118,7 @@ where
     Parent: Basis,
     Parent::State: Hash + Ord,
 {
-    pub fn new(parent: Parent, sector: SymmetrySector<Parent::State>) -> Result<Self> {
+    pub fn new(parent: Parent, sector: SymmetryReducer<Parent::State>) -> Result<Self> {
         Self::from_reducer(parent, sector)
     }
 
@@ -4997,14 +5016,16 @@ impl<const WORDS: usize> WideState<WORDS> {
     }
 }
 
+impl<const WORDS: usize> BinaryState for WideState<WORDS> {
+    fn bit(&self, index: usize) -> Result<bool> {
+        WideState::bit(self, index)
+    }
+}
+
 pub type U256 = WideState<4>;
 pub type U1024 = WideState<16>;
 pub type U4096 = WideState<64>;
 pub type U16384 = WideState<256>;
-pub type UInt256 = U256;
-pub type UInt1024 = U1024;
-pub type UInt4096 = U4096;
-pub type UInt16384 = U16384;
 
 /// Runtime-selected fixed-width basis state.
 ///
@@ -5175,6 +5196,23 @@ impl ErasedState {
         self.to_biguint().to_str_radix(10)
     }
 
+    /// Return whether one logical binary mode is occupied.
+    pub fn bit(&self, index: usize) -> Result<bool> {
+        if index >= self.width_bits {
+            return Err(QmbedError::InvalidSite {
+                site: index,
+                sites: self.width_bits,
+            });
+        }
+        match &self.value {
+            ErasedStateValue::U128(value) => BinaryState::bit(value, index),
+            ErasedStateValue::U256(value) => value.bit(index),
+            ErasedStateValue::U1024(value) => value.bit(index),
+            ErasedStateValue::U4096(value) => value.bit(index),
+            ErasedStateValue::U16384(value) => value.bit(index),
+        }
+    }
+
     fn ensure_compatible(&self, right: &Self) -> Result<()> {
         if self.width_bits != right.width_bits || self.storage() != right.storage() {
             return Err(QmbedError::DimensionMismatch(
@@ -5319,6 +5357,12 @@ impl ErasedState {
             width_bits: self.width_bits,
             value,
         }
+    }
+}
+
+impl BinaryState for ErasedState {
+    fn bit(&self, index: usize) -> Result<bool> {
+        ErasedState::bit(self, index)
     }
 }
 
