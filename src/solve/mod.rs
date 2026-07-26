@@ -403,6 +403,59 @@ pub struct Eigensystem {
     pub converged: bool,
 }
 
+/// Reusable state for a sequence of related Hermitian eigenproblems.
+///
+/// The workspace keeps the complete converged invariant subspace from the
+/// previous solve.  Passing it to [`eigsh_with_workspace`] gives a parameter
+/// scan a thick initial subspace without coupling the solver to any particular
+/// Hamiltonian family.
+#[derive(Clone, Debug, Default)]
+pub struct EigshWorkspace {
+    dimension: usize,
+    initial_subspace: Vec<Vec<Complex64>>,
+}
+
+impl EigshWorkspace {
+    pub const fn new() -> Self {
+        Self {
+            dimension: 0,
+            initial_subspace: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.dimension = 0;
+        self.initial_subspace.clear();
+    }
+
+    pub const fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub fn initial_subspace(&self) -> &[Vec<Complex64>] {
+        &self.initial_subspace
+    }
+
+    pub fn set_initial_subspace(
+        &mut self,
+        dimension: usize,
+        vectors: impl IntoIterator<Item = Vec<Complex64>>,
+    ) -> Result<()> {
+        let vectors: Vec<_> = vectors.into_iter().collect();
+        for vector in &vectors {
+            validate_eigsh_initial(vector, dimension)?;
+        }
+        self.dimension = dimension;
+        self.initial_subspace = vectors;
+        Ok(())
+    }
+
+    fn update(&mut self, dimension: usize, eigensystem: &Eigensystem) {
+        self.dimension = dimension;
+        self.initial_subspace.clone_from(&eigensystem.eigenvectors);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EighOptions {
     pub return_eigenvectors: bool,
@@ -489,6 +542,29 @@ fn residual_norm(
         .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
         .sum::<f64>()
         .sqrt())
+}
+
+fn rayleigh_value_and_residual(
+    operator: &(impl LinearOperator + ?Sized),
+    vector: &[Complex64],
+) -> Result<(f64, f64)> {
+    let mut applied = vec![Complex64::new(0.0, 0.0); vector.len()];
+    operator.apply(vector, &mut applied)?;
+    let norm_squared = inner(vector, vector).re;
+    if !norm_squared.is_finite() || norm_squared <= f64::EPSILON {
+        return Err(QmbedError::NonConvergence {
+            iterations: 0,
+            residual: norm_squared.sqrt(),
+        });
+    }
+    let eigenvalue = inner(vector, &applied).re / norm_squared;
+    let residual = applied
+        .iter()
+        .zip(vector)
+        .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
+        .sum::<f64>()
+        .sqrt();
+    Ok((eigenvalue, residual))
 }
 
 fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
@@ -859,6 +935,7 @@ fn real_vector_norm(vector: &[f64]) -> f64 {
     real_inner(vector, vector).sqrt()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn dgks_reorthogonalize_real(basis: &[Vec<f64>], output: &mut [f64]) -> (f64, bool) {
     let norm_before_reorthogonalization = real_vector_norm(output);
     for vector in basis {
@@ -884,6 +961,7 @@ fn dgks_reorthogonalize_real(basis: &[Vec<f64>], output: &mut [f64]) -> (f64, bo
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn dgks_reorthogonalize_complex(basis: &[Vec<Complex64>], output: &mut [Complex64]) -> (f64, bool) {
     let norm_before_reorthogonalization = vector_norm(output);
     for vector in basis {
@@ -923,6 +1001,7 @@ fn normalize_real(vector: &mut [f64]) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn lanczos_eigsh_real<O>(
     operator: &O,
     options: &EigshOptions,
@@ -1091,6 +1170,7 @@ where
     })
 }
 
+#[allow(dead_code)]
 fn lanczos_eigsh<O>(
     operator: &O,
     options: &EigshOptions,
@@ -1264,6 +1344,746 @@ where
     })
 }
 
+#[derive(Clone)]
+struct RealRitzCandidate {
+    value: f64,
+    vector: Vec<f64>,
+    residual: f64,
+    transformed_action: Vec<f64>,
+}
+
+#[derive(Clone)]
+struct ComplexRitzCandidate {
+    value: f64,
+    vector: Vec<Complex64>,
+    residual: f64,
+    transformed_action: Vec<Complex64>,
+}
+
+struct RetainedRealVector {
+    vector: Vec<f64>,
+    transformed_action: Option<Vec<f64>>,
+}
+
+struct RetainedComplexVector {
+    vector: Vec<Complex64>,
+    transformed_action: Option<Vec<Complex64>>,
+}
+
+fn sort_real_candidates(candidates: &mut [RealRitzCandidate], target: SpectrumTarget) {
+    candidates.sort_by(|left, right| match target {
+        SpectrumTarget::SmallestAlgebraic => left.value.total_cmp(&right.value),
+        SpectrumTarget::LargestAlgebraic => right.value.total_cmp(&left.value),
+        SpectrumTarget::SmallestMagnitude => left.value.abs().total_cmp(&right.value.abs()),
+        SpectrumTarget::LargestMagnitude => right.value.abs().total_cmp(&left.value.abs()),
+        SpectrumTarget::BothEnds => left.value.total_cmp(&right.value),
+        SpectrumTarget::Shift(shift) => (left.value - shift)
+            .abs()
+            .total_cmp(&(right.value - shift).abs()),
+    });
+}
+
+fn sort_complex_candidates(candidates: &mut [ComplexRitzCandidate], target: SpectrumTarget) {
+    candidates.sort_by(|left, right| match target {
+        SpectrumTarget::SmallestAlgebraic => left.value.total_cmp(&right.value),
+        SpectrumTarget::LargestAlgebraic => right.value.total_cmp(&left.value),
+        SpectrumTarget::SmallestMagnitude => left.value.abs().total_cmp(&right.value.abs()),
+        SpectrumTarget::LargestMagnitude => right.value.abs().total_cmp(&left.value.abs()),
+        SpectrumTarget::BothEnds => left.value.total_cmp(&right.value),
+        SpectrumTarget::Shift(shift) => (left.value - shift)
+            .abs()
+            .total_cmp(&(right.value - shift).abs()),
+    });
+}
+
+fn orthonormalize_real(
+    locked: &[RealRitzCandidate],
+    basis: &[Vec<f64>],
+    vector: Vec<f64>,
+) -> (Option<Vec<f64>>, usize, usize) {
+    let (vector, passes, second_passes, _) =
+        orthonormalize_real_with_projection(locked, basis, vector);
+    (vector, passes, second_passes)
+}
+
+fn orthonormalize_real_with_projection(
+    locked: &[RealRitzCandidate],
+    basis: &[Vec<f64>],
+    mut vector: Vec<f64>,
+) -> (Option<Vec<f64>>, usize, usize, Vec<f64>) {
+    let norm_before = real_vector_norm(&vector);
+    for candidate in locked {
+        let overlap = real_inner(&candidate.vector, &vector);
+        for (value, locked_value) in vector.iter_mut().zip(&candidate.vector) {
+            *value -= overlap * *locked_value;
+        }
+    }
+    let mut projection = Vec::with_capacity(basis.len());
+    for basis_vector in basis {
+        let overlap = real_inner(basis_vector, &vector);
+        projection.push(overlap);
+        for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+            *value -= overlap * *basis_value;
+        }
+    }
+    let mut norm = real_vector_norm(&vector);
+    let second_pass =
+        norm_before > f64::EPSILON && norm <= DGKS_REORTHOGONALIZATION_THRESHOLD * norm_before;
+    if second_pass {
+        for candidate in locked {
+            let overlap = real_inner(&candidate.vector, &vector);
+            for (value, locked_value) in vector.iter_mut().zip(&candidate.vector) {
+                *value -= overlap * *locked_value;
+            }
+        }
+        for basis_vector in basis {
+            let overlap = real_inner(basis_vector, &vector);
+            for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+                *value -= overlap * *basis_value;
+            }
+        }
+        norm = real_vector_norm(&vector);
+    }
+    if !norm.is_finite() || norm <= 1.0e-14 {
+        return (
+            None,
+            1 + usize::from(second_pass),
+            usize::from(second_pass),
+            projection,
+        );
+    }
+    for value in &mut vector {
+        *value /= norm;
+    }
+    (
+        Some(vector),
+        1 + usize::from(second_pass),
+        usize::from(second_pass),
+        projection,
+    )
+}
+
+fn orthonormalize_complex(
+    locked: &[ComplexRitzCandidate],
+    basis: &[Vec<Complex64>],
+    vector: Vec<Complex64>,
+) -> (Option<Vec<Complex64>>, usize, usize) {
+    let (vector, passes, second_passes, _) =
+        orthonormalize_complex_with_projection(locked, basis, vector);
+    (vector, passes, second_passes)
+}
+
+fn orthonormalize_complex_with_projection(
+    locked: &[ComplexRitzCandidate],
+    basis: &[Vec<Complex64>],
+    mut vector: Vec<Complex64>,
+) -> (Option<Vec<Complex64>>, usize, usize, Vec<Complex64>) {
+    let norm_before = vector_norm(&vector);
+    for candidate in locked {
+        let overlap = inner(&candidate.vector, &vector);
+        for (value, locked_value) in vector.iter_mut().zip(&candidate.vector) {
+            *value -= overlap * *locked_value;
+        }
+    }
+    let mut projection = Vec::with_capacity(basis.len());
+    for basis_vector in basis {
+        let overlap = inner(basis_vector, &vector);
+        projection.push(overlap);
+        for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+            *value -= overlap * *basis_value;
+        }
+    }
+    let mut norm = vector_norm(&vector);
+    let second_pass =
+        norm_before > f64::EPSILON && norm <= DGKS_REORTHOGONALIZATION_THRESHOLD * norm_before;
+    if second_pass {
+        for candidate in locked {
+            let overlap = inner(&candidate.vector, &vector);
+            for (value, locked_value) in vector.iter_mut().zip(&candidate.vector) {
+                *value -= overlap * *locked_value;
+            }
+        }
+        for basis_vector in basis {
+            let overlap = inner(basis_vector, &vector);
+            for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+                *value -= overlap * *basis_value;
+            }
+        }
+        norm = vector_norm(&vector);
+    }
+    if !norm.is_finite() || norm <= 1.0e-14 {
+        return (
+            None,
+            1 + usize::from(second_pass),
+            usize::from(second_pass),
+            projection,
+        );
+    }
+    for value in &mut vector {
+        *value /= norm;
+    }
+    (
+        Some(vector),
+        1 + usize::from(second_pass),
+        usize::from(second_pass),
+        projection,
+    )
+}
+
+fn thick_restart_dimension(options: &EigshOptions, dimension: usize) -> usize {
+    options
+        .krylov_dimension
+        .unwrap_or_else(|| (4 * options.eigenpairs + 24).max(32))
+        .min(dimension)
+}
+
+fn thick_restarted_eigsh_real<O>(
+    operator: &O,
+    options: &EigshOptions,
+    initial_subspace: Option<&[Vec<Complex64>]>,
+    shifted_solver: Option<Box<dyn ShiftedLinearSolver>>,
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let dimension = operator.shape().0;
+    let restart_dimension = thick_restart_dimension(options, dimension);
+    if restart_dimension <= options.eigenpairs {
+        return Err(QmbedError::InvalidOptions(
+            "the effective Krylov dimension must exceed eigenpairs".into(),
+        ));
+    }
+    let mut retained = initial_subspace
+        .unwrap_or_default()
+        .iter()
+        .map(|vector| RetainedRealVector {
+            vector: vector.iter().map(|value| value.re).collect::<Vec<_>>(),
+            transformed_action: None,
+        })
+        .collect::<Vec<_>>();
+    let mut locked = Vec::<RealRitzCandidate>::new();
+    let mut iterations = 0usize;
+    let mut reorthogonalization_passes = 0usize;
+    let mut conditional_second_passes = 0usize;
+    let mut last_residual = f64::INFINITY;
+    let mut cycle = 0_u64;
+
+    while iterations < options.max_iterations && locked.len() < options.eigenpairs {
+        let mut basis = Vec::with_capacity(restart_dimension);
+        let mut applied = Vec::with_capacity(restart_dimension);
+        let reuse_actions = !retained.is_empty()
+            && retained
+                .iter()
+                .all(|vector| vector.transformed_action.is_some());
+        for mut retained_vector in retained.drain(..) {
+            if reuse_actions {
+                let norm = real_vector_norm(&retained_vector.vector);
+                if norm.is_finite() && norm > 1.0e-14 {
+                    for value in &mut retained_vector.vector {
+                        *value /= norm;
+                    }
+                    let mut action = retained_vector.transformed_action.take().unwrap();
+                    for value in &mut action {
+                        *value /= norm;
+                    }
+                    basis.push(retained_vector.vector);
+                    applied.push(action);
+                }
+            } else {
+                let (vector, passes, second_passes) =
+                    orthonormalize_real(&locked, &basis, retained_vector.vector);
+                reorthogonalization_passes += passes;
+                conditional_second_passes += second_passes;
+                if let Some(vector) = vector {
+                    basis.push(vector);
+                }
+            }
+            if basis.len() >= restart_dimension / 2 {
+                break;
+            }
+        }
+        if basis.is_empty() {
+            let start = deterministic_start(
+                dimension,
+                options.seed.wrapping_add(cycle.wrapping_mul(0x9e37_79b9)),
+            )?
+            .into_iter()
+            .map(|value| value.re)
+            .collect();
+            let (start, passes, second_passes) = orthonormalize_real(&locked, &basis, start);
+            reorthogonalization_passes += passes;
+            conditional_second_passes += second_passes;
+            if let Some(start) = start {
+                basis.push(start);
+            }
+        }
+        if basis.is_empty() {
+            break;
+        }
+
+        let known_actions = applied.len();
+        let mut projection_columns = Vec::with_capacity(restart_dimension);
+        if reuse_actions {
+            for (column, action) in applied[..known_actions].iter().cloned().enumerate() {
+                if basis.len() >= restart_dimension {
+                    break;
+                }
+                let (residual_direction, passes, second_passes, projection) =
+                    orthonormalize_real_with_projection(&locked, &basis, action);
+                reorthogonalization_passes += passes;
+                conditional_second_passes += second_passes;
+                projection_columns.push(projection[..=column].to_vec());
+                if let Some(residual_direction) = residual_direction {
+                    basis.push(residual_direction);
+                }
+            }
+        }
+        let mut cursor = known_actions;
+        while cursor < basis.len()
+            && iterations < options.max_iterations
+            && applied.len() < restart_dimension
+        {
+            let mut output = vec![0.0; dimension];
+            transformed_apply_real(
+                operator,
+                options,
+                shifted_solver.as_deref(),
+                &basis[cursor],
+                &mut output,
+            )?;
+            iterations += 1;
+            applied.push(output.clone());
+            let (next, passes, second_passes, projection) =
+                orthonormalize_real_with_projection(&locked, &basis, output);
+            reorthogonalization_passes += passes;
+            conditional_second_passes += second_passes;
+            projection_columns.push(projection[..=cursor].to_vec());
+            if basis.len() < restart_dimension {
+                if let Some(next) = next {
+                    basis.push(next);
+                }
+            }
+            cursor += 1;
+        }
+        basis.truncate(applied.len());
+        if basis.is_empty() {
+            break;
+        }
+
+        let size = basis.len();
+        let mut projected = DMatrix::<f64>::zeros(size, size);
+        for (column, projection) in projection_columns.iter().enumerate().take(size) {
+            for (row, &value) in projection.iter().enumerate().take(column + 1) {
+                projected[(row, column)] = value;
+                projected[(column, row)] = value;
+            }
+        }
+        let decomposition = SymmetricEigen::new(projected);
+        let transformed_target = if matches!(options.target, SpectrumTarget::Shift(_)) {
+            SpectrumTarget::LargestMagnitude
+        } else {
+            options.target
+        };
+        let active_needed = options.eigenpairs - locked.len();
+        let keep_limit = active_needed.min(restart_dimension / 2).max(1);
+        let indices = select_indices(
+            decomposition.eigenvalues.as_slice(),
+            transformed_target,
+            keep_limit.min(size),
+        );
+        let mut candidates = Vec::with_capacity(indices.len());
+        let mut original_action = vec![0.0; dimension];
+        for index in indices {
+            let mut vector = vec![0.0; dimension];
+            let mut transformed_action = vec![0.0; dimension];
+            for (basis_index, basis_vector) in basis.iter().enumerate() {
+                let coefficient = decomposition.eigenvectors[(basis_index, index)];
+                for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+                    *value += coefficient * *basis_value;
+                }
+                for (value, applied_value) in
+                    transformed_action.iter_mut().zip(&applied[basis_index])
+                {
+                    *value += coefficient * *applied_value;
+                }
+            }
+            let ritz_norm = real_vector_norm(&vector);
+            if !ritz_norm.is_finite() || ritz_norm <= f64::EPSILON {
+                return Err(QmbedError::NonConvergence {
+                    iterations,
+                    residual: ritz_norm,
+                });
+            }
+            for value in &mut vector {
+                *value /= ritz_norm;
+            }
+            for value in &mut transformed_action {
+                *value /= ritz_norm;
+            }
+            if matches!(options.target, SpectrumTarget::Shift(_)) {
+                operator.apply_real(&vector, &mut original_action)?;
+            } else {
+                original_action.copy_from_slice(&transformed_action);
+            }
+            let value = real_inner(&vector, &original_action);
+            let residual = original_action
+                .iter()
+                .zip(&vector)
+                .map(|(actual, component)| (actual - value * component).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            candidates.push(RealRitzCandidate {
+                value,
+                vector,
+                residual,
+                transformed_action,
+            });
+        }
+        sort_real_candidates(&mut candidates, options.target);
+        last_residual = candidates
+            .iter()
+            .take(active_needed)
+            .map(|candidate| candidate.residual)
+            .fold(0.0_f64, f64::max);
+
+        let mut next_retained = Vec::new();
+        for (rank, candidate) in candidates.into_iter().enumerate() {
+            let converged =
+                candidate.residual <= options.tolerance * candidate.value.abs().max(1.0);
+            if rank < active_needed && converged && locked.len() < options.eigenpairs {
+                let (vector, passes, second_passes) =
+                    orthonormalize_real(&locked, &[], candidate.vector);
+                reorthogonalization_passes += passes;
+                conditional_second_passes += second_passes;
+                if let Some(vector) = vector {
+                    locked.push(RealRitzCandidate {
+                        vector,
+                        ..candidate
+                    });
+                }
+            } else if next_retained.len() < keep_limit {
+                next_retained.push(RetainedRealVector {
+                    vector: candidate.vector,
+                    transformed_action: Some(candidate.transformed_action),
+                });
+            }
+        }
+        retained = next_retained;
+        cycle = cycle.wrapping_add(1);
+    }
+
+    if locked.len() < options.eigenpairs {
+        return Err(QmbedError::NonConvergence {
+            iterations,
+            residual: last_residual,
+        });
+    }
+    sort_real_candidates(&mut locked, options.target);
+    locked.truncate(options.eigenpairs);
+    Ok(Eigensystem {
+        eigenvalues: locked.iter().map(|candidate| candidate.value).collect(),
+        eigenvectors: locked
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .vector
+                    .iter()
+                    .map(|value| Complex64::new(*value, 0.0))
+                    .collect()
+            })
+            .collect(),
+        residuals: locked.iter().map(|candidate| candidate.residual).collect(),
+        iterations,
+        reorthogonalization_passes,
+        conditional_second_passes,
+        converged: true,
+    })
+}
+
+fn thick_restarted_eigsh_complex<O>(
+    operator: &O,
+    options: &EigshOptions,
+    initial_subspace: Option<&[Vec<Complex64>]>,
+    shifted_solver: Option<Box<dyn ShiftedLinearSolver>>,
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let dimension = operator.shape().0;
+    let restart_dimension = thick_restart_dimension(options, dimension);
+    if restart_dimension <= options.eigenpairs {
+        return Err(QmbedError::InvalidOptions(
+            "the effective Krylov dimension must exceed eigenpairs".into(),
+        ));
+    }
+    let mut retained = initial_subspace
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+        .map(|vector| RetainedComplexVector {
+            vector,
+            transformed_action: None,
+        })
+        .collect::<Vec<_>>();
+    let mut locked = Vec::<ComplexRitzCandidate>::new();
+    let mut iterations = 0usize;
+    let mut reorthogonalization_passes = 0usize;
+    let mut conditional_second_passes = 0usize;
+    let mut last_residual = f64::INFINITY;
+    let mut cycle = 0_u64;
+
+    while iterations < options.max_iterations && locked.len() < options.eigenpairs {
+        let mut basis = Vec::with_capacity(restart_dimension);
+        let mut applied = Vec::with_capacity(restart_dimension);
+        let reuse_actions = !retained.is_empty()
+            && retained
+                .iter()
+                .all(|vector| vector.transformed_action.is_some());
+        for mut retained_vector in retained.drain(..) {
+            if reuse_actions {
+                let norm = vector_norm(&retained_vector.vector);
+                if norm.is_finite() && norm > 1.0e-14 {
+                    for value in &mut retained_vector.vector {
+                        *value /= norm;
+                    }
+                    let mut action = retained_vector.transformed_action.take().unwrap();
+                    for value in &mut action {
+                        *value /= norm;
+                    }
+                    basis.push(retained_vector.vector);
+                    applied.push(action);
+                }
+            } else {
+                let (vector, passes, second_passes) =
+                    orthonormalize_complex(&locked, &basis, retained_vector.vector);
+                reorthogonalization_passes += passes;
+                conditional_second_passes += second_passes;
+                if let Some(vector) = vector {
+                    basis.push(vector);
+                }
+            }
+            if basis.len() >= restart_dimension / 2 {
+                break;
+            }
+        }
+        if basis.is_empty() {
+            let start = deterministic_start(
+                dimension,
+                options.seed.wrapping_add(cycle.wrapping_mul(0x9e37_79b9)),
+            )?;
+            let (start, passes, second_passes) = orthonormalize_complex(&locked, &basis, start);
+            reorthogonalization_passes += passes;
+            conditional_second_passes += second_passes;
+            if let Some(start) = start {
+                basis.push(start);
+            }
+        }
+        if basis.is_empty() {
+            break;
+        }
+
+        let known_actions = applied.len();
+        let mut projection_columns = Vec::with_capacity(restart_dimension);
+        if reuse_actions {
+            for (column, action) in applied[..known_actions].iter().cloned().enumerate() {
+                if basis.len() >= restart_dimension {
+                    break;
+                }
+                let (residual_direction, passes, second_passes, projection) =
+                    orthonormalize_complex_with_projection(&locked, &basis, action);
+                reorthogonalization_passes += passes;
+                conditional_second_passes += second_passes;
+                projection_columns.push(projection[..=column].to_vec());
+                if let Some(residual_direction) = residual_direction {
+                    basis.push(residual_direction);
+                }
+            }
+        }
+        let mut cursor = known_actions;
+        while cursor < basis.len()
+            && iterations < options.max_iterations
+            && applied.len() < restart_dimension
+        {
+            let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+            transformed_apply(
+                operator,
+                options,
+                shifted_solver.as_deref(),
+                &basis[cursor],
+                &mut output,
+            )?;
+            iterations += 1;
+            applied.push(output.clone());
+            let (next, passes, second_passes, projection) =
+                orthonormalize_complex_with_projection(&locked, &basis, output);
+            reorthogonalization_passes += passes;
+            conditional_second_passes += second_passes;
+            projection_columns.push(projection[..=cursor].to_vec());
+            if basis.len() < restart_dimension {
+                if let Some(next) = next {
+                    basis.push(next);
+                }
+            }
+            cursor += 1;
+        }
+        basis.truncate(applied.len());
+        if basis.is_empty() {
+            break;
+        }
+
+        let size = basis.len();
+        let mut projected = DMatrix::<Complex64>::zeros(size, size);
+        for (column, projection) in projection_columns.iter().enumerate().take(size) {
+            for (row, &value) in projection.iter().enumerate().take(column + 1) {
+                projected[(row, column)] = value;
+                projected[(column, row)] = value.conj();
+            }
+        }
+        let decomposition = SymmetricEigen::new(projected);
+        let transformed_target = if matches!(options.target, SpectrumTarget::Shift(_)) {
+            SpectrumTarget::LargestMagnitude
+        } else {
+            options.target
+        };
+        let active_needed = options.eigenpairs - locked.len();
+        let keep_limit = active_needed.min(restart_dimension / 2).max(1);
+        let indices = select_indices(
+            decomposition.eigenvalues.as_slice(),
+            transformed_target,
+            keep_limit.min(size),
+        );
+        let mut candidates = Vec::with_capacity(indices.len());
+        let mut original_action = vec![Complex64::new(0.0, 0.0); dimension];
+        for index in indices {
+            let mut vector = vec![Complex64::new(0.0, 0.0); dimension];
+            let mut transformed_action = vec![Complex64::new(0.0, 0.0); dimension];
+            for (basis_index, basis_vector) in basis.iter().enumerate() {
+                let coefficient = decomposition.eigenvectors[(basis_index, index)];
+                for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+                    *value += coefficient * *basis_value;
+                }
+                for (value, applied_value) in
+                    transformed_action.iter_mut().zip(&applied[basis_index])
+                {
+                    *value += coefficient * *applied_value;
+                }
+            }
+            let ritz_norm = vector_norm(&vector);
+            if !ritz_norm.is_finite() || ritz_norm <= f64::EPSILON {
+                return Err(QmbedError::NonConvergence {
+                    iterations,
+                    residual: ritz_norm,
+                });
+            }
+            for value in &mut vector {
+                *value /= ritz_norm;
+            }
+            for value in &mut transformed_action {
+                *value /= ritz_norm;
+            }
+            if matches!(options.target, SpectrumTarget::Shift(_)) {
+                operator.apply(&vector, &mut original_action)?;
+            } else {
+                original_action.copy_from_slice(&transformed_action);
+            }
+            let value = inner(&vector, &original_action).re;
+            let residual = original_action
+                .iter()
+                .zip(&vector)
+                .map(|(actual, component)| (*actual - value * *component).norm_sqr())
+                .sum::<f64>()
+                .sqrt();
+            candidates.push(ComplexRitzCandidate {
+                value,
+                vector,
+                residual,
+                transformed_action,
+            });
+        }
+        sort_complex_candidates(&mut candidates, options.target);
+        last_residual = candidates
+            .iter()
+            .take(active_needed)
+            .map(|candidate| candidate.residual)
+            .fold(0.0_f64, f64::max);
+
+        let mut next_retained = Vec::new();
+        for (rank, candidate) in candidates.into_iter().enumerate() {
+            let converged =
+                candidate.residual <= options.tolerance * candidate.value.abs().max(1.0);
+            if rank < active_needed && converged && locked.len() < options.eigenpairs {
+                let (vector, passes, second_passes) =
+                    orthonormalize_complex(&locked, &[], candidate.vector);
+                reorthogonalization_passes += passes;
+                conditional_second_passes += second_passes;
+                if let Some(vector) = vector {
+                    locked.push(ComplexRitzCandidate {
+                        vector,
+                        ..candidate
+                    });
+                }
+            } else if next_retained.len() < keep_limit {
+                next_retained.push(RetainedComplexVector {
+                    vector: candidate.vector,
+                    transformed_action: Some(candidate.transformed_action),
+                });
+            }
+        }
+        retained = next_retained;
+        cycle = cycle.wrapping_add(1);
+    }
+
+    if locked.len() < options.eigenpairs {
+        return Err(QmbedError::NonConvergence {
+            iterations,
+            residual: last_residual,
+        });
+    }
+    sort_complex_candidates(&mut locked, options.target);
+    locked.truncate(options.eigenpairs);
+    Ok(Eigensystem {
+        eigenvalues: locked.iter().map(|candidate| candidate.value).collect(),
+        eigenvectors: locked
+            .iter()
+            .map(|candidate| candidate.vector.clone())
+            .collect(),
+        residuals: locked.iter().map(|candidate| candidate.residual).collect(),
+        iterations,
+        reorthogonalization_passes,
+        conditional_second_passes,
+        converged: true,
+    })
+}
+
+fn thick_restarted_eigsh<O>(
+    operator: &O,
+    options: &EigshOptions,
+    initial_subspace: Option<&[Vec<Complex64>]>,
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let real_compatible = operator.is_real()
+        && initial_subspace.is_none_or(|vectors| {
+            vectors
+                .iter()
+                .all(|vector| vector.iter().all(|value| value.im.abs() <= 1.0e-14))
+        });
+    let shifted_solver = match options.target {
+        SpectrumTarget::Shift(shift) => operator.shifted_solver(shift)?,
+        _ => None,
+    };
+    if real_compatible
+        && (!matches!(options.target, SpectrumTarget::Shift(_))
+            || shifted_solver
+                .as_ref()
+                .is_some_and(|solver| solver.supports_real()))
+    {
+        return thick_restarted_eigsh_real(operator, options, initial_subspace, shifted_solver);
+    }
+    thick_restarted_eigsh_complex(operator, options, initial_subspace, shifted_solver)
+}
+
 fn dense_eigsh<O>(operator: &O, options: &EigshOptions) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
@@ -1283,16 +2103,20 @@ where
         }
         _ => select_indices(&values, options.target, options.eigenpairs),
     };
-    let eigenvalues: Vec<_> = indices.iter().map(|&index| values[index]).collect();
     let eigenvectors: Vec<_> = indices
         .iter()
         .map(|&index| vectors[index].clone())
         .collect();
-    let residuals = eigenvalues
+    // Use the selected dense eigenvectors to refine each value with its
+    // Rayleigh quotient. This shares the operator applications already needed
+    // for residuals and avoids backend/platform rounding differences at tight
+    // compatibility tolerances.
+    let refined = eigenvectors
         .iter()
-        .zip(&eigenvectors)
-        .map(|(&value, vector)| residual_norm(operator, value, vector))
+        .map(|vector| rayleigh_value_and_residual(operator, vector))
         .collect::<Result<Vec<_>>>()?;
+    let eigenvalues = refined.iter().map(|&(value, _)| value).collect();
+    let residuals = refined.iter().map(|&(_, residual)| residual).collect();
     Ok(Eigensystem {
         eigenvalues,
         eigenvectors,
@@ -1307,63 +2131,88 @@ where
 fn expanding_lanczos_eigsh<O>(
     operator: &O,
     options: &EigshOptions,
-    initial: Option<&[Complex64]>,
+    initial_subspace: Option<&[Vec<Complex64>]>,
 ) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
 {
-    if let Some(krylov_dimension) = options.krylov_dimension {
-        return match lanczos_eigsh(operator, options, initial) {
-            Err(QmbedError::NonConvergence { .. })
-                if krylov_dimension == operator.shape().0
-                    && krylov_dimension <= FULL_KRYLOV_DENSE_FALLBACK =>
-            {
-                dense_eigsh(operator, options)
-            }
-            result => result,
-        };
-    }
-
-    let dimension = operator.shape().0;
-    let mut subspace_dimension = (8 * options.eigenpairs + 64)
-        .max(256)
-        .min(dimension)
-        .min(options.max_iterations);
-    let mut spent_iterations = 0usize;
-    loop {
-        let mut attempt = options.clone();
-        attempt.krylov_dimension = Some(subspace_dimension);
-        attempt.max_iterations = subspace_dimension;
-        match lanczos_eigsh(operator, &attempt, initial) {
-            Ok(mut result) => {
-                result.iterations += spent_iterations;
-                return Ok(result);
-            }
-            Err(QmbedError::NonConvergence {
-                iterations,
-                residual,
-            }) => {
-                spent_iterations = spent_iterations.saturating_add(iterations);
-                if subspace_dimension == dimension && dimension <= FULL_KRYLOV_DENSE_FALLBACK {
-                    let mut result = dense_eigsh(operator, options)?;
-                    result.iterations = result.iterations.saturating_add(spent_iterations);
+    if options.krylov_dimension.is_none()
+        && initial_subspace.is_none_or(|vectors| vectors.len() <= 1)
+    {
+        let initial = initial_subspace
+            .and_then(|vectors| vectors.first())
+            .map(Vec::as_slice);
+        let dimension = operator.shape().0;
+        let mut subspace_dimension = (8 * options.eigenpairs + 64)
+            .max(256)
+            .min(dimension)
+            .min(options.max_iterations);
+        let mut spent_iterations = 0usize;
+        loop {
+            let mut attempt = options.clone();
+            attempt.krylov_dimension = Some(subspace_dimension);
+            attempt.max_iterations = subspace_dimension;
+            match lanczos_eigsh(operator, &attempt, initial) {
+                Ok(mut result) => {
+                    result.iterations += spent_iterations;
                     return Ok(result);
                 }
-                let remaining = options.max_iterations.saturating_sub(spent_iterations);
-                let next_dimension = subspace_dimension
-                    .saturating_mul(2)
-                    .min(dimension)
-                    .min(remaining);
-                if next_dimension <= subspace_dimension {
-                    return Err(QmbedError::NonConvergence {
-                        iterations: spent_iterations,
-                        residual,
-                    });
+                Err(QmbedError::NonConvergence {
+                    iterations,
+                    residual,
+                }) => {
+                    spent_iterations = spent_iterations.saturating_add(iterations);
+                    if subspace_dimension == dimension && dimension <= FULL_KRYLOV_DENSE_FALLBACK {
+                        let mut result = dense_eigsh(operator, options)?;
+                        result.iterations = result.iterations.saturating_add(spent_iterations);
+                        return Ok(result);
+                    }
+                    let remaining = options.max_iterations.saturating_sub(spent_iterations);
+                    let next_dimension = subspace_dimension
+                        .saturating_mul(2)
+                        .min(dimension)
+                        .min(remaining);
+                    if next_dimension <= subspace_dimension {
+                        return Err(QmbedError::NonConvergence {
+                            iterations: spent_iterations,
+                            residual,
+                        });
+                    }
+                    subspace_dimension = next_dimension;
                 }
-                subspace_dimension = next_dimension;
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
+    }
+    // A large enough unrestarted window is still the cheapest path: its
+    // three-term projection is tridiagonal and avoids the dense Rayleigh--Ritz
+    // projection required after a thick restart.  Small windows and genuine
+    // multi-vector starts use the restarted backend below.
+    if options
+        .krylov_dimension
+        .is_some_and(|dimension| dimension >= 96)
+        && initial_subspace.is_none_or(|vectors| vectors.len() <= 1)
+    {
+        let initial = initial_subspace
+            .and_then(|vectors| vectors.first())
+            .map(Vec::as_slice);
+        return lanczos_eigsh(operator, options, initial);
+    }
+    match thick_restarted_eigsh(operator, options, initial_subspace) {
+        Err(QmbedError::NonConvergence {
+            iterations,
+            residual: _,
+        }) if operator.shape().0 <= FULL_KRYLOV_DENSE_FALLBACK
+            && options.max_iterations >= operator.shape().0
+            && options
+                .krylov_dimension
+                .is_none_or(|dimension| dimension == operator.shape().0) =>
+        {
+            let mut result = dense_eigsh(operator, options)?;
+            result.iterations = iterations.saturating_add(result.iterations);
+            Ok(result)
+        }
+        result => result,
     }
 }
 
@@ -1408,7 +2257,61 @@ where
     if use_dense_eigsh(shape.0, &options) {
         return eigsh(operator, options);
     }
-    expanding_lanczos_eigsh(operator, &options, Some(initial))
+    let initial_subspace = vec![initial.to_vec()];
+    expanding_lanczos_eigsh(operator, &options, Some(&initial_subspace))
+}
+
+/// Solve from a complete user-supplied initial subspace.
+///
+/// Related parameter points should pass all previously converged target
+/// vectors here.  The thick-restart backend preserves the subspace as a
+/// subspace, so rotations inside a degenerate multiplet do not discard useful
+/// information.
+pub fn eigsh_with_initial_subspace<O>(
+    operator: &O,
+    options: EigshOptions,
+    initial_subspace: &[Vec<Complex64>],
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let shape = operator.shape();
+    if shape.0 != shape.1 {
+        return Err(QmbedError::DimensionMismatch(
+            "eigsh requires a square operator".into(),
+        ));
+    }
+    options.validate(shape.0)?;
+    if initial_subspace.is_empty() {
+        return eigsh(operator, options);
+    }
+    for vector in initial_subspace {
+        validate_eigsh_initial(vector, shape.0)?;
+    }
+    if use_dense_eigsh(shape.0, &options) {
+        return eigsh(operator, options);
+    }
+    expanding_lanczos_eigsh(operator, &options, Some(initial_subspace))
+}
+
+/// Solve one member of a related operator family and update its reusable
+/// invariant-subspace workspace.
+pub fn eigsh_with_workspace<O>(
+    operator: &O,
+    options: EigshOptions,
+    workspace: &mut EigshWorkspace,
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let dimension = operator.shape().0;
+    let result = if workspace.dimension == dimension && !workspace.initial_subspace.is_empty() {
+        eigsh_with_initial_subspace(operator, options, &workspace.initial_subspace)?
+    } else {
+        eigsh(operator, options)?
+    };
+    workspace.update(dimension, &result);
+    Ok(result)
 }
 
 pub fn eigsh_values<O>(operator: &O, options: EigshOptions) -> Result<Vec<f64>>

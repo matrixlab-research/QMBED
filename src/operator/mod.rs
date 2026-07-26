@@ -2789,6 +2789,11 @@ impl QuantumOperator {
         Operator::from_triplets(self.shape.0, self.shape.1, entries, format)
     }
 
+    /// Prepare a fixed sparse pattern for repeated evaluations of this family.
+    pub fn plan(&self, format: MatrixFormat) -> Result<QuantumOperatorPlan> {
+        QuantumOperatorPlan::new(self, format)
+    }
+
     pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
         let coefficient = coefficient.into();
         let mut components = Vec::with_capacity(self.components.len());
@@ -2859,6 +2864,254 @@ impl QuantumOperator {
             });
         }
         Self::new(components)
+    }
+}
+
+/// Fixed-pattern materialization of a [`QuantumOperator`].
+///
+/// Construction aligns every component with the union sparsity pattern once.
+/// Subsequent evaluations update only numerical values, preserving the sparse
+/// indices and any backend analysis that depends on them.
+#[derive(Clone, Debug)]
+pub struct QuantumOperatorPlan {
+    component_names: Vec<String>,
+    defaults: Vec<Option<Complex64>>,
+    component_values: Vec<Vec<Complex64>>,
+    combined_values: Vec<Complex64>,
+    operator: Operator,
+}
+
+impl QuantumOperatorPlan {
+    fn new(family: &QuantumOperator, format: MatrixFormat) -> Result<Self> {
+        let mut entries = HashMap::<(usize, usize), Vec<Complex64>>::new();
+        for (component_index, component) in family.components.iter().enumerate() {
+            for (row, column, value) in component.operator.triplets() {
+                entries
+                    .entry((row, column))
+                    .or_insert_with(|| vec![Complex64::new(0.0, 0.0); family.components.len()])
+                    [component_index] += value;
+            }
+        }
+        let mut coordinates: Vec<_> = entries.keys().copied().collect();
+        match format {
+            MatrixFormat::Csc => coordinates.sort_by_key(|&(row, column)| (column, row)),
+            MatrixFormat::Csr | MatrixFormat::MatrixFree | MatrixFormat::Dia => {
+                coordinates.sort_unstable()
+            }
+            MatrixFormat::Dense => {}
+        }
+
+        let components = family.components.len();
+        let zero = Complex64::new(0.0, 0.0);
+        let (storage, component_values) = match format {
+            MatrixFormat::Dense => {
+                let slots = family.shape.0.saturating_mul(family.shape.1);
+                let mut values = vec![vec![zero; slots]; components];
+                for (&(row, column), aligned) in &entries {
+                    let slot = row * family.shape.1 + column;
+                    for (component, value) in aligned.iter().enumerate() {
+                        values[component][slot] = *value;
+                    }
+                }
+                (Storage::Dense(vec![zero; slots]), values)
+            }
+            MatrixFormat::Csc => {
+                let mut column_offsets = vec![0usize; family.shape.1 + 1];
+                let mut row_indices = Vec::with_capacity(coordinates.len());
+                let mut values = vec![vec![zero; coordinates.len()]; components];
+                for (slot, &(row, column)) in coordinates.iter().enumerate() {
+                    column_offsets[column + 1] += 1;
+                    row_indices.push(row);
+                    for (component, value) in entries[&(row, column)].iter().enumerate() {
+                        values[component][slot] = *value;
+                    }
+                }
+                for column in 0..family.shape.1 {
+                    column_offsets[column + 1] += column_offsets[column];
+                }
+                (
+                    Storage::Csc {
+                        column_offsets,
+                        row_indices,
+                        values: vec![zero; coordinates.len()],
+                    },
+                    values,
+                )
+            }
+            MatrixFormat::Csr => {
+                let mut row_offsets = vec![0usize; family.shape.0 + 1];
+                let mut column_indices = Vec::with_capacity(coordinates.len());
+                let mut values = vec![vec![zero; coordinates.len()]; components];
+                for (slot, &(row, column)) in coordinates.iter().enumerate() {
+                    row_offsets[row + 1] += 1;
+                    column_indices.push(column);
+                    for (component, value) in entries[&(row, column)].iter().enumerate() {
+                        values[component][slot] = *value;
+                    }
+                }
+                for row in 0..family.shape.0 {
+                    row_offsets[row + 1] += row_offsets[row];
+                }
+                (
+                    Storage::Csr {
+                        row_offsets,
+                        column_indices,
+                        values: vec![zero; coordinates.len()],
+                    },
+                    values,
+                )
+            }
+            MatrixFormat::MatrixFree => {
+                let mut values = vec![vec![zero; coordinates.len()]; components];
+                let pattern = coordinates
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &(row, column))| {
+                        for (component, value) in entries[&(row, column)].iter().enumerate() {
+                            values[component][slot] = *value;
+                        }
+                        Triplet {
+                            row,
+                            column,
+                            value: zero,
+                        }
+                    })
+                    .collect();
+                (Storage::MatrixFree(pattern), values)
+            }
+            MatrixFormat::Dia => {
+                let mut offsets: Vec<_> = coordinates
+                    .iter()
+                    .map(|&(row, column)| row as isize - column as isize)
+                    .collect();
+                offsets.sort_unstable();
+                offsets.dedup();
+                let slots = offsets.len().saturating_mul(family.shape.0);
+                let mut values = vec![vec![zero; slots]; components];
+                for (&(row, column), aligned) in &entries {
+                    let offset = row as isize - column as isize;
+                    let diagonal = offsets.binary_search(&offset).map_err(|_| {
+                        QmbedError::InternalState(
+                            "parameterized diagonal pattern lost an offset".into(),
+                        )
+                    })?;
+                    let slot = diagonal * family.shape.0 + row;
+                    for (component, value) in aligned.iter().enumerate() {
+                        values[component][slot] = *value;
+                    }
+                }
+                (
+                    Storage::Dia {
+                        offsets,
+                        values_by_row: vec![zero; slots],
+                    },
+                    values,
+                )
+            }
+        };
+        let combined_values =
+            vec![Complex64::new(0.0, 0.0); component_values.first().map_or(0, Vec::len)];
+        Ok(Self {
+            component_names: family
+                .components
+                .iter()
+                .map(|component| component.name.clone())
+                .collect(),
+            defaults: family
+                .components
+                .iter()
+                .map(|component| component.default)
+                .collect(),
+            component_values,
+            combined_values,
+            operator: Operator {
+                shape: family.shape,
+                format,
+                real: true,
+                storage,
+            },
+        })
+    }
+
+    pub fn component_names(&self) -> impl Iterator<Item = &str> {
+        self.component_names.iter().map(String::as_str)
+    }
+
+    pub fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
+    pub fn resolve_coefficients(
+        &self,
+        parameters: &HashMap<String, Complex64>,
+    ) -> Result<Vec<Complex64>> {
+        if let Some(name) = parameters
+            .keys()
+            .find(|name| !self.component_names.contains(name))
+        {
+            return Err(QmbedError::InvalidOptions(format!(
+                "unknown operator parameter {name:?}"
+            )));
+        }
+        self.component_names
+            .iter()
+            .zip(&self.defaults)
+            .map(|(name, default)| {
+                let coefficient = parameters.get(name).copied().or(*default).ok_or_else(|| {
+                    QmbedError::InvalidOptions(format!(
+                        "missing required operator parameter {name:?}"
+                    ))
+                })?;
+                if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+                    return Err(QmbedError::InvalidOptions(format!(
+                        "operator parameter {name:?} must be finite"
+                    )));
+                }
+                Ok(coefficient)
+            })
+            .collect()
+    }
+
+    pub fn evaluate(&mut self, parameters: &HashMap<String, Complex64>) -> Result<&Operator> {
+        let coefficients = self.resolve_coefficients(parameters)?;
+        self.evaluate_coefficients(&coefficients)
+    }
+
+    pub fn evaluate_coefficients(&mut self, coefficients: &[Complex64]) -> Result<&Operator> {
+        if coefficients.len() != self.component_values.len() {
+            return Err(QmbedError::DimensionMismatch(
+                "parameter coefficients have the wrong length".into(),
+            ));
+        }
+        if coefficients
+            .iter()
+            .any(|value| !value.re.is_finite() || !value.im.is_finite())
+        {
+            return Err(QmbedError::InvalidOptions(
+                "parameter coefficients must be finite".into(),
+            ));
+        }
+        self.combined_values.fill(Complex64::new(0.0, 0.0));
+        for (coefficient, values) in coefficients.iter().zip(&self.component_values) {
+            for (target, value) in self.combined_values.iter_mut().zip(values) {
+                *target += *coefficient * *value;
+            }
+        }
+        match &mut self.operator.storage {
+            Storage::Dense(values) | Storage::Csc { values, .. } | Storage::Csr { values, .. } => {
+                values.copy_from_slice(&self.combined_values)
+            }
+            Storage::Dia { values_by_row, .. } => {
+                values_by_row.copy_from_slice(&self.combined_values)
+            }
+            Storage::MatrixFree(entries) => {
+                for (entry, value) in entries.iter_mut().zip(&self.combined_values) {
+                    entry.value = *value;
+                }
+            }
+        }
+        self.operator.real = storage_is_real(&self.operator.storage);
+        Ok(&self.operator)
     }
 }
 

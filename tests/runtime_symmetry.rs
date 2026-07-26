@@ -186,6 +186,11 @@ fn reducer_queries_orbits_before_basis_materialization() {
         .with_map(reflection, 0);
 
     let orbit = reducer.orbit(8).unwrap();
+    assert_eq!(reducer.cached_orbits(), 1);
+    let shared = reducer.clone();
+    let repeated = shared.orbit(8).unwrap();
+    assert_eq!(repeated, orbit);
+    assert_eq!(shared.cached_orbits(), 1);
     assert_eq!(*orbit.representative(), 1);
     assert_eq!(orbit.orbit_size(), 4);
     assert!(orbit.is_compatible());
@@ -209,6 +214,8 @@ fn reducer_queries_orbits_before_basis_materialization() {
     assert_eq!(image.phase(), orbit.phase().unwrap());
     assert_eq!(image.orbit_size(), orbit.orbit_size());
     assert_eq!(basis.reducer().generators(), 2);
+    basis.reducer().clear_cache();
+    assert_eq!(reducer.cached_orbits(), 0);
 }
 
 #[test]

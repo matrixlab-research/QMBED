@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use num_bigint::BigUint;
 use num_complex::Complex64;
@@ -3221,6 +3221,7 @@ struct SymmetryGenerator<State> {
 #[derive(Clone)]
 pub struct SymmetryReducer<State> {
     generators: Vec<SymmetryGenerator<State>>,
+    orbit_cache: Arc<RwLock<HashMap<State, Arc<SymmetryTrace<State>>>>>,
 }
 
 impl<State> std::fmt::Debug for SymmetryReducer<State> {
@@ -3228,6 +3229,7 @@ impl<State> std::fmt::Debug for SymmetryReducer<State> {
         formatter
             .debug_struct("SymmetryReducer")
             .field("generators", &self.generators.len())
+            .field("cached_orbits", &self.cached_orbits())
             .finish()
     }
 }
@@ -3236,6 +3238,7 @@ impl<State> SymmetryReducer<State> {
     pub fn new() -> Self {
         Self {
             generators: Vec::new(),
+            orbit_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -3243,6 +3246,9 @@ impl<State> SymmetryReducer<State> {
     where
         M: SymmetryMap<State> + 'static,
     {
+        // A changed generator list defines a different group action.  Clones
+        // of an unchanged reducer share their cache; derived reducers do not.
+        self.orbit_cache = Arc::new(RwLock::new(HashMap::new()));
         self.generators.push(SymmetryGenerator {
             map: Arc::new(map),
             sector,
@@ -3252,6 +3258,16 @@ impl<State> SymmetryReducer<State> {
 
     pub fn generators(&self) -> usize {
         self.generators.len()
+    }
+
+    pub fn cached_orbits(&self) -> usize {
+        self.orbit_cache.read().map_or(0, |cache| cache.len())
+    }
+
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache) = self.orbit_cache.write() {
+            cache.clear();
+        }
     }
 
     /// Product of declared generator periods.
@@ -3327,6 +3343,7 @@ struct GeneralSymmetryImage<State> {
     orbit_size: usize,
 }
 
+#[derive(Clone)]
 struct SymmetryTrace<State> {
     coefficients: HashMap<State, Complex64>,
     physical_phases: HashMap<State, Complex64>,
@@ -3416,6 +3433,25 @@ impl<State> SymmetryReducer<State>
 where
     State: Copy + Eq + Hash + Ord,
 {
+    fn trace(&self, state: State) -> Result<Arc<SymmetryTrace<State>>> {
+        if let Some(trace) = self
+            .orbit_cache
+            .read()
+            .map_err(|_| QmbedError::InternalState("symmetry orbit cache was poisoned".into()))?
+            .get(&state)
+            .cloned()
+        {
+            return Ok(trace);
+        }
+        let trace = Arc::new(trace_symmetry_orbit(state, &self.generators)?);
+        self.orbit_cache
+            .write()
+            .map_err(|_| QmbedError::InternalState("symmetry orbit cache was poisoned".into()))?
+            .entry(state)
+            .or_insert_with(|| trace.clone());
+        Ok(trace)
+    }
+
     /// Enumerate the finite physical orbit of one state in canonical order.
     ///
     /// This stays independent of any materialized basis. Deferred operator
@@ -3436,7 +3472,7 @@ where
         state: State,
         ordering: RepresentativeOrdering,
     ) -> Result<(SymmetryOrbit<State>, Vec<State>)> {
-        let trace = trace_symmetry_orbit(state, &self.generators)?;
+        let trace = self.trace(state)?;
         let representative = *match ordering {
             RepresentativeOrdering::Minimum => trace.coefficients.keys().min(),
             RepresentativeOrdering::Maximum => trace.coefficients.keys().max(),
@@ -4061,7 +4097,7 @@ where
             if visited.contains(&seed) {
                 continue;
             }
-            let trace = trace_symmetry_orbit(seed, &reducer.generators)?;
+            let trace = reducer.trace(seed)?;
             for state in trace.coefficients.keys() {
                 if require_parent_membership {
                     parent.index(*state).map_err(|_| {

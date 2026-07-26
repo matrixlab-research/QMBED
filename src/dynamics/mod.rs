@@ -237,8 +237,8 @@ impl Floquet {
                 "Floquet eigensystems require a positive period".into(),
             ));
         }
-        let unitary = materialize_dense(&self.full_unitary(MatrixFormat::Dense)?)?;
-        floquet_eigensystem_from_dense(&unitary, self.dimension, period)
+        let dense_unitary = self.full_unitary(MatrixFormat::Dense)?.to_dense();
+        floquet_eigensystem_from_dense(&dense_unitary, self.dimension, period)
     }
 
     pub fn effective_hamiltonian(&self, format: MatrixFormat) -> Result<Operator> {
@@ -254,23 +254,45 @@ impl Floquet {
         floquet_effective_hamiltonian(eigensystem, self.dimension, format)
     }
 
-    /// Compute the period propagator and all spectral products while
-    /// materializing the propagator only once.
-    pub fn analyze(&self, format: MatrixFormat) -> Result<FloquetAnalysis> {
+    /// Materialize one period once and compute its complete dense spectrum.
+    ///
+    /// The returned object owns both products, so callers that need unitarity
+    /// and quasienergy checks never need to rebuild the propagator or bring a
+    /// second dense eigensolver into the workflow.
+    pub fn spectrum(&self, format: MatrixFormat) -> Result<FloquetSpectrum> {
         let period = self.period();
         if period <= 0.0 {
             return Err(QmbedError::InvalidOptions(
-                "Floquet analyses require a positive period".into(),
+                "Floquet spectra require a positive period".into(),
             ));
         }
-        let dense_unitary = self.full_unitary(MatrixFormat::Dense)?;
-        analyze_floquet_dense_unitary(
-            dense_unitary.to_dense(),
-            self.dimension,
+        let dense_unitary = self.full_unitary(MatrixFormat::Dense)?.to_dense();
+        let unitarity_residual = backend::unitarity_residual(&dense_unitary, self.dimension)?;
+        let eigensystem = floquet_eigensystem_from_dense(&dense_unitary, self.dimension, period)?;
+        Ok(FloquetSpectrum {
             period,
-            self.protocol_duration(),
-            format,
-        )
+            protocol_duration: self.protocol_duration(),
+            unitary: Operator::from_dense(self.dimension, self.dimension, dense_unitary)?
+                .converted(format)?,
+            unitarity_residual,
+            eigensystem,
+        })
+    }
+
+    /// Compute the period propagator and all spectral products while
+    /// materializing the propagator only once.
+    pub fn analyze(&self, format: MatrixFormat) -> Result<FloquetAnalysis> {
+        let spectrum = self.spectrum(format)?;
+        let effective_hamiltonian =
+            self.effective_hamiltonian_from_eigensystem(&spectrum.eigensystem, format)?;
+        Ok(FloquetAnalysis {
+            period: spectrum.period,
+            protocol_duration: spectrum.protocol_duration,
+            unitary: spectrum.unitary,
+            unitarity_residual: spectrum.unitarity_residual,
+            eigensystem: spectrum.eigensystem,
+            effective_hamiltonian,
+        })
     }
 }
 
@@ -299,10 +321,20 @@ pub struct FloquetEigensystem {
 }
 
 #[derive(Clone, Debug)]
+pub struct FloquetSpectrum {
+    pub period: f64,
+    pub protocol_duration: f64,
+    pub unitary: Operator,
+    pub unitarity_residual: f64,
+    pub eigensystem: FloquetEigensystem,
+}
+
+#[derive(Clone, Debug)]
 pub struct FloquetAnalysis {
     pub period: f64,
     pub protocol_duration: f64,
     pub unitary: Operator,
+    pub unitarity_residual: f64,
     pub eigensystem: FloquetEigensystem,
     pub effective_hamiltonian: Operator,
 }
@@ -378,12 +410,14 @@ fn analyze_floquet_dense_unitary(
             "Floquet analyses require a finite positive period".into(),
         ));
     }
+    let unitarity_residual = backend::unitarity_residual(&dense_unitary, dimension)?;
     let eigensystem = floquet_eigensystem_from_dense(&dense_unitary, dimension, period)?;
     let effective_hamiltonian = floquet_effective_hamiltonian(&eigensystem, dimension, format)?;
     Ok(FloquetAnalysis {
         period,
         protocol_duration,
         unitary: Operator::from_dense(dimension, dimension, dense_unitary)?.converted(format)?,
+        unitarity_residual,
         eigensystem,
         effective_hamiltonian,
     })
