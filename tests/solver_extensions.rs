@@ -143,6 +143,36 @@ fn thick_restart_and_workspace_reuse_a_complete_invariant_subspace() {
 }
 
 #[test]
+fn large_workspace_window_keeps_the_tridiagonal_lanczos_path() {
+    let values = (0..300)
+        .map(|index| {
+            if index < 3 {
+                index as f64
+            } else {
+                100.0 + index as f64
+            }
+        })
+        .collect::<Vec<_>>();
+    let operator = diagonal(&values);
+    let options = EigshOptions {
+        eigenpairs: 3,
+        target: SpectrumTarget::SmallestAlgebraic,
+        krylov_dimension: Some(100),
+        tolerance: 1.0e-10,
+        max_iterations: 100,
+        seed: 23,
+    };
+    let mut workspace = EigshWorkspace::new();
+    let first = eigsh_with_workspace(&operator, options.clone(), &mut workspace).unwrap();
+    let second = eigsh_with_workspace(&operator, options, &mut workspace).unwrap();
+    assert_eq!(workspace.initial_subspace().len(), 3);
+    for (left, right) in first.eigenvalues.iter().zip(&second.eigenvalues) {
+        assert_abs_diff_eq!(left, right, epsilon = 1.0e-12);
+    }
+    assert!(second.residuals.iter().all(|residual| *residual <= 1.0e-10));
+}
+
+#[test]
 fn public_lanczos_full_and_iterator_return_the_same_tridiagonalization() {
     let operator = diagonal(&[-2.0, 0.5, 3.0]);
     let initial = vec![
