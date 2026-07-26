@@ -13,9 +13,12 @@ use num_complex::Complex64;
 use crate::operator::LinearOperator;
 use crate::{QmbedError, Result};
 
+/// Accelerator requested by an execution profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Accelerator {
+    /// Host CPU execution.
     Cpu,
+    /// GPU execution on a zero-based device index.
     Gpu { device: usize },
 }
 
@@ -31,14 +34,17 @@ pub struct ExecutionProfile {
 }
 
 impl ExecutionProfile {
+    /// Request one CPU rank and one host thread.
     pub const fn serial() -> Self {
         Self::local_cpu(1)
     }
 
+    /// Request bounded host parallelism for independent work items.
     pub const fn throughput(threads: usize) -> Self {
         Self::local_cpu(threads)
     }
 
+    /// Request one CPU rank with `threads` host workers.
     pub const fn local_cpu(threads: usize) -> Self {
         Self {
             accelerator: Accelerator::Cpu,
@@ -47,6 +53,10 @@ impl ExecutionProfile {
         }
     }
 
+    /// Request a distributed CPU run.
+    ///
+    /// The built-in runtime rejects this profile until an MPI implementation
+    /// of [`Runtime`] is installed.
     pub const fn distributed_cpu(ranks: usize, threads_per_rank: usize) -> Self {
         Self {
             accelerator: Accelerator::Cpu,
@@ -55,6 +65,7 @@ impl ExecutionProfile {
         }
     }
 
+    /// Request one GPU device with the supplied host-thread allowance.
     pub const fn local_gpu(device: usize, threads: usize) -> Self {
         Self {
             accelerator: Accelerator::Gpu { device },
@@ -63,6 +74,7 @@ impl ExecutionProfile {
         }
     }
 
+    /// Validate that rank and thread counts are positive.
     pub fn validate(self) -> Result<Self> {
         if self.ranks == 0 || self.threads_per_rank == 0 {
             return Err(QmbedError::InvalidOptions(
@@ -73,16 +85,23 @@ impl ExecutionProfile {
     }
 }
 
+/// Concrete resources supplied by one runtime implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeCapabilities {
+    /// Active accelerator.
     pub accelerator: Accelerator,
+    /// Number of cooperating process ranks.
     pub ranks: usize,
+    /// Host threads available to each rank.
     pub threads_per_rank: usize,
 }
 
+/// Vector storage owned by a [`Runtime`].
 pub trait RuntimeBuffer: Send + Sync {
+    /// Return the number of complex elements.
     fn len(&self) -> usize;
 
+    /// Return whether the buffer has no elements.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -93,18 +112,28 @@ pub trait RuntimeBuffer: Send + Sync {
 /// A future GPU or MPI backend implements this trait with its native buffer.
 /// No basis, model, or operator-string type crosses this boundary.
 pub trait Runtime: Send + Sync {
+    /// Backend-native vector type.
     type Buffer: RuntimeBuffer;
 
+    /// Report the execution resources supplied by this runtime.
     fn capabilities(&self) -> RuntimeCapabilities;
+    /// Allocate a zero-filled complex vector.
     fn zeros(&self, length: usize) -> Result<Self::Buffer>;
+    /// Copy a host slice into backend-owned storage.
     fn upload(&self, values: &[Complex64]) -> Result<Self::Buffer>;
+    /// Copy backend-owned storage to the host.
     fn to_host(&self, buffer: &Self::Buffer) -> Result<Vec<Complex64>>;
+    /// Fill a backend buffer with one complex value.
     fn fill(&self, buffer: &mut Self::Buffer, value: Complex64) -> Result<()>;
+    /// Compute `output += alpha * input`.
     fn axpy(&self, alpha: Complex64, input: &Self::Buffer, output: &mut Self::Buffer)
     -> Result<()>;
+    /// Scale a vector in place.
     fn scale(&self, alpha: Complex64, buffer: &mut Self::Buffer) -> Result<()>;
+    /// Return the conjugating inner product of two buffers.
     fn dotc(&self, left: &Self::Buffer, right: &Self::Buffer) -> Result<Complex64>;
 
+    /// Return the Euclidean norm derived from [`Runtime::dotc`].
     fn norm(&self, buffer: &Self::Buffer) -> Result<f64> {
         Ok(self.dotc(buffer, buffer)?.re.max(0.0).sqrt())
     }
@@ -115,20 +144,25 @@ pub trait RuntimeLinearOperator<R>
 where
     R: Runtime,
 {
+    /// Return `(rows, columns)` in runtime coordinates.
     fn runtime_shape(&self) -> (usize, usize);
+    /// Apply this map to backend-owned buffers.
     fn apply_on(&self, runtime: &R, input: &R::Buffer, output: &mut R::Buffer) -> Result<()>;
 }
 
+/// Host-resident complex vector used by [`CpuRuntime`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuBuffer {
     values: Vec<Complex64>,
 }
 
 impl CpuBuffer {
+    /// Borrow the host values.
     pub fn as_slice(&self) -> &[Complex64] {
         &self.values
     }
 
+    /// Mutably borrow the host values.
     pub fn as_mut_slice(&mut self) -> &mut [Complex64] {
         &mut self.values
     }
@@ -140,12 +174,14 @@ impl RuntimeBuffer for CpuBuffer {
     }
 }
 
+/// Built-in single-rank CPU runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuRuntime {
     profile: ExecutionProfile,
 }
 
 impl CpuRuntime {
+    /// Construct a local CPU runtime with a positive worker count.
     pub fn new(threads: usize) -> Result<Self> {
         Self::from_profile(ExecutionProfile::local_cpu(threads))
     }
@@ -169,6 +205,7 @@ impl CpuRuntime {
         Ok(Self { profile })
     }
 
+    /// Return the validated profile used to construct this runtime.
     pub const fn profile(self) -> ExecutionProfile {
         self.profile
     }

@@ -3,3 +3,7 @@ Cargo.lock
 *.profraw
 __pycache__/
 *.py[cod]
+bindings/julia/docs/Manifest.toml
+bindings/julia/docs/build/
+bindings/python/src/*.egg-info/
+site/

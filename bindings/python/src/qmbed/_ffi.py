@@ -13,6 +13,8 @@ import numpy as np
 
 
 class QmbedError(RuntimeError):
+    """Error reported by the QMBED native library or language boundary."""
+
     pass
 
 

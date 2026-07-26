@@ -325,23 +325,37 @@ impl LinearOperator for ExpmMultiplyParallel {
     }
 }
 
+/// Spectral region requested from a selected Hermitian eigensolver.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SpectrumTarget {
+    /// Algebraically smallest eigenvalues.
     SmallestAlgebraic,
+    /// Algebraically largest eigenvalues.
     LargestAlgebraic,
+    /// Eigenvalues with smallest absolute value.
     SmallestMagnitude,
+    /// Eigenvalues with largest absolute value.
     LargestMagnitude,
+    /// A balanced selection from both algebraic ends.
     BothEnds,
+    /// Eigenvalues nearest the supplied real shift.
     Shift(f64),
 }
 
+/// Controls target selection, search-space size, and convergence for [`eigsh`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct EigshOptions {
+    /// Number of requested eigenpairs; must be smaller than the dimension.
     pub eigenpairs: usize,
+    /// Region of the real Hermitian spectrum to target.
     pub target: SpectrumTarget,
+    /// Optional Lanczos or restart window dimension.
     pub krylov_dimension: Option<usize>,
+    /// Required residual norm for convergence.
     pub tolerance: f64,
+    /// Maximum Lanczos or restart iteration budget.
     pub max_iterations: usize,
+    /// Deterministic seed for the initial vector.
     pub seed: u64,
 }
 
@@ -356,6 +370,7 @@ fn use_dense_eigsh(dimension: usize, options: &EigshOptions) -> bool {
 }
 
 impl EigshOptions {
+    /// Construct default controls for the algebraically lowest eigenpairs.
     pub fn smallest_algebraic(eigenpairs: usize) -> Self {
         Self {
             eigenpairs,
@@ -393,14 +408,22 @@ impl EigshOptions {
     }
 }
 
+/// Values, vectors, residual evidence, and work counters from an eigensolve.
 #[derive(Clone, Debug)]
 pub struct Eigensystem {
+    /// Ordered real eigenvalues or Ritz values.
     pub eigenvalues: Vec<f64>,
+    /// Column vectors corresponding to `eigenvalues`.
     pub eigenvectors: Vec<Vec<Complex64>>,
+    /// Norm of `A v - λ v` for each returned pair.
     pub residuals: Vec<f64>,
+    /// Algorithm iteration count.
     pub iterations: usize,
+    /// Total modified Gram-Schmidt passes.
     pub reorthogonalization_passes: usize,
+    /// Selective DGKS second passes triggered by loss of norm.
     pub conditional_second_passes: usize,
+    /// Whether every requested residual met the tolerance.
     pub converged: bool,
 }
 
@@ -417,6 +440,7 @@ pub struct EigshWorkspace {
 }
 
 impl EigshWorkspace {
+    /// Create an empty workspace that accepts the first solved dimension.
     pub const fn new() -> Self {
         Self {
             dimension: 0,
@@ -424,19 +448,23 @@ impl EigshWorkspace {
         }
     }
 
+    /// Forget the stored dimension and converged invariant subspace.
     pub fn clear(&mut self) {
         self.dimension = 0;
         self.initial_subspace.clear();
     }
 
+    /// Return the operator dimension associated with the stored subspace.
     pub const fn dimension(&self) -> usize {
         self.dimension
     }
 
+    /// Borrow the complete converged subspace from the previous solve.
     pub fn initial_subspace(&self) -> &[Vec<Complex64>] {
         &self.initial_subspace
     }
 
+    /// Install a user-provided warm-start subspace after validating dimensions.
     pub fn set_initial_subspace(
         &mut self,
         dimension: usize,
@@ -457,8 +485,10 @@ impl EigshWorkspace {
     }
 }
 
+/// Controls whether [`eigh_with_options`] retains the complete eigenvector matrix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EighOptions {
+    /// Return eigenvectors when `true`; values and residuals are always returned.
     pub return_eigenvectors: bool,
 }
 
@@ -519,6 +549,10 @@ where
     })
 }
 
+/// Compute the complete Hermitian spectrum with optional vector elision.
+///
+/// The operator is materialized once as dense storage. This routine is for
+/// finite systems where the cubic full-spectrum cost is intentional.
 pub fn eigh_with_options<O>(operator: &O, options: EighOptions) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
@@ -2260,6 +2294,10 @@ where
     dense_eigsh(operator, &options)
 }
 
+/// Compute selected eigenpairs from one explicit initial vector.
+///
+/// The vector must match the square operator dimension and have nonzero finite
+/// norm. Small problems may still choose the exact dense route.
 pub fn eigsh_with_initial<O>(
     operator: &O,
     options: EigshOptions,
@@ -2318,6 +2356,11 @@ where
 
 /// Solve one member of a related operator family and update its reusable
 /// invariant-subspace workspace.
+///
+/// A compatible workspace retains all previously converged vectors. Small
+/// restart windows preserve them as a thick subspace; the cheaper large-window
+/// tridiagonal route forms a balanced warm start without replacing the generic
+/// Lanczos algorithm.
 pub fn eigsh_with_workspace<O>(
     operator: &O,
     options: EigshOptions,
@@ -2345,6 +2388,7 @@ where
     Ok(result)
 }
 
+/// Return only selected eigenvalues while using the same convergence checks as [`eigsh`].
 pub fn eigsh_values<O>(operator: &O, options: EigshOptions) -> Result<Vec<f64>>
 where
     O: LinearOperator + ?Sized,
@@ -2352,12 +2396,18 @@ where
     Ok(eigsh(operator, options)?.eigenvalues)
 }
 
+/// Time grid and adaptive Krylov controls for state evolution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EvolutionOptions {
+    /// Finite nondecreasing output times measured from the initial state.
     pub times: Vec<f64>,
+    /// Maximum dimension of each Krylov projection.
     pub krylov_dimension: usize,
+    /// Local error tolerance.
     pub tolerance: f64,
+    /// Maximum accepted and rejected trial intervals.
     pub max_substeps: usize,
+    /// Interpret the generator as `H` and apply `exp(-i H t)` when true.
     pub hamiltonian: bool,
 }
 
@@ -2384,9 +2434,12 @@ impl EvolutionOptions {
     }
 }
 
+/// State vectors sampled at the requested physical times.
 #[derive(Clone, Debug)]
 pub struct StateTrajectory {
+    /// Output times copied from the validated request.
     pub times: Vec<f64>,
+    /// One state vector per output time.
     pub states: Vec<Vec<Complex64>>,
 }
 
@@ -2413,9 +2466,12 @@ pub struct StateBatchTrajectory {
     pub states: Vec<Vec<Vec<Complex64>>>,
 }
 
+/// Dimension and breakdown tolerance for a Lanczos decomposition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LanczosOptions {
+    /// Maximum number of orthonormal Krylov vectors.
     pub krylov_dimension: usize,
+    /// Threshold for norm breakdown and Hermiticity checks.
     pub tolerance: f64,
 }
 
@@ -2430,19 +2486,29 @@ impl LanczosOptions {
     }
 }
 
+/// One streamed vector and neighboring coefficients of a Lanczos recurrence.
 #[derive(Clone, Debug)]
 pub struct LanczosVector {
+    /// Zero-based position in the Krylov basis.
     pub index: usize,
+    /// Normalized Krylov vector.
     pub vector: Vec<Complex64>,
+    /// Diagonal tridiagonal coefficient.
     pub diagonal: f64,
+    /// Off-diagonal coefficient leading to the next vector.
     pub next_off_diagonal: f64,
 }
 
+/// Complete orthonormal basis and real symmetric tridiagonal projection.
 #[derive(Clone, Debug)]
 pub struct LanczosDecomposition {
+    /// Norm removed from the caller's initial vector.
     pub initial_norm: f64,
+    /// Orthonormal Krylov vectors.
     pub basis: Vec<Vec<Complex64>>,
+    /// Diagonal of the projected tridiagonal matrix.
     pub diagonal: Vec<f64>,
+    /// First off-diagonal of the projected tridiagonal matrix.
     pub off_diagonal: Vec<f64>,
 }
 
@@ -2455,6 +2521,7 @@ pub struct LanczosRitzDecomposition {
 }
 
 impl LanczosRitzDecomposition {
+    /// Lift coefficients in Krylov-basis order back to the full Hilbert space.
     pub fn linear_combination(&self, coefficients: &[Complex64]) -> Result<Vec<Complex64>> {
         linear_combination_qt(&self.decomposition.basis, coefficients)
     }
@@ -2492,6 +2559,7 @@ impl LanczosRitzDecomposition {
     }
 }
 
+/// Iterator that streams a fully reorthogonalized Lanczos recurrence.
 pub struct LanczosIter<'a, O>
 where
     O: LinearOperator + ?Sized,
@@ -2577,6 +2645,7 @@ where
     }
 }
 
+/// Start a validated streaming Lanczos decomposition.
 pub fn lanczos_iter<'a, O>(
     operator: &'a O,
     initial: &'a [Complex64],
@@ -2607,6 +2676,7 @@ where
     })
 }
 
+/// Materialize the full Lanczos basis and tridiagonal coefficients.
 pub fn lanczos_full<O>(
     operator: &O,
     initial: &[Complex64],
@@ -2676,12 +2746,18 @@ where
     })
 }
 
+/// Compatibility controls for exponential-action time grids.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpmOptions {
+    /// Requested output times.
     pub times: Vec<f64>,
+    /// Maximum Krylov dimension per interval.
     pub krylov_dimension: usize,
+    /// Local error tolerance.
     pub tolerance: f64,
+    /// Maximum interval-splitting budget.
     pub max_substeps: usize,
+    /// Apply Hamiltonian convention `exp(-i H t)` when true.
     pub hamiltonian: bool,
 }
 

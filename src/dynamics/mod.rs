@@ -15,17 +15,24 @@ use crate::{QmbedError, Result};
 
 const DENSE_PROPAGATOR_CUTOFF: usize = 128;
 
+/// One piecewise-constant Hamiltonian and its physical duration.
 pub struct DriveStep {
+    /// Square Hermitian generator.
     pub hamiltonian: Arc<dyn LinearOperator>,
+    /// Nonnegative evolution duration.
     pub duration: f64,
 }
 
+/// One explicitly time-dependent Hamiltonian and its physical duration.
 pub struct CallableDriveStep {
+    /// Square callable generator evaluated at internal integration times.
     pub hamiltonian: Arc<dyn TimeDependentOperator>,
+    /// Nonnegative evolution duration.
     pub duration: f64,
 }
 
 impl CallableDriveStep {
+    /// Validate a callable square Hamiltonian and nonnegative duration.
     pub fn new(hamiltonian: Arc<dyn TimeDependentOperator>, duration: f64) -> Result<Self> {
         let shape = hamiltonian.shape();
         if shape.0 != shape.1 {
@@ -51,6 +58,7 @@ enum FloquetStep {
 }
 
 impl DriveStep {
+    /// Validate a static square Hamiltonian and nonnegative duration.
     pub fn new(hamiltonian: Arc<dyn LinearOperator>, duration: f64) -> Result<Self> {
         let shape = hamiltonian.shape();
         if shape.0 != shape.1 {
@@ -79,6 +87,7 @@ pub struct Floquet {
 }
 
 impl Floquet {
+    /// Construct one period from ordered piecewise-constant drive steps.
     pub fn new(steps: impl IntoIterator<Item = DriveStep>) -> Result<Self> {
         let steps: Vec<_> = steps.into_iter().map(FloquetStep::Static).collect();
         let first = steps.first().ok_or_else(|| {
@@ -107,6 +116,7 @@ impl Floquet {
         })
     }
 
+    /// Construct one period from ordered callable drive steps.
     pub fn from_callable(steps: impl IntoIterator<Item = CallableDriveStep>) -> Result<Self> {
         let steps: Vec<_> = steps.into_iter().map(FloquetStep::Callable).collect();
         let first = steps.first().ok_or_else(|| {
@@ -135,6 +145,7 @@ impl Floquet {
         })
     }
 
+    /// Replace the Krylov controls used to apply each drive step.
     pub fn with_evolution_options(mut self, options: EvolutionOptions) -> Self {
         self.evolution = options;
         self.evolution.hamiltonian = true;
@@ -156,6 +167,7 @@ impl Floquet {
         Ok(self)
     }
 
+    /// Apply one ordered drive period without materializing the full unitary.
     pub fn apply_period(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if input.len() != self.dimension || output.len() != self.dimension {
             return Err(QmbedError::DimensionMismatch(
@@ -190,6 +202,7 @@ impl Floquet {
         Ok(())
     }
 
+    /// Return the declared analysis period or the sum of step durations.
     pub fn period(&self) -> f64 {
         self.analysis_period
             .unwrap_or_else(|| self.protocol_duration())
@@ -200,6 +213,10 @@ impl Floquet {
         self.steps.iter().map(FloquetStep::duration).sum()
     }
 
+    /// Materialize the complete period propagator in the requested format.
+    ///
+    /// This operation scales quadratically in memory and is intended for
+    /// workflows that explicitly require the full Floquet unitary.
     pub fn full_unitary(&self, format: MatrixFormat) -> Result<Operator> {
         let dense = if self
             .steps
@@ -230,6 +247,7 @@ impl Floquet {
         Operator::from_dense(self.dimension, self.dimension, dense)?.converted(format)
     }
 
+    /// Compute sorted quasienergies, unit-circle eigenvalues, vectors, and residuals.
     pub fn eigensystem(&self) -> Result<FloquetEigensystem> {
         let period = self.period();
         if period <= 0.0 {
@@ -241,6 +259,7 @@ impl Floquet {
         floquet_eigensystem_from_dense(&dense_unitary, self.dimension, period)
     }
 
+    /// Construct the principal-branch effective Hamiltonian.
     pub fn effective_hamiltonian(&self, format: MatrixFormat) -> Result<Operator> {
         let eigensystem = self.eigensystem()?;
         self.effective_hamiltonian_from_eigensystem(&eigensystem, format)
@@ -312,30 +331,48 @@ impl FloquetStep {
     }
 }
 
+/// Complete eigensystem of a one-period unitary.
 #[derive(Clone, Debug)]
 pub struct FloquetEigensystem {
+    /// Quasienergies ordered on the selected phase branch.
     pub quasienergies: Vec<f64>,
+    /// Unit-circle eigenvalues of the period propagator.
     pub eigenvalues: Vec<Complex64>,
+    /// Corresponding column eigenvectors.
     pub eigenvectors: Vec<Vec<Complex64>>,
+    /// Norm of `U v - λ v` for each pair.
     pub residuals: Vec<f64>,
 }
 
+/// One-materialization Floquet unitary and its complete spectrum.
 #[derive(Clone, Debug)]
 pub struct FloquetSpectrum {
+    /// Physical period used to convert phases into quasienergies.
     pub period: f64,
+    /// Sum of explicit evolution intervals.
     pub protocol_duration: f64,
+    /// Materialized period propagator.
     pub unitary: Operator,
+    /// Norm measuring deviation from `U†U = I`.
     pub unitarity_residual: f64,
+    /// Complete eigensystem of `unitary`.
     pub eigensystem: FloquetEigensystem,
 }
 
+/// Floquet spectrum together with the principal-branch effective Hamiltonian.
 #[derive(Clone, Debug)]
 pub struct FloquetAnalysis {
+    /// Physical analysis period.
     pub period: f64,
+    /// Sum of explicit drive-step durations.
     pub protocol_duration: f64,
+    /// Materialized period propagator.
     pub unitary: Operator,
+    /// Norm measuring deviation from exact unitarity.
     pub unitarity_residual: f64,
+    /// Complete unitary eigensystem.
     pub eigensystem: FloquetEigensystem,
+    /// Hermitian generator reconstructed on the principal quasienergy branch.
     pub effective_hamiltonian: Operator,
 }
 

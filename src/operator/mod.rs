@@ -27,6 +27,7 @@ pub enum LocalOperator {
 }
 
 impl LocalOperator {
+    /// Return the canonical one-character spelling used at basis boundaries.
     pub const fn symbol(self) -> char {
         match self {
             Self::Identity => 'I',
@@ -56,10 +57,15 @@ pub struct OpProduct {
 }
 
 impl OpProduct {
+    /// Construct a single-factor ordered product.
+    ///
+    /// The product must contain at least one local action. Sites are attached
+    /// later by [`Coupling`], allowing this parsed action to be reused.
     pub fn new(local: impl IntoIterator<Item = LocalOperator>) -> Result<Self> {
         Self::with_split(local, None)
     }
 
+    /// Construct a two-species product and record the species boundary.
     pub fn spinful(
         up: impl IntoIterator<Item = LocalOperator>,
         down: impl IntoIterator<Item = LocalOperator>,
@@ -70,6 +76,7 @@ impl OpProduct {
         Self::with_split(local, Some(split))
     }
 
+    /// Construct a product with zero or one explicit factor boundary.
     pub fn with_split(
         local: impl IntoIterator<Item = LocalOperator>,
         split: Option<usize>,
@@ -125,18 +132,22 @@ impl OpProduct {
         })
     }
 
+    /// Return the local actions in coupling-site order.
     pub fn local_operators(&self) -> &[LocalOperator] {
         &self.local
     }
 
+    /// Return the legacy single species boundary, when exactly one exists.
     pub const fn split(&self) -> Option<usize> {
         self.split
     }
 
+    /// Return every ordered tensor-factor boundary.
     pub fn splits(&self) -> &[usize] {
         &self.splits
     }
 
+    /// Return the canonical compact operator label.
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -154,6 +165,10 @@ pub struct Coupling {
 }
 
 impl Coupling {
+    /// Construct a coefficient with its ordered zero-based sites.
+    ///
+    /// Arity and site bounds are validated when the coupling is attached to a
+    /// product and assembled against a concrete basis.
     pub fn new(coefficient: impl Into<Complex64>, sites: impl Into<Vec<usize>>) -> Self {
         Self {
             coefficient: coefficient.into(),
@@ -175,6 +190,10 @@ pub struct OperatorTerm {
 pub type OperatorSpec = OperatorTerm;
 
 impl OperatorTerm {
+    /// Attach spatial couplings to a parsed local operator product.
+    ///
+    /// Every coupling must have the same arity as `product`, and coefficients
+    /// must be finite.
     pub fn from_product(
         product: OpProduct,
         couplings: impl IntoIterator<Item = Coupling>,
@@ -198,14 +217,17 @@ impl OperatorTerm {
         Ok(Self { product, couplings })
     }
 
+    /// Return the canonical compatibility operator string.
     pub fn operator(&self) -> &str {
         self.product.label()
     }
 
+    /// Return the typed, parsed local product.
     pub const fn product(&self) -> &OpProduct {
         &self.product
     }
 
+    /// Return the spatial couplings in insertion order.
     pub fn couplings(&self) -> &[Coupling] {
         &self.couplings
     }
@@ -270,17 +292,28 @@ impl OperatorTerm {
 /// Requested materialization backend.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MatrixFormat {
+    /// Row-major dense storage.
     Dense,
+    /// Compressed sparse columns, preferred for many Hermitian eigensolvers.
     Csc,
+    /// Compressed sparse rows.
     Csr,
+    /// Diagonal-offset storage.
     Dia,
+    /// Delayed action without exposing one public sparse representation.
     MatrixFree,
 }
 
 /// Rectangular-capable narrow waist shared by stored and matrix-free maps.
 pub trait LinearOperator: Send + Sync {
+    /// Return `(rows, columns)`.
     fn shape(&self) -> (usize, usize);
+    /// Report the public materialization format.
     fn format(&self) -> MatrixFormat;
+    /// Compute `output = A * input`.
+    ///
+    /// Implementations validate both vector lengths and overwrite every output
+    /// element.
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
 
     /// Whether this operator preserves real vectors exactly.
@@ -375,6 +408,7 @@ pub trait LinearOperator: Send + Sync {
         Ok(None)
     }
 
+    /// Prepare a reusable solver for `(A - shift I) x = b`, when supported.
     fn shifted_solver(&self, _shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
         Ok(None)
     }
@@ -663,6 +697,7 @@ pub struct Operator {
 }
 
 impl Operator {
+    /// Construct a row-major dense rectangular operator.
     pub fn from_dense(
         rows: usize,
         columns: usize,
@@ -683,6 +718,10 @@ impl Operator {
         })
     }
 
+    /// Construct an operator from zero-based `(row, column, value)` entries.
+    ///
+    /// Duplicate coordinates are summed, exact numerical zeros are discarded,
+    /// and the result is canonicalized for `format`.
     pub fn from_triplets(
         rows: usize,
         columns: usize,
@@ -746,6 +785,7 @@ impl Operator {
         })
     }
 
+    /// Materialize a row-major dense copy of this operator.
     pub fn to_dense(&self) -> Vec<Complex64> {
         if let Storage::Dense(values) = &self.storage {
             return values.clone();
@@ -800,6 +840,7 @@ impl Operator {
         dense
     }
 
+    /// Return an elementwise complex-conjugated operator.
     pub fn conjugated(&self) -> Result<Self> {
         Self::from_triplets(
             self.shape.0,
@@ -823,6 +864,7 @@ impl Operator {
         Ok(output)
     }
 
+    /// Estimate bytes owned by the current materialized representation.
     pub fn memory_bytes(&self) -> usize {
         let complex = std::mem::size_of::<Complex64>();
         let index = std::mem::size_of::<usize>();
@@ -846,6 +888,7 @@ impl Operator {
         }
     }
 
+    /// Count stored mathematical nonzeros.
     pub fn nnz(&self) -> usize {
         match &self.storage {
             Storage::Dense(values) => values
@@ -1963,6 +2006,7 @@ impl<'a, BasisType> OperatorBuilder<'a, BasisType, BasisType>
 where
     BasisType: Basis,
 {
+    /// Start a square operator builder on one source and target basis.
     pub fn on(basis: &'a BasisType) -> Self {
         Self {
             source: basis,
@@ -1978,6 +2022,10 @@ where
     Source: Basis,
     Target: Basis<State = Source::State>,
 {
+    /// Start a rectangular builder mapping `source` coordinates into `target`.
+    ///
+    /// The two bases share a state representation but may select different
+    /// particle-number or symmetry sectors.
     pub fn between(source: &'a Source, target: &'a Target) -> Self {
         Self {
             source,
@@ -1987,21 +2035,29 @@ where
         }
     }
 
+    /// Append several validated local terms.
     pub fn terms(mut self, terms: impl IntoIterator<Item = OperatorTerm>) -> Self {
         self.terms.extend(terms);
         self
     }
 
+    /// Append one validated local term.
     pub fn term(mut self, term: OperatorTerm) -> Self {
         self.terms.push(term);
         self
     }
 
+    /// Replace the default Hermiticity, conservation, and symmetry checks.
     pub const fn checks(mut self, checks: AssemblyChecks) -> Self {
         self.checks = checks;
         self
     }
 
+    /// Assemble all terms through the universal column-streaming path.
+    ///
+    /// The same routine supports deterministic and branching local actions,
+    /// symmetry-reduced targets, rectangular sector changes, and every public
+    /// storage format.
     pub fn build(self, format: MatrixFormat) -> Result<Operator> {
         let shape = (self.target.len(), self.source.len());
         if self.checks.particle_conservation
@@ -2627,6 +2683,7 @@ pub struct QuantumOperator {
 }
 
 impl QuantumOperator {
+    /// Construct a named linear family after validating names and shapes.
     pub fn new(components: impl IntoIterator<Item = QuantumComponent>) -> Result<Self> {
         let components: Vec<_> = components.into_iter().collect();
         let first = components.first().ok_or_else(|| {
@@ -2657,20 +2714,24 @@ impl QuantumOperator {
         Ok(Self { components, shape })
     }
 
+    /// Return the common rectangular shape of every component.
     pub const fn shape(&self) -> (usize, usize) {
         self.shape
     }
 
+    /// Iterate component names in stable coefficient order.
     pub fn component_names(&self) -> impl Iterator<Item = &str> {
         self.components
             .iter()
             .map(|component| component.name.as_str())
     }
 
+    /// Return every named component in stable coefficient order.
     pub fn components(&self) -> &[QuantumComponent] {
         &self.components
     }
 
+    /// Look up one named component or return an invalid-options error.
     pub fn component(&self, name: &str) -> Result<&Operator> {
         self.components
             .iter()
@@ -2770,6 +2831,10 @@ impl QuantumOperator {
         self.apply_coefficients(&coefficients, input, output)
     }
 
+    /// Materialize one parameter value in the requested format.
+    ///
+    /// For repeated evaluations prefer [`QuantumOperator::plan`], which
+    /// retains a common sparse pattern and updates only numeric values.
     pub fn evaluate(
         &self,
         parameters: &HashMap<String, Complex64>,
@@ -2790,6 +2855,11 @@ impl QuantumOperator {
     }
 
     /// Prepare a fixed sparse pattern for repeated evaluations of this family.
+    ///
+    /// The plan aligns every component on one union pattern, reuses all index
+    /// arrays, and mutates only a preallocated value buffer. It supports
+    /// dense, CSC, CSR, DIA, and matrix-free output without a model-specific
+    /// fast path.
     pub fn plan(&self, format: MatrixFormat) -> Result<QuantumOperatorPlan> {
         QuantumOperatorPlan::new(self, format)
     }
@@ -3033,14 +3103,17 @@ impl QuantumOperatorPlan {
         })
     }
 
+    /// Iterate component names in the coefficient order accepted by the plan.
     pub fn component_names(&self) -> impl Iterator<Item = &str> {
         self.component_names.iter().map(String::as_str)
     }
 
+    /// Borrow the most recently evaluated operator and its stable storage.
     pub fn operator(&self) -> &Operator {
         &self.operator
     }
 
+    /// Resolve a parameter map into the plan's stable coefficient order.
     pub fn resolve_coefficients(
         &self,
         parameters: &HashMap<String, Complex64>,
@@ -3072,11 +3145,16 @@ impl QuantumOperatorPlan {
             .collect()
     }
 
+    /// Evaluate named parameters while reusing the plan's storage pattern.
     pub fn evaluate(&mut self, parameters: &HashMap<String, Complex64>) -> Result<&Operator> {
         let coefficients = self.resolve_coefficients(parameters)?;
         self.evaluate_coefficients(&coefficients)
     }
 
+    /// Evaluate coefficients already arranged in [`Self::component_names`] order.
+    ///
+    /// This is the lowest-overhead scan path: it performs no name lookup and
+    /// allocates no matrix structure.
     pub fn evaluate_coefficients(&mut self, coefficients: &[Complex64]) -> Result<&Operator> {
         if coefficients.len() != self.component_values.len() {
             return Err(QmbedError::DimensionMismatch(

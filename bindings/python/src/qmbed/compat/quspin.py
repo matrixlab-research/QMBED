@@ -1,3 +1,5 @@
+"""Small functional adapters from QuSpin spellings to native QMBED requests."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
@@ -28,6 +30,20 @@ def operator_term(
     operator: str,
     couplings: Iterable[Coupling],
 ) -> OperatorSpec:
+    """Translate one QuSpin operator string into a typed QMBED term.
+
+    Vertical bars delimit species. Every non-delimiter symbol is converted to
+    a built-in local action when known and otherwise retained as a custom
+    action for a compatible callback-defined basis.
+
+    Args:
+        operator: QuSpin-style local operator string.
+        couplings: Coefficients and zero-based site tuples.
+
+    Returns:
+        A native :class:`qmbed.OperatorSpec`.
+    """
+
     splits = []
     local_count = 0
     for symbol in operator:
@@ -48,6 +64,12 @@ def operator_term(
 
 
 def terms_from_static(static: Iterable[Sequence]) -> tuple[OperatorSpec, ...]:
+    """Translate a QuSpin ``static`` list into native operator terms.
+
+    Each item must contain an operator string followed by coupling rows of the
+    form ``[coefficient, site0, ...]``.
+    """
+
     terms = []
     for operator, coupling_rows in static:
         couplings = []
@@ -68,6 +90,21 @@ def eigsh(
     sigma: float | None = None,
     **options,
 ):
+    """Run a QuSpin-shaped selected eigensolve through the QMBED core.
+
+    Args:
+        basis: Native QMBED basis request.
+        static: QuSpin-style static operator list.
+        k: Number of requested eigenpairs.
+        which: ARPACK-style target code (``SA``, ``LA``, ``SM``, ``LM``, or
+            ``BE``).
+        sigma: Optional interior shift. When present it overrides ``which``.
+        **options: Additional fields accepted by :class:`qmbed.EigshOptions`.
+
+    Returns:
+        A native :class:`qmbed.Eigensystem`.
+    """
+
     targets = {
         "SA": "smallest_algebraic",
         "LA": "largest_algebraic",
