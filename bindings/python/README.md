@@ -13,6 +13,10 @@ After the first registry release:
 python -m pip install qmbed
 ```
 
+Wheels target CPython 3.10–3.14 on Linux, Windows, and Apple Silicon.
+Intel macOS wheels stop at CPython 3.13 because the QuSpin compatibility
+surface depends on the last Numba release that published Intel Mac binaries.
+
 ```python
 import qmbed
 

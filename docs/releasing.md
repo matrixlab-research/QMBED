@@ -61,7 +61,9 @@ git push origin vX.Y.Z
 The `release` workflow then:
 
 1. repeats the Rust, C ABI, Python, and artifact-backed Julia gates;
-2. builds and tests CPython 3.10–3.14 wheels on the supported platforms;
+2. builds and tests CPython 3.10–3.14 wheels on the supported platforms
+   (Intel macOS stops at CPython 3.13 because Numba no longer ships newer
+   Intel Mac binaries);
 3. publishes the Rust crate to crates.io and the wheels to PyPI; and
 4. creates the GitHub release with the same wheels attached.
 
