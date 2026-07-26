@@ -44,6 +44,7 @@ cargo-manifest-args = ["--locked"]
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+archs = ["native"]
 skip = "*-musllinux_*"
 build-frontend = "build[uv]"
 test-command = "python {package}/tests/wheel_smoke.py"
