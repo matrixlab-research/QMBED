@@ -4,10 +4,11 @@ use approx::assert_abs_diff_eq;
 use qmbed::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
 use qmbed::runtime::{CpuRuntime, ExecutionProfile};
 use qmbed::solve::{
-    EigshOptions, ExpmActionPlan, ExpmMultiplyParallel, ExpmOptions, LanczosOptions,
-    ShiftInvertPlan, SpectrumTarget, eigsh, evolve_with_diagnostics, expm_multiply,
-    ftlm_observable_iteration, ftlm_static_iteration, lanczos_full, lanczos_iter, lanczos_ritz,
-    linear_combination_qt, ltlm_observable_iteration, ltlm_static_iteration,
+    EigshOptions, EigshWorkspace, ExpmActionPlan, ExpmMultiplyParallel, ExpmOptions,
+    LanczosOptions, ShiftInvertPlan, SpectrumTarget, eigsh, eigsh_with_workspace,
+    evolve_with_diagnostics, expm_multiply, ftlm_observable_iteration, ftlm_static_iteration,
+    lanczos_full, lanczos_iter, lanczos_ritz, linear_combination_qt, ltlm_observable_iteration,
+    ltlm_static_iteration,
 };
 use qmbed::{Complex64, QmbedError};
 
@@ -112,6 +113,33 @@ fn automatic_eigsh_expands_the_krylov_space_within_the_iteration_budget() {
     assert!(result.residuals[0] <= 1.0e-13);
     assert!(result.iterations > 256);
     assert!(result.conditional_second_passes < result.iterations);
+}
+
+#[test]
+fn thick_restart_and_workspace_reuse_a_complete_invariant_subspace() {
+    let values = (0..300)
+        .map(|index| index as f64 / 299.0)
+        .collect::<Vec<_>>();
+    let operator = diagonal(&values);
+    let options = EigshOptions {
+        eigenpairs: 3,
+        target: SpectrumTarget::SmallestAlgebraic,
+        krylov_dimension: Some(16),
+        tolerance: 1.0e-10,
+        max_iterations: 1_000,
+        seed: 19,
+    };
+    let mut workspace = EigshWorkspace::new();
+    let first = eigsh_with_workspace(&operator, options.clone(), &mut workspace).unwrap();
+    assert!(first.iterations > 16);
+    assert_eq!(workspace.initial_subspace().len(), 3);
+
+    let second = eigsh_with_workspace(&operator, options, &mut workspace).unwrap();
+    assert!(second.iterations <= 16);
+    for (left, right) in first.eigenvalues.iter().zip(&second.eigenvalues) {
+        assert_abs_diff_eq!(left, right, epsilon = 1.0e-14);
+    }
+    assert!(second.residuals.iter().all(|residual| *residual <= 1.0e-10));
 }
 
 #[test]

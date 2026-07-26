@@ -233,6 +233,30 @@ pub(crate) fn square_matmul(
     Ok(output)
 }
 
+/// Frobenius residual `||U†U - I||_F / n` for a row-major square matrix.
+pub(crate) fn unitarity_residual(values: &[Complex64], dimension: usize) -> Result<f64> {
+    validate_square_dense(values, dimension)?;
+    if dimension == 0 {
+        return Ok(0.0);
+    }
+    let matrix = Mat::<Complex64>::from_fn(dimension, dimension, |row, column| {
+        values[row * dimension + column]
+    });
+    let gram = matrix.adjoint() * &matrix;
+    let mut squared = 0.0;
+    for row in 0..dimension {
+        for column in 0..dimension {
+            let expected = if row == column {
+                Complex64::new(1.0, 0.0)
+            } else {
+                Complex64::new(0.0, 0.0)
+            };
+            squared += (gram[(row, column)] - expected).norm_sqr();
+        }
+    }
+    Ok(squared.sqrt() / dimension as f64)
+}
+
 /// Reusable factorization of `(A - shift I)`.
 pub trait ShiftedLinearSolver: Send + Sync {
     fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;

@@ -5,7 +5,9 @@ use qmbed::dynamics::{
     CallableDriveStep, DriveStep, Floquet, FloquetTimeVector, analyze_floquet_unitary,
     dynamical_correlator,
 };
-use qmbed::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
+use qmbed::operator::{
+    Dynamic, DynamicComponent, Hamiltonian, LinearOperator, MatrixFormat, Operator,
+};
 use qmbed::solve::EvolutionOptions;
 use qmbed::{Complex64, QmbedError};
 
@@ -69,6 +71,25 @@ fn floquet_analysis_reuses_one_propagator_and_supports_kicked_periods() {
     let effective = analysis.effective_hamiltonian.to_dense();
     assert_abs_diff_eq!(effective[0].re, -0.25, epsilon = 1.0e-12);
     assert_abs_diff_eq!(effective[3].re, 0.25, epsilon = 1.0e-12);
+}
+
+#[test]
+fn floquet_spectrum_owns_the_reused_unitary_and_backend_diagnostics() {
+    let hamiltonian = diagonal(&[-1.0, 1.0]);
+    let floquet = Floquet::new([DriveStep::new(Arc::new(hamiltonian), 0.4).unwrap()]).unwrap();
+    let spectrum = floquet.spectrum(MatrixFormat::Csc).unwrap();
+    assert_eq!(spectrum.unitary.format(), MatrixFormat::Csc);
+    assert!(spectrum.unitarity_residual < 1.0e-12);
+    assert_abs_diff_eq!(
+        spectrum.eigensystem.quasienergies[0],
+        -1.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        spectrum.eigensystem.quasienergies[1],
+        1.0,
+        epsilon = 1.0e-12
+    );
 }
 
 #[test]

@@ -17,15 +17,17 @@ transitions, and every stored or matrix-free map implements one rectangular
   multi-sector spinful spaces, Majorana operators, branching user actions,
   projectors with leakage checks, and streamed source-to-target sector changes.
 - Dense, CSC, CSR, DIA, and matrix-free operators; static, driven, and named
-  parameterized Hamiltonians; nonzero-driven sparse algebra; reusable
-  exponential grid/right action and low-level matvec plans; and safe versioned
-  dense/sparse archives.
+  parameterized Hamiltonians; fixed-pattern parameter-scan plans; nonzero-driven
+  sparse algebra; reusable exponential grid/right action and low-level matvec
+  plans; and safe versioned dense/sparse archives.
 - Dense and selected Hermitian eigensolvers, shift-invert, fully
-  reorthogonalized Lanczos, static/callable/batched/density evolution,
+  reorthogonalized and thick-restarted Lanczos, locked Ritz vectors, reusable
+  invariant-subspace workspaces, static/callable/batched/density evolution,
   FTLM/LTLM, reusable exponential plans, and cached shift-invert plans.
-- Floquet systems, block operators, spectral and dynamical response,
-  expectation values, arbitrary-site partial traces, pure/mixed entanglement,
-  diagonal ensembles, level statistics, subspace tracking, and Lindblad
+- Shared symmetry-orbit caches; Floquet systems with a single-materialization
+  spectrum boundary; block operators; spectral and dynamical response;
+  expectation values; arbitrary-site partial traces; pure/mixed entanglement;
+  diagonal ensembles; level statistics; subspace tracking; and Lindblad
   generators.
 
 The four fixed-width state types (`U256`, `U1024`, `U4096`, `U16384`) are

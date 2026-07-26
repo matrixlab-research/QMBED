@@ -118,6 +118,53 @@ fn quantum_operator_uses_required_and_default_parameters() {
 }
 
 #[test]
+fn quantum_operator_plan_reuses_one_pattern_across_parameter_points() {
+    let diagonal = Operator::from_triplets(
+        3,
+        3,
+        [
+            (0, 0, Complex64::new(1.0, 0.0)),
+            (1, 1, Complex64::new(-2.0, 0.0)),
+            (2, 2, Complex64::new(3.0, 0.0)),
+        ],
+        MatrixFormat::Csc,
+    )
+    .unwrap();
+    let hopping = Operator::from_triplets(
+        3,
+        3,
+        [
+            (0, 1, Complex64::new(1.0, 0.0)),
+            (1, 0, Complex64::new(1.0, 0.0)),
+            (1, 2, Complex64::new(1.0, 0.0)),
+            (2, 1, Complex64::new(1.0, 0.0)),
+        ],
+        MatrixFormat::Csc,
+    )
+    .unwrap();
+    let family = QuantumOperator::new([
+        QuantumComponent::required("field", diagonal),
+        QuantumComponent::required("hop", hopping),
+    ])
+    .unwrap();
+    let mut plan = family.plan(MatrixFormat::Csc).unwrap();
+    let structural_bytes = plan.operator().memory_bytes();
+    for (field, hop) in [(0.5, -1.0), (1.25, 0.3), (-0.7, 2.0)] {
+        let parameters = HashMap::from([
+            ("field".to_string(), Complex64::new(field, 0.0)),
+            ("hop".to_string(), Complex64::new(hop, 0.0)),
+        ]);
+        let expected = family
+            .evaluate(&parameters, MatrixFormat::Dense)
+            .unwrap()
+            .to_dense();
+        let actual = plan.evaluate(&parameters).unwrap().to_dense();
+        assert_eq!(actual, expected);
+        assert_eq!(plan.operator().memory_bytes(), structural_bytes);
+    }
+}
+
+#[test]
 fn spinful_basis_accepts_unified_orbital_labels_without_losing_sector_checks() {
     let basis = SpinfulFermionBasis1D::builder(2)
         .particles(1, 1)
