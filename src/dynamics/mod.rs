@@ -75,6 +75,7 @@ pub struct Floquet {
     steps: Vec<FloquetStep>,
     dimension: usize,
     evolution: EvolutionOptions,
+    analysis_period: Option<f64>,
 }
 
 impl Floquet {
@@ -102,6 +103,7 @@ impl Floquet {
                 max_substeps: 10_000,
                 hamiltonian: true,
             },
+            analysis_period: None,
         })
     }
 
@@ -129,6 +131,7 @@ impl Floquet {
                 max_substeps: 10_000,
                 hamiltonian: true,
             },
+            analysis_period: None,
         })
     }
 
@@ -136,6 +139,21 @@ impl Floquet {
         self.evolution = options;
         self.evolution.hamiltonian = true;
         self
+    }
+
+    /// Override the physical Floquet period used for quasienergies and the
+    /// effective Hamiltonian without changing the step durations.
+    ///
+    /// This supports kicked protocols whose explicit evolution intervals do
+    /// not add up to the declared drive period.
+    pub fn with_period(mut self, period: f64) -> Result<Self> {
+        if !period.is_finite() || period <= 0.0 {
+            return Err(QmbedError::InvalidOptions(
+                "Floquet analysis period must be finite and positive".into(),
+            ));
+        }
+        self.analysis_period = Some(period);
+        Ok(self)
     }
 
     pub fn apply_period(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
@@ -173,6 +191,12 @@ impl Floquet {
     }
 
     pub fn period(&self) -> f64 {
+        self.analysis_period
+            .unwrap_or_else(|| self.protocol_duration())
+    }
+
+    /// Sum of the explicit piecewise evolution intervals.
+    pub fn protocol_duration(&self) -> f64 {
         self.steps.iter().map(FloquetStep::duration).sum()
     }
 
@@ -214,56 +238,39 @@ impl Floquet {
             ));
         }
         let unitary = materialize_dense(&self.full_unitary(MatrixFormat::Dense)?)?;
-        let eigensystem = backend::complex_eigenpairs(&unitary, self.dimension)?;
-        let mut entries = Vec::with_capacity(self.dimension);
-        for column in 0..self.dimension {
-            let eigenvalue = eigensystem.eigenvalues[column];
-            if (eigenvalue.norm() - 1.0).abs() > 1.0e-8 {
-                return Err(QmbedError::NonConvergence {
-                    iterations: 1,
-                    residual: (eigenvalue.norm() - 1.0).abs(),
-                });
-            }
-            let vector = eigensystem.eigenvectors[column].clone();
-            let mut applied = vec![Complex64::new(0.0, 0.0); self.dimension];
-            for row in 0..self.dimension {
-                applied[row] = (0..self.dimension)
-                    .map(|inner| unitary[row * self.dimension + inner] * vector[inner])
-                    .sum();
-            }
-            let residual = applied
-                .iter()
-                .zip(&vector)
-                .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
-                .sum::<f64>()
-                .sqrt();
-            entries.push((-eigenvalue.arg() / period, eigenvalue, vector, residual));
-        }
-        entries.sort_by(|left, right| left.0.total_cmp(&right.0));
-        Ok(FloquetEigensystem {
-            quasienergies: entries.iter().map(|entry| entry.0).collect(),
-            eigenvalues: entries.iter().map(|entry| entry.1).collect(),
-            eigenvectors: entries.iter().map(|entry| entry.2.clone()).collect(),
-            residuals: entries.into_iter().map(|entry| entry.3).collect(),
-        })
+        floquet_eigensystem_from_dense(&unitary, self.dimension, period)
     }
 
     pub fn effective_hamiltonian(&self, format: MatrixFormat) -> Result<Operator> {
         let eigensystem = self.eigensystem()?;
-        let mut values = vec![Complex64::new(0.0, 0.0); self.dimension * self.dimension];
-        for (energy, vector) in eigensystem
-            .quasienergies
-            .iter()
-            .zip(&eigensystem.eigenvectors)
-        {
-            for row in 0..self.dimension {
-                for column in 0..self.dimension {
-                    values[row * self.dimension + column] +=
-                        *energy * vector[row] * vector[column].conj();
-                }
-            }
+        self.effective_hamiltonian_from_eigensystem(&eigensystem, format)
+    }
+
+    fn effective_hamiltonian_from_eigensystem(
+        &self,
+        eigensystem: &FloquetEigensystem,
+        format: MatrixFormat,
+    ) -> Result<Operator> {
+        floquet_effective_hamiltonian(eigensystem, self.dimension, format)
+    }
+
+    /// Compute the period propagator and all spectral products while
+    /// materializing the propagator only once.
+    pub fn analyze(&self, format: MatrixFormat) -> Result<FloquetAnalysis> {
+        let period = self.period();
+        if period <= 0.0 {
+            return Err(QmbedError::InvalidOptions(
+                "Floquet analyses require a positive period".into(),
+            ));
         }
-        Operator::from_dense(self.dimension, self.dimension, values)?.converted(format)
+        let dense_unitary = self.full_unitary(MatrixFormat::Dense)?;
+        analyze_floquet_dense_unitary(
+            dense_unitary.to_dense(),
+            self.dimension,
+            period,
+            self.protocol_duration(),
+            format,
+        )
     }
 }
 
@@ -289,6 +296,115 @@ pub struct FloquetEigensystem {
     pub eigenvalues: Vec<Complex64>,
     pub eigenvectors: Vec<Vec<Complex64>>,
     pub residuals: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FloquetAnalysis {
+    pub period: f64,
+    pub protocol_duration: f64,
+    pub unitary: Operator,
+    pub eigensystem: FloquetEigensystem,
+    pub effective_hamiltonian: Operator,
+}
+
+fn floquet_eigensystem_from_dense(
+    unitary: &[Complex64],
+    dimension: usize,
+    period: f64,
+) -> Result<FloquetEigensystem> {
+    let eigensystem = backend::complex_eigenpairs(unitary, dimension)?;
+    let mut entries = Vec::with_capacity(dimension);
+    for column in 0..dimension {
+        let eigenvalue = eigensystem.eigenvalues[column];
+        if (eigenvalue.norm() - 1.0).abs() > 1.0e-8 {
+            return Err(QmbedError::NonConvergence {
+                iterations: 1,
+                residual: (eigenvalue.norm() - 1.0).abs(),
+            });
+        }
+        let vector = eigensystem.eigenvectors[column].clone();
+        let mut applied = vec![Complex64::new(0.0, 0.0); dimension];
+        for row in 0..dimension {
+            applied[row] = (0..dimension)
+                .map(|inner| unitary[row * dimension + inner] * vector[inner])
+                .sum();
+        }
+        let residual = applied
+            .iter()
+            .zip(&vector)
+            .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
+            .sum::<f64>()
+            .sqrt();
+        entries.push((-eigenvalue.arg() / period, eigenvalue, vector, residual));
+    }
+    entries.sort_by(|left, right| left.0.total_cmp(&right.0));
+    Ok(FloquetEigensystem {
+        quasienergies: entries.iter().map(|entry| entry.0).collect(),
+        eigenvalues: entries.iter().map(|entry| entry.1).collect(),
+        eigenvectors: entries.iter().map(|entry| entry.2.clone()).collect(),
+        residuals: entries.into_iter().map(|entry| entry.3).collect(),
+    })
+}
+
+fn floquet_effective_hamiltonian(
+    eigensystem: &FloquetEigensystem,
+    dimension: usize,
+    format: MatrixFormat,
+) -> Result<Operator> {
+    let mut values = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+    for (energy, vector) in eigensystem
+        .quasienergies
+        .iter()
+        .zip(&eigensystem.eigenvectors)
+    {
+        for row in 0..dimension {
+            for column in 0..dimension {
+                values[row * dimension + column] += *energy * vector[row] * vector[column].conj();
+            }
+        }
+    }
+    Operator::from_dense(dimension, dimension, values)?.converted(format)
+}
+
+fn analyze_floquet_dense_unitary(
+    dense_unitary: Vec<Complex64>,
+    dimension: usize,
+    period: f64,
+    protocol_duration: f64,
+    format: MatrixFormat,
+) -> Result<FloquetAnalysis> {
+    if !period.is_finite() || period <= 0.0 {
+        return Err(QmbedError::InvalidOptions(
+            "Floquet analyses require a finite positive period".into(),
+        ));
+    }
+    let eigensystem = floquet_eigensystem_from_dense(&dense_unitary, dimension, period)?;
+    let effective_hamiltonian = floquet_effective_hamiltonian(&eigensystem, dimension, format)?;
+    Ok(FloquetAnalysis {
+        period,
+        protocol_duration,
+        unitary: Operator::from_dense(dimension, dimension, dense_unitary)?.converted(format)?,
+        eigensystem,
+        effective_hamiltonian,
+    })
+}
+
+/// Analyze an already-constructed one-period propagator.
+///
+/// This is the common boundary for continuous-time integrators, tensor-network
+/// propagators, and externally supplied unitaries.
+pub fn analyze_floquet_unitary(
+    unitary: &dyn LinearOperator,
+    period: f64,
+    format: MatrixFormat,
+) -> Result<FloquetAnalysis> {
+    let (rows, columns) = unitary.shape();
+    if rows != columns {
+        return Err(QmbedError::DimensionMismatch(
+            "a Floquet propagator must be square".into(),
+        ));
+    }
+    analyze_floquet_dense_unitary(materialize_dense(unitary)?, rows, period, period, format)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -331,12 +447,58 @@ impl FloquetTimeVector {
         })
     }
 
+    /// Time grid for ramp-up, constant, and ramp-down Floquet stages.
+    ///
+    /// The grid starts at `-ramp_up_cycles * period`, includes the final
+    /// endpoint, and retains a uniform number of points per period.
+    pub fn staged(
+        period: f64,
+        ramp_up_cycles: usize,
+        constant_cycles: usize,
+        ramp_down_cycles: usize,
+        points_per_cycle: usize,
+    ) -> Result<Self> {
+        let cycles = ramp_up_cycles
+            .checked_add(constant_cycles)
+            .and_then(|value| value.checked_add(ramp_down_cycles))
+            .ok_or_else(|| QmbedError::InvalidOptions("Floquet cycle count overflow".into()))?;
+        if !period.is_finite()
+            || period <= 0.0
+            || constant_cycles == 0
+            || cycles == 0
+            || points_per_cycle == 0
+        {
+            return Err(QmbedError::InvalidOptions(
+                "Floquet staged-grid controls must be positive".into(),
+            ));
+        }
+        let points = cycles
+            .checked_mul(points_per_cycle)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| QmbedError::InvalidOptions("Floquet time-vector overflow".into()))?;
+        let step = period / points_per_cycle as f64;
+        let start = -(ramp_up_cycles as f64) * period;
+        let times = (0..points)
+            .map(|index| start + index as f64 * step)
+            .collect();
+        Ok(Self {
+            period,
+            cycles,
+            points_per_cycle,
+            times,
+        })
+    }
+
     pub const fn period(&self) -> f64 {
         self.period
     }
 
     pub const fn cycles(&self) -> usize {
         self.cycles
+    }
+
+    pub const fn points_per_cycle(&self) -> usize {
+        self.points_per_cycle
     }
 
     pub fn times(&self) -> &[f64] {

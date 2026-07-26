@@ -28,16 +28,23 @@ def operator_term(
     operator: str,
     couplings: Iterable[Coupling],
 ) -> OperatorSpec:
-    if operator.count("|") > 1:
-        raise ValueError("a spinful operator may contain only one separator")
-    split = operator.find("|")
-    split = None if split < 0 else split
+    splits = []
+    local_count = 0
+    for symbol in operator:
+        if symbol == "|":
+            splits.append(local_count)
+        else:
+            local_count += 1
     local = tuple(
         _SYMBOLS.get(symbol, f"custom:{symbol}")
         for symbol in operator
         if symbol != "|"
     )
-    return OperatorSpec(OpProduct(local, split), tuple(couplings))
+    if len(splits) == 1:
+        product = OpProduct(local, split=splits[0])
+    else:
+        product = OpProduct(local, splits=tuple(splits))
+    return OperatorSpec(product, tuple(couplings))
 
 
 def terms_from_static(static: Iterable[Sequence]) -> tuple[OperatorSpec, ...]:

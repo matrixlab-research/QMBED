@@ -319,7 +319,7 @@ fn paper_scale_pxp_revival_uses_the_universal_user_basis_path() {
 
 #[test]
 #[ignore = "paper-scale workflow; exercised in release mode"]
-fn paper_scale_bose_hubbard_mott_quench_reuses_one_krylov_projection() {
+fn paper_scale_bose_hubbard_mott_quench_uses_residual_controlled_krylov_restarts() {
     let sites = 11;
     let basis = BosonBasis1D::builder(sites, 3)
         .particles(sites)

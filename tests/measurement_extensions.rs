@@ -1,14 +1,19 @@
 use approx::assert_abs_diff_eq;
 use qmbed::Complex64;
 use qmbed::measure::{
-    EntropyOrder, array_to_ints, array_to_states, density_expectation, diagonal_ensemble,
+    EntropyOrder, NoncommutingGroup, analyze_diagonal_ensemble, apply_fermionic_subsystem_phases,
+    apply_noncommuting_subsystem_exchange_phases,
+    apply_noncommuting_subsystem_exchange_phases_density, apply_noncommuting_subsystem_phases,
+    array_to_ints, array_to_states, canonical_schmidt_spectrum_subsystem, density_expectation,
+    density_matrix_spectrum, density_quantum_fluctuation, diagonal_ensemble,
     diagonal_ensemble_density, diagonal_ensemble_observable, ed_density_vs_time, ed_state_vs_time,
     energy_window_indices, entanglement_entropy, entanglement_entropy_batch,
     entanglement_entropy_density, entanglement_entropy_density_subsystem,
     entanglement_entropy_subsystem, entanglement_spectrum, entanglement_spectrum_density,
-    entanglement_spectrum_subsystem, expectation, ints_to_array, kl_divergence, matrix_element,
-    mean_level_spacing, observables_vs_time, partial_trace, partial_trace_density,
-    partial_trace_density_subsystem, partial_trace_subsystem, quantum_fluctuation, states_to_array,
+    entanglement_spectrum_subsystem, entropy_from_spectrum, expectation, ints_to_array,
+    kl_divergence, matrix_element, mean_level_spacing, observables_vs_time, partial_trace,
+    partial_trace_density, partial_trace_density_subsystem, partial_trace_subsystem,
+    quantum_fluctuation, raw_quantum_fluctuation, states_to_array,
 };
 use qmbed::operator::Operator;
 use qmbed::solve::StateTrajectory;
@@ -48,6 +53,14 @@ fn observables_and_fluctuations_match_two_level_anchors() {
         quantum_fluctuation(&operator, &plus).unwrap(),
         1.0,
         epsilon = 1.0e-12
+    );
+    assert_eq!(
+        raw_quantum_fluctuation(
+            &operator,
+            &[Complex64::new(0.0, 0.0), Complex64::new(0.0, 0.0)],
+        )
+        .unwrap(),
+        Complex64::new(0.0, 0.0)
     );
 
     let trajectory = StateTrajectory {
@@ -217,6 +230,11 @@ fn density_diagonal_ensemble_and_observable_are_consistent() {
         epsilon = 1.0e-12
     );
     assert_abs_diff_eq!(
+        density_quantum_fluctuation(&z, &density).unwrap().re,
+        0.75,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
         diagonal_ensemble_observable(&ensemble, &eigenvectors, &z)
             .unwrap()
             .re,
@@ -226,6 +244,55 @@ fn density_diagonal_ensemble_and_observable_are_consistent() {
     assert_eq!(
         energy_window_indices(&[-2.0, -0.1, 0.2, 3.0], 0.0, 0.25).unwrap(),
         vec![1, 2]
+    );
+}
+
+#[test]
+fn diagonal_probability_batches_share_matrix_free_observable_statistics() {
+    let eigenvectors = vec![
+        vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+        vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+    ];
+    let sigma_x = Operator::from_dense(
+        2,
+        2,
+        vec![
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        ],
+    )
+    .unwrap();
+    let analyses = analyze_diagonal_ensemble(
+        &[-1.0, 1.0],
+        &eigenvectors,
+        &[vec![3.0, 1.0], vec![1.0, 1.0]],
+        Some(&sigma_x),
+        2.0,
+    )
+    .unwrap();
+    assert_eq!(analyses[0].ensemble.probabilities, vec![0.75, 0.25]);
+    assert_abs_diff_eq!(
+        analyses[0].diagonal_entropy,
+        -(0.625_f64).ln(),
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(analyses[0].observable.unwrap(), 0.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(
+        analyses[0].temporal_fluctuation.unwrap(),
+        0.375_f64.sqrt(),
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        analyses[0].quantum_fluctuation.unwrap(),
+        0.625_f64.sqrt(),
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        analyses[1].diagonal_entropy,
+        2.0_f64.ln(),
+        epsilon = 1.0e-12
     );
 }
 
@@ -270,4 +337,119 @@ fn arbitrary_site_partial_trace_supports_noncontiguous_subsystems() {
         2.0_f64.ln(),
         epsilon = 1.0e-12
     );
+}
+
+#[test]
+fn large_rank_deficient_density_spectrum_survives_backend_degeneracy() {
+    let dimension = 192;
+    let norm = (dimension as f64).sqrt();
+    let first = vec![Complex64::new(1.0 / norm, 0.0); dimension];
+    let second = (0..dimension)
+        .map(|index| {
+            let phase = std::f64::consts::TAU * index as f64 / dimension as f64;
+            Complex64::from_polar(1.0 / norm, phase)
+        })
+        .collect::<Vec<_>>();
+    let density = (0..dimension)
+        .flat_map(|row| {
+            let first = &first;
+            let second = &second;
+            (0..dimension).map(move |column| {
+                0.3 * first[row] * first[column].conj() + 0.7 * second[row] * second[column].conj()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let spectrum = density_matrix_spectrum(density, dimension).unwrap();
+    assert_eq!(spectrum.len(), dimension);
+    assert!(
+        spectrum[..dimension - 2]
+            .iter()
+            .all(|value| *value < 1.0e-10)
+    );
+    assert_abs_diff_eq!(spectrum[dimension - 2], 0.3, epsilon = 1.0e-10);
+    assert_abs_diff_eq!(spectrum[dimension - 1], 0.7, epsilon = 1.0e-10);
+}
+
+#[test]
+fn canonical_schmidt_spectrum_is_bitwise_identical_for_complementary_calls() {
+    let local_dimensions = [2; 6];
+    let mut state = (0..64)
+        .map(|index| {
+            Complex64::new(
+                ((index * 17 + 3) % 29) as f64 - 14.0,
+                ((index * 11 + 5) % 31) as f64 - 15.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let norm = state.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt();
+    for value in &mut state {
+        *value /= norm;
+    }
+    for (retained, environment) in [
+        (vec![2, 0, 4, 1, 3], vec![5]),
+        (vec![4, 0, 2], vec![1, 3, 5]),
+        (vec![5, 3, 1], vec![0, 2, 4]),
+    ] {
+        let retained_spectrum =
+            canonical_schmidt_spectrum_subsystem(&state, &local_dimensions, &retained, &[])
+                .unwrap();
+        let environment_spectrum =
+            canonical_schmidt_spectrum_subsystem(&state, &local_dimensions, &environment, &[])
+                .unwrap();
+        assert_eq!(retained_spectrum, environment_spectrum);
+        assert_eq!(
+            entropy_from_spectrum(&retained_spectrum, EntropyOrder::VonNeumann).unwrap(),
+            entropy_from_spectrum(&environment_spectrum, EntropyOrder::VonNeumann).unwrap()
+        );
+    }
+}
+
+#[test]
+fn fermionic_subsystem_reordering_tracks_occupied_mode_swaps() {
+    let mut state = vec![Complex64::new(0.0, 0.0); 16];
+    state[0b0110] = Complex64::new(0.25, -0.5);
+    state[0b1010] = Complex64::new(-0.75, 0.125);
+    apply_fermionic_subsystem_phases(&mut state, &[2, 2, 2, 2], &[1, 3]).unwrap();
+    assert_eq!(state[0b0110], Complex64::new(-0.25, 0.5));
+    assert_eq!(state[0b1010], Complex64::new(-0.75, 0.125));
+}
+
+#[test]
+fn noncommuting_subsystem_reordering_keeps_distinct_species_commuting() {
+    let mut state = vec![Complex64::new(1.0, 0.0); 16];
+    apply_noncommuting_subsystem_phases(
+        &mut state,
+        &[2, 2, 2, 2],
+        &[1, 2],
+        &[vec![0, 1], vec![2, 3]],
+    )
+    .unwrap();
+    assert_eq!(state[0b0110], Complex64::new(1.0, 0.0));
+    assert_eq!(state[0b1100], Complex64::new(-1.0, 0.0));
+}
+
+#[test]
+fn noncommuting_subsystem_reordering_supports_unit_modulus_exchange_phases() {
+    let group = NoncommutingGroup::new([0, 1], Complex64::new(0.0, 1.0)).unwrap();
+    let mut state = vec![Complex64::new(1.0, 0.0); 4];
+    apply_noncommuting_subsystem_exchange_phases(
+        &mut state,
+        &[2, 2],
+        &[0],
+        std::slice::from_ref(&group),
+    )
+    .unwrap();
+    assert_eq!(state[0b00], Complex64::new(1.0, 0.0));
+    assert_eq!(state[0b11], Complex64::new(0.0, 1.0));
+
+    let mut density = vec![Complex64::new(0.0, 0.0); 16];
+    density[0b11 * 4] = Complex64::new(1.0, 0.0);
+    density[0b11] = Complex64::new(1.0, 0.0);
+    apply_noncommuting_subsystem_exchange_phases_density(&mut density, &[2, 2], &[0], &[group])
+        .unwrap();
+    assert_eq!(density[0b11 * 4], Complex64::new(0.0, 1.0));
+    assert_eq!(density[0b11], Complex64::new(0.0, -1.0));
+
+    assert!(NoncommutingGroup::new([0, 1], Complex64::new(2.0, 0.0)).is_err());
 }

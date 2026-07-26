@@ -1,8 +1,8 @@
 use qmbed::Complex64;
 use qmbed::basis::{
     Basis, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap,
-    LocalOccupationConstraint, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D,
-    SpinlessFermionBasis1D, SymmetryMap, SymmetryReducer, SymmetrySector,
+    LocalOccupationConstraint, PackedBasis, RepresentativeOrdering, SpinBasis1D,
+    SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetryMap, SymmetryReducer, SymmetrySector,
 };
 
 #[test]
@@ -124,6 +124,37 @@ fn local_binary_species_constraints_compose_with_sector_and_symmetry_reduction()
 }
 
 #[test]
+fn spinful_reduction_inherits_the_parent_direct_product_row_order() {
+    let sites = 3;
+    let parent = SpinfulFermionBasis1D::builder(sites)
+        .particles(2, 1)
+        .build()
+        .unwrap();
+    let reflection = LatticeSymmetryMap::site_permutation(2, vec![2, 1, 0, 5, 4, 3]).unwrap();
+    let reduced = GeneralBasis::from_orbit_seeds_with_ordering(
+        parent.clone(),
+        SymmetryReducer::new().with_map(reflection, 0),
+        RepresentativeOrdering::Maximum,
+    )
+    .unwrap();
+
+    let parent_rows = (0..reduced.len())
+        .map(|index| parent.index(reduced.state(index).unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        parent_rows.windows(2).all(|rows| rows[0] < rows[1]),
+        "a reduced basis must inherit the parent's row convention"
+    );
+    let native_states = (0..reduced.len())
+        .map(|index| reduced.state(index).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !native_states.windows(2).all(|states| states[0] < states[1]),
+        "the anchor must distinguish direct-product ordering from packed-integer ordering"
+    );
+}
+
+#[test]
 fn generated_group_closure_supports_noncommuting_trivial_characters() {
     let sites = 4;
     let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
@@ -158,6 +189,11 @@ fn reducer_queries_orbits_before_basis_materialization() {
     assert_eq!(*orbit.representative(), 1);
     assert_eq!(orbit.orbit_size(), 4);
     assert!(orbit.is_compatible());
+    let maximum = reducer
+        .orbit_with_ordering(8, RepresentativeOrdering::Maximum)
+        .unwrap();
+    assert_eq!(*maximum.representative(), 8);
+    assert_eq!(maximum.orbit_size(), orbit.orbit_size());
     assert_eq!(orbit.phase(), Some(Complex64::new(1.0, 0.0)));
     assert_eq!(
         orbit.physical_phase_to_representative(),
@@ -214,12 +250,91 @@ fn local_digit_permutations_cover_spin_inversion() {
 }
 
 #[test]
+fn orbit_seed_reduction_completes_a_noninvariant_additive_sector() {
+    let sites = 4;
+    let inversion = LatticeSymmetryMap::new(
+        2,
+        (0..sites).collect::<Vec<_>>(),
+        Some(vec![vec![1, 0]; sites]),
+        ExchangeStatistics::Distinguishable,
+    )
+    .unwrap();
+    let seeds = SpinBasis1D::builder(sites).up(1).build().unwrap();
+
+    let strict = GeneralBasis::from_reducer(
+        seeds.clone(),
+        SymmetryReducer::new().with_map(inversion.clone(), 0),
+    );
+    assert!(
+        strict
+            .unwrap_err()
+            .to_string()
+            .contains("leaves the parent basis")
+    );
+
+    let completed =
+        GeneralBasis::from_orbit_seeds(seeds, SymmetryReducer::new().with_map(inversion, 0))
+            .unwrap();
+    let representatives = (0..completed.len())
+        .map(|index| completed.state(index).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(representatives, vec![0b0001, 0b0010, 0b0100, 0b0111]);
+
+    let image = completed.reduction_image(0b1110).unwrap().unwrap();
+    assert_eq!(*image.representative(), 0b0001);
+    assert_eq!(image.orbit_size(), 2);
+    assert!((image.amplitude().norm() - 1.0 / 2.0_f64.sqrt()).abs() < 1.0e-12);
+
+    // The last representative is outside the enumerated one-particle seed
+    // sector, but it still uses the same local spin algebra.
+    assert!(
+        completed
+            .apply_local(0b0111, "zz", &[0, 1])
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn fermionic_permutations_compute_the_exchange_phase() {
     let swap = LatticeSymmetryMap::fermionic_orbital_permutation(vec![1, 0]).unwrap();
 
     assert_eq!(swap.period(), 2);
     assert_eq!(swap.apply(0b01).unwrap(), (0b10, Complex64::new(1.0, 0.0)));
     assert_eq!(swap.apply(0b11).unwrap(), (0b11, Complex64::new(-1.0, 0.0)));
+}
+
+#[test]
+fn fermionic_particle_hole_maps_keep_the_occupied_orbital_phase_convention() {
+    let particle_hole = LatticeSymmetryMap::new(
+        2,
+        vec![2, 0, 3, 1],
+        Some(vec![vec![1, 0]; 4]),
+        ExchangeStatistics::Fermionic,
+    )
+    .unwrap();
+
+    assert_eq!(particle_hole.period(), 4);
+    assert_eq!(
+        particle_hole.apply(0b0011).unwrap(),
+        (0b1010, Complex64::new(-1.0, 0.0))
+    );
+    assert_eq!(
+        particle_hole.apply(0b1011).unwrap(),
+        (0b1000, Complex64::new(1.0, 0.0))
+    );
+
+    for state in 0_u128..16 {
+        let mut transformed = state;
+        let mut phase = Complex64::new(1.0, 0.0);
+        for _ in 0..particle_hole.period() {
+            let (next, step_phase) = particle_hole.apply(transformed).unwrap();
+            transformed = next;
+            phase *= step_phase;
+        }
+        assert_eq!(transformed, state);
+        assert_eq!(phase, Complex64::new(1.0, 0.0));
+    }
 }
 
 #[test]
@@ -243,14 +358,14 @@ fn malformed_runtime_maps_are_rejected_before_basis_construction() {
     );
     assert!(
         LatticeSymmetryMap::new(
-            2,
+            3,
             vec![1, 0],
-            Some(vec![vec![1, 0], vec![1, 0]]),
+            Some(vec![vec![0, 1, 2], vec![0, 1, 2]]),
             ExchangeStatistics::Fermionic,
         )
         .unwrap_err()
         .to_string()
-        .contains("cannot change")
+        .contains("binary occupation")
     );
 }
 

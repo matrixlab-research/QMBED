@@ -42,8 +42,11 @@ fn quspin_strings_are_parsed_once_at_the_compatibility_boundary() {
     );
     assert_eq!(product.label(), "+-|nI");
 
+    let recursive = parse_operator_product("+||-").unwrap();
+    assert_eq!(recursive.splits(), &[1, 1]);
+    assert_eq!(recursive.label(), "+||-");
     assert!(matches!(
-        parse_operator_product("+||-"),
+        parse_operator_product("||"),
         Err(QmbedError::InvalidOperator(_))
     ));
 }

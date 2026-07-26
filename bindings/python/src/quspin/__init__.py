@@ -1,7 +1,6 @@
 """QuSpin 1.0.1 compatibility surface backed by QMBED."""
 
-from . import basis, operators
+from . import basis, operators, tools
+from ._version import __version__
 
-__version__ = "1.0.1"
-
-__all__ = ["__version__", "basis", "operators"]
+__all__ = ["__version__", "basis", "operators", "tools"]

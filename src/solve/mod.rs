@@ -11,6 +11,242 @@ use crate::operator::{
 use crate::runtime::CpuRuntime;
 use crate::{QmbedError, Result};
 
+const EXPM_TAYLOR_THETA: &[(usize, f64)] = &[
+    (1, 2.29e-16),
+    (2, 2.58e-8),
+    (3, 1.39e-5),
+    (4, 3.40e-4),
+    (5, 2.40e-3),
+    (6, 9.07e-3),
+    (7, 2.38e-2),
+    (8, 5.00e-2),
+    (9, 8.96e-2),
+    (10, 1.44e-1),
+    (11, 2.14e-1),
+    (12, 3.00e-1),
+    (13, 4.00e-1),
+    (14, 5.14e-1),
+    (15, 6.41e-1),
+    (16, 7.81e-1),
+    (17, 9.31e-1),
+    (18, 1.09),
+    (19, 1.26),
+    (20, 1.44),
+    (21, 1.62),
+    (22, 1.82),
+    (23, 2.01),
+    (24, 2.22),
+    (25, 2.43),
+    (26, 2.64),
+    (27, 2.86),
+    (28, 3.08),
+    (29, 3.31),
+    (30, 3.54),
+    (35, 4.7),
+    (40, 6.0),
+    (45, 7.2),
+    (50, 8.5),
+    (55, 9.9),
+];
+
+// Daniel--Gragg--Kaufman--Stewart reorthogonalization criterion. A second
+// modified Gram--Schmidt pass is useful only when the first pass removes a
+// substantial fraction of the vector norm. Keeping the criterion here makes
+// clustered-spectrum robustness a property of the generic Lanczos backend
+// without charging every iteration for two unconditional O(m n) passes.
+const DGKS_REORTHOGONALIZATION_THRESHOLD: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+fn shifted_trace_and_one_norm(
+    operator: &(impl LinearOperator + ?Sized),
+) -> Result<(Complex64, f64)> {
+    let (rows, columns) = operator.shape();
+    if rows != columns {
+        return Err(QmbedError::DimensionMismatch(
+            "exponential action requires a square operator".into(),
+        ));
+    }
+    if rows == 0 {
+        return Ok((Complex64::new(0.0, 0.0), 0.0));
+    }
+    let entries = match operator.stored_triplets()? {
+        Some(entries) => entries,
+        None => {
+            let dense = materialize_dense(operator)?;
+            dense
+                .into_iter()
+                .enumerate()
+                .filter_map(|(offset, value)| {
+                    (value.norm() > 0.0).then_some((offset / columns, offset % columns, value))
+                })
+                .collect()
+        }
+    };
+    let mut diagonal = vec![Complex64::new(0.0, 0.0); rows];
+    let mut column_sums = vec![0.0; columns];
+    for (row, column, value) in entries {
+        if !value.re.is_finite() || !value.im.is_finite() {
+            return Err(QmbedError::InvalidOptions(
+                "exponential generator entries must be finite".into(),
+            ));
+        }
+        if row == column {
+            diagonal[row] += value;
+        } else {
+            column_sums[column] += value.norm();
+        }
+    }
+    let trace = diagonal.iter().copied().sum::<Complex64>();
+    let shift = trace / rows as f64;
+    for (column, value) in diagonal.into_iter().enumerate() {
+        column_sums[column] += (value - shift).norm();
+    }
+    Ok((shift, column_sums.into_iter().fold(0.0_f64, f64::max)))
+}
+
+fn vector_infinity_norm(vector: &[Complex64]) -> f64 {
+    vector.iter().map(|value| value.norm()).fold(0.0, f64::max)
+}
+
+/// Prepared Al-Mohy--Higham exponential-action plan.
+///
+/// Construction computes the trace shift, exact stored one-norm, Taylor
+/// degree, and scaling count once. Repeated vector and batch applications then
+/// perform only matrix-vector products and vector updates.
+#[derive(Clone, Debug)]
+pub struct ExpmActionPlan {
+    dimension: usize,
+    coefficient: Complex64,
+    shift: Complex64,
+    degree: usize,
+    scaling: usize,
+    tolerance: f64,
+}
+
+impl ExpmActionPlan {
+    pub fn new(
+        operator: &(impl LinearOperator + ?Sized),
+        coefficient: Complex64,
+        max_degree: usize,
+        tolerance: f64,
+        max_substeps: usize,
+    ) -> Result<Self> {
+        let (rows, columns) = operator.shape();
+        if rows != columns {
+            return Err(QmbedError::DimensionMismatch(
+                "exponential action requires a square operator".into(),
+            ));
+        }
+        if !coefficient.re.is_finite()
+            || !coefficient.im.is_finite()
+            || max_degree == 0
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || max_substeps == 0
+        {
+            return Err(QmbedError::InvalidOptions(
+                "invalid exponential coefficient or numerical controls".into(),
+            ));
+        }
+        let (shift, shifted_one_norm) = shifted_trace_and_one_norm(operator)?;
+        let scaled_norm = coefficient.norm() * shifted_one_norm;
+        let (degree, scaling) = if scaled_norm == 0.0 {
+            (0, 1)
+        } else {
+            EXPM_TAYLOR_THETA
+                .iter()
+                .copied()
+                .filter(|(degree, _)| *degree <= max_degree)
+                .map(|(degree, theta)| {
+                    let scaling = (scaled_norm / theta).ceil().max(1.0) as usize;
+                    (degree, scaling)
+                })
+                .min_by_key(|(degree, scaling)| degree.saturating_mul(*scaling))
+                .ok_or_else(|| {
+                    QmbedError::InvalidOptions(
+                        "Taylor degree is below the minimum supported degree".into(),
+                    )
+                })?
+        };
+        if scaling > max_substeps {
+            return Err(QmbedError::NonConvergence {
+                iterations: max_substeps,
+                residual: scaled_norm,
+            });
+        }
+        Ok(Self {
+            dimension: rows,
+            coefficient,
+            shift,
+            degree,
+            scaling,
+            tolerance,
+        })
+    }
+
+    pub const fn coefficient(&self) -> Complex64 {
+        self.coefficient
+    }
+
+    pub const fn degree(&self) -> usize {
+        self.degree
+    }
+
+    pub const fn scaling(&self) -> usize {
+        self.scaling
+    }
+
+    pub fn apply(
+        &self,
+        operator: &(impl LinearOperator + ?Sized),
+        initial: &[Complex64],
+    ) -> Result<Vec<Complex64>> {
+        if operator.shape() != (self.dimension, self.dimension) || initial.len() != self.dimension {
+            return Err(QmbedError::DimensionMismatch(
+                "exponential plan, operator, and state dimensions do not match".into(),
+            ));
+        }
+        if self.coefficient.norm() <= f64::EPSILON || vector_infinity_norm(initial) == 0.0 {
+            return Ok(initial.to_vec());
+        }
+        let factor = self.coefficient / self.scaling as f64;
+        let eta = (factor * self.shift).exp();
+        if !eta.re.is_finite() || !eta.im.is_finite() {
+            return Err(QmbedError::UnsupportedBackend(
+                "exponential action overflowed its scalar trace shift".into(),
+            ));
+        }
+        let mut state = initial.to_vec();
+        let mut applied = vec![Complex64::new(0.0, 0.0); self.dimension];
+        for _ in 0..self.scaling {
+            let mut term = state.clone();
+            let mut sum = state.clone();
+            let mut previous_norm = vector_infinity_norm(&term);
+            for order in 1..=self.degree {
+                operator.apply(&term, &mut applied)?;
+                let scale = factor / order as f64;
+                for index in 0..self.dimension {
+                    applied[index] = scale * (applied[index] - self.shift * term[index]);
+                }
+                std::mem::swap(&mut term, &mut applied);
+                for (total, value) in sum.iter_mut().zip(&term) {
+                    *total += *value;
+                }
+                let term_norm = vector_infinity_norm(&term);
+                if previous_norm + term_norm
+                    <= self.tolerance * vector_infinity_norm(&sum).max(f64::MIN_POSITIVE)
+                {
+                    break;
+                }
+                previous_norm = term_norm;
+            }
+            for (value, total) in state.iter_mut().zip(sum) {
+                *value = eta * total;
+            }
+        }
+        Ok(state)
+    }
+}
+
 /// Reusable exponential-action plan for vectors and batches.
 #[derive(Clone, Debug)]
 pub struct ExpmMultiplyParallel {
@@ -111,6 +347,7 @@ pub struct EigshOptions {
 
 const GUARANTEED_DENSE_EIGSH_CROSSOVER: usize = 128;
 const AUTOMATIC_DENSE_EIGSH_CROSSOVER: usize = 256;
+const FULL_KRYLOV_DENSE_FALLBACK: usize = 2_048;
 
 fn use_dense_eigsh(dimension: usize, options: &EigshOptions) -> bool {
     dimension <= GUARANTEED_DENSE_EIGSH_CROSSOVER
@@ -161,6 +398,8 @@ pub struct Eigensystem {
     pub eigenvectors: Vec<Vec<Complex64>>,
     pub residuals: Vec<f64>,
     pub iterations: usize,
+    pub reorthogonalization_passes: usize,
+    pub conditional_second_passes: usize,
     pub converged: bool,
 }
 
@@ -188,6 +427,9 @@ pub(crate) fn hermitian_eigenpairs_all(
     }
     let dense = materialize_dense(operator)?;
     let dimension = shape.0;
+    if dimension == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
     for row in 0..dimension {
         for column in 0..dimension {
             if (dense[row * dimension + column] - dense[column * dimension + row].conj()).norm()
@@ -216,7 +458,9 @@ where
         eigenvalues,
         eigenvectors,
         residuals,
-        iterations: 1,
+        iterations: usize::from(operator.shape().0 != 0),
+        reorthogonalization_passes: 0,
+        conditional_second_passes: 0,
         converged: true,
     })
 }
@@ -256,6 +500,29 @@ fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
 
 fn vector_norm(vector: &[Complex64]) -> f64 {
     vector.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt()
+}
+
+fn validate_eigsh_initial(vector: &[Complex64], dimension: usize) -> Result<()> {
+    if vector.len() != dimension {
+        return Err(QmbedError::DimensionMismatch(
+            "eigsh initial vector does not match the operator".into(),
+        ));
+    }
+    if vector
+        .iter()
+        .any(|value| !value.re.is_finite() || !value.im.is_finite())
+    {
+        return Err(QmbedError::InvalidOptions(
+            "eigsh initial vector must contain only finite values".into(),
+        ));
+    }
+    let norm = vector_norm(vector);
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(QmbedError::InvalidOptions(
+            "eigsh initial vector must have nonzero finite norm".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize(vector: &mut [Complex64]) -> Result<()> {
@@ -592,6 +859,56 @@ fn real_vector_norm(vector: &[f64]) -> f64 {
     real_inner(vector, vector).sqrt()
 }
 
+fn dgks_reorthogonalize_real(basis: &[Vec<f64>], output: &mut [f64]) -> (f64, bool) {
+    let norm_before_reorthogonalization = real_vector_norm(output);
+    for vector in basis {
+        let overlap = real_inner(vector, output);
+        for (value, basis_value) in output.iter_mut().zip(vector) {
+            *value -= overlap * *basis_value;
+        }
+    }
+    let norm_after_first_pass = real_vector_norm(output);
+    if norm_before_reorthogonalization > f64::EPSILON
+        && norm_after_first_pass
+            <= DGKS_REORTHOGONALIZATION_THRESHOLD * norm_before_reorthogonalization
+    {
+        for vector in basis {
+            let overlap = real_inner(vector, output);
+            for (value, basis_value) in output.iter_mut().zip(vector) {
+                *value -= overlap * *basis_value;
+            }
+        }
+        (real_vector_norm(output), true)
+    } else {
+        (norm_after_first_pass, false)
+    }
+}
+
+fn dgks_reorthogonalize_complex(basis: &[Vec<Complex64>], output: &mut [Complex64]) -> (f64, bool) {
+    let norm_before_reorthogonalization = vector_norm(output);
+    for vector in basis {
+        let overlap = inner(vector, output);
+        for (value, basis_value) in output.iter_mut().zip(vector) {
+            *value -= overlap * *basis_value;
+        }
+    }
+    let norm_after_first_pass = vector_norm(output);
+    if norm_before_reorthogonalization > f64::EPSILON
+        && norm_after_first_pass
+            <= DGKS_REORTHOGONALIZATION_THRESHOLD * norm_before_reorthogonalization
+    {
+        for vector in basis {
+            let overlap = inner(vector, output);
+            for (value, basis_value) in output.iter_mut().zip(vector) {
+                *value -= overlap * *basis_value;
+            }
+        }
+        (vector_norm(output), true)
+    } else {
+        (norm_after_first_pass, false)
+    }
+}
+
 fn normalize_real(vector: &mut [f64]) -> Result<()> {
     let norm = real_vector_norm(vector);
     if !norm.is_finite() || norm <= f64::EPSILON {
@@ -648,6 +965,8 @@ where
     let mut alphas = Vec::with_capacity(krylov_dimension);
     let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
     let mut output = vec![0.0; dimension];
+    let mut reorthogonalization_passes = 0;
+    let mut conditional_second_passes = 0;
 
     for iteration in 0..krylov_dimension {
         transformed_apply_real(
@@ -669,19 +988,11 @@ where
             }
         }
 
-        // A second modified Gram-Schmidt pass is necessary when extremal
-        // Ritz values are clustered. Without it, a nominally complete
-        // Krylov space can still return residuals above the requested
-        // tolerance because roundoff reintroduces earlier Lanczos vectors.
-        for _ in 0..2 {
-            for vector in &basis {
-                let overlap = real_inner(vector, &output);
-                for (value, basis_value) in output.iter_mut().zip(vector) {
-                    *value -= overlap * *basis_value;
-                }
-            }
+        let (beta, second_pass) = dgks_reorthogonalize_real(&basis, &mut output);
+        reorthogonalization_passes += 1 + usize::from(second_pass);
+        if second_pass {
+            conditional_second_passes += 1;
         }
-        let beta = real_vector_norm(&output);
         if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
             break;
         }
@@ -748,9 +1059,13 @@ where
         SpectrumTarget::Shift(shift) => (left.0 - shift).abs().total_cmp(&(right.0 - shift).abs()),
     });
     let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
-    let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
-    let accepted_residual = options.tolerance.max(1.0e-7);
-    if failure_residual > accepted_residual {
+    let failure_residual = candidates
+        .iter()
+        .filter_map(|candidate| {
+            (candidate.2 > options.tolerance * candidate.0.abs().max(1.0)).then_some(candidate.2)
+        })
+        .fold(0.0_f64, f64::max);
+    if failure_residual > 0.0 {
         return Err(QmbedError::NonConvergence {
             iterations: size,
             residual: failure_residual,
@@ -770,6 +1085,8 @@ where
             .collect(),
         residuals,
         iterations: size,
+        reorthogonalization_passes,
+        conditional_second_passes,
         converged: true,
     })
 }
@@ -825,6 +1142,8 @@ where
     let mut alphas = Vec::with_capacity(krylov_dimension);
     let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
     let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut reorthogonalization_passes = 0;
+    let mut conditional_second_passes = 0;
     if let SpectrumTarget::Shift(shift) = options.target
         && shifted_solver.is_none()
     {
@@ -851,17 +1170,11 @@ where
             }
         }
 
-        // Two-pass modified Gram-Schmidt keeps clustered, multiple, and
-        // interior Ritz vectors reliable at the requested residual.
-        for _ in 0..2 {
-            for vector in &basis {
-                let overlap = inner(vector, &output);
-                for (value, basis_value) in output.iter_mut().zip(vector) {
-                    *value -= overlap * *basis_value;
-                }
-            }
+        let (beta, second_pass) = dgks_reorthogonalize_complex(&basis, &mut output);
+        reorthogonalization_passes += 1 + usize::from(second_pass);
+        if second_pass {
+            conditional_second_passes += 1;
         }
-        let beta = vector_norm(&output);
         if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
             break;
         }
@@ -925,9 +1238,13 @@ where
         SpectrumTarget::Shift(shift) => (left.0 - shift).abs().total_cmp(&(right.0 - shift).abs()),
     });
     let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
-    let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
-    let accepted_residual = options.tolerance.max(1.0e-7);
-    if failure_residual > accepted_residual {
+    let failure_residual = candidates
+        .iter()
+        .filter_map(|candidate| {
+            (candidate.2 > options.tolerance * candidate.0.abs().max(1.0)).then_some(candidate.2)
+        })
+        .fold(0.0_f64, f64::max);
+    if failure_residual > 0.0 {
         return Err(QmbedError::NonConvergence {
             iterations: size,
             residual: failure_residual,
@@ -941,29 +1258,16 @@ where
             .collect(),
         residuals,
         iterations: size,
+        reorthogonalization_passes,
+        conditional_second_passes,
         converged: true,
     })
 }
 
-/// Selected Hermitian eigenpairs.
-///
-/// Small problems use a dense real-symmetric decomposition. Larger problems
-/// use a matrix-free, fully reorthogonalized Lanczos backend; shift targets
-/// apply a restarted GMRES inverse without materializing the operator.
-pub fn eigsh<O>(operator: &O, options: EigshOptions) -> Result<Eigensystem>
+fn dense_eigsh<O>(operator: &O, options: &EigshOptions) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
 {
-    let shape = operator.shape();
-    if shape.0 != shape.1 {
-        return Err(QmbedError::DimensionMismatch(
-            "eigsh requires a square operator".into(),
-        ));
-    }
-    options.validate(shape.0)?;
-    if !use_dense_eigsh(shape.0, &options) {
-        return lanczos_eigsh(operator, &options, None);
-    }
     let (values, vectors) = hermitian_eigenpairs_all(operator)?;
     let indices = match options.target {
         SpectrumTarget::Shift(shift) => {
@@ -994,8 +1298,95 @@ where
         eigenvectors,
         residuals,
         iterations: 1,
+        reorthogonalization_passes: 0,
+        conditional_second_passes: 0,
         converged: true,
     })
+}
+
+fn expanding_lanczos_eigsh<O>(
+    operator: &O,
+    options: &EigshOptions,
+    initial: Option<&[Complex64]>,
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    if let Some(krylov_dimension) = options.krylov_dimension {
+        return match lanczos_eigsh(operator, options, initial) {
+            Err(QmbedError::NonConvergence { .. })
+                if krylov_dimension == operator.shape().0
+                    && krylov_dimension <= FULL_KRYLOV_DENSE_FALLBACK =>
+            {
+                dense_eigsh(operator, options)
+            }
+            result => result,
+        };
+    }
+
+    let dimension = operator.shape().0;
+    let mut subspace_dimension = (8 * options.eigenpairs + 64)
+        .max(256)
+        .min(dimension)
+        .min(options.max_iterations);
+    let mut spent_iterations = 0usize;
+    loop {
+        let mut attempt = options.clone();
+        attempt.krylov_dimension = Some(subspace_dimension);
+        attempt.max_iterations = subspace_dimension;
+        match lanczos_eigsh(operator, &attempt, initial) {
+            Ok(mut result) => {
+                result.iterations += spent_iterations;
+                return Ok(result);
+            }
+            Err(QmbedError::NonConvergence {
+                iterations,
+                residual,
+            }) => {
+                spent_iterations = spent_iterations.saturating_add(iterations);
+                if subspace_dimension == dimension && dimension <= FULL_KRYLOV_DENSE_FALLBACK {
+                    let mut result = dense_eigsh(operator, options)?;
+                    result.iterations = result.iterations.saturating_add(spent_iterations);
+                    return Ok(result);
+                }
+                let remaining = options.max_iterations.saturating_sub(spent_iterations);
+                let next_dimension = subspace_dimension
+                    .saturating_mul(2)
+                    .min(dimension)
+                    .min(remaining);
+                if next_dimension <= subspace_dimension {
+                    return Err(QmbedError::NonConvergence {
+                        iterations: spent_iterations,
+                        residual,
+                    });
+                }
+                subspace_dimension = next_dimension;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Selected Hermitian eigenpairs.
+///
+/// Small problems use a dense real-symmetric decomposition. Larger problems
+/// use a matrix-free, fully reorthogonalized Lanczos backend; shift targets
+/// apply a restarted GMRES inverse without materializing the operator.
+pub fn eigsh<O>(operator: &O, options: EigshOptions) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let shape = operator.shape();
+    if shape.0 != shape.1 {
+        return Err(QmbedError::DimensionMismatch(
+            "eigsh requires a square operator".into(),
+        ));
+    }
+    options.validate(shape.0)?;
+    if !use_dense_eigsh(shape.0, &options) {
+        return expanding_lanczos_eigsh(operator, &options, None);
+    }
+    dense_eigsh(operator, &options)
 }
 
 pub fn eigsh_with_initial<O>(
@@ -1013,15 +1404,11 @@ where
         ));
     }
     options.validate(shape.0)?;
-    if initial.len() != shape.0 {
-        return Err(QmbedError::DimensionMismatch(
-            "eigsh initial vector does not match the operator".into(),
-        ));
-    }
+    validate_eigsh_initial(initial, shape.0)?;
     if use_dense_eigsh(shape.0, &options) {
         return eigsh(operator, options);
     }
-    lanczos_eigsh(operator, &options, Some(initial))
+    expanding_lanczos_eigsh(operator, &options, Some(initial))
 }
 
 pub fn eigsh_values<O>(operator: &O, options: EigshOptions) -> Result<Vec<f64>>
@@ -1069,6 +1456,22 @@ pub struct StateTrajectory {
     pub states: Vec<Vec<Complex64>>,
 }
 
+/// Algorithmic work performed by Hermitian Krylov time evolution.
+///
+/// Wall time depends on the host and sparse backend. These counters expose the
+/// portable cost drivers needed by verification and performance-regression
+/// suites without changing the existing [`evolve`] return contract.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EvolutionDiagnostics {
+    pub lanczos_projections: usize,
+    pub matrix_vector_products: usize,
+    pub real_lanczos_projections: usize,
+    pub real_matrix_vector_products: usize,
+    pub accepted_substeps: usize,
+    pub rejected_trial_intervals: usize,
+    pub maximum_estimated_error: f64,
+}
+
 /// Column-oriented batch trajectory: `states[time_index][column_index]`.
 #[derive(Clone, Debug)]
 pub struct StateBatchTrajectory {
@@ -1107,6 +1510,52 @@ pub struct LanczosDecomposition {
     pub basis: Vec<Vec<Complex64>>,
     pub diagonal: Vec<f64>,
     pub off_diagonal: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LanczosRitzDecomposition {
+    pub decomposition: LanczosDecomposition,
+    pub eigenvalues: Vec<f64>,
+    /// Column-oriented eigenvectors of the real symmetric tridiagonal matrix.
+    pub eigenvectors: Vec<Vec<f64>>,
+}
+
+impl LanczosRitzDecomposition {
+    pub fn linear_combination(&self, coefficients: &[Complex64]) -> Result<Vec<Complex64>> {
+        linear_combination_qt(&self.decomposition.basis, coefficients)
+    }
+
+    /// Apply `exp(coefficient * T)` to the first Krylov vector and lift it
+    /// through the stored Lanczos basis.
+    pub fn exponential_action(&self, coefficient: Complex64) -> Result<Vec<Complex64>> {
+        if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+            return Err(QmbedError::InvalidOptions(
+                "Lanczos exponential coefficient must be finite".into(),
+            ));
+        }
+        let dimension = self.eigenvalues.len();
+        if dimension == 0
+            || self.eigenvectors.len() != dimension
+            || self
+                .eigenvectors
+                .iter()
+                .any(|vector| vector.len() != dimension)
+        {
+            return Err(QmbedError::InternalState(
+                "Lanczos Ritz eigensystem is inconsistent".into(),
+            ));
+        }
+        let mut coefficients = vec![Complex64::new(0.0, 0.0); dimension];
+        for (eigenvalue, eigenvector) in self.eigenvalues.iter().zip(&self.eigenvectors) {
+            let weight = Complex64::new(eigenvector[0], 0.0)
+                * (coefficient * *eigenvalue).exp()
+                * self.decomposition.initial_norm;
+            for (value, component) in coefficients.iter_mut().zip(eigenvector) {
+                *value += weight * *component;
+            }
+        }
+        self.linear_combination(&coefficients)
+    }
 }
 
 pub struct LanczosIter<'a, O>
@@ -1152,9 +1601,18 @@ where
                 *value -= self.previous_beta * *basis_value;
             }
         }
-        // Two-pass full reorthogonalization keeps the public basis usable for
-        // degenerate and long Krylov runs, not only for tridiagonal scalars.
-        for _ in 0..2 {
+        let norm_before_reorthogonalization = vector_norm(&applied);
+        for basis_vector in self.history.iter().chain(std::iter::once(&current)) {
+            let correction = inner(basis_vector, &applied);
+            for (value, basis_value) in applied.iter_mut().zip(basis_vector) {
+                *value -= correction * *basis_value;
+            }
+        }
+        let norm_after_first_pass = vector_norm(&applied);
+        if norm_before_reorthogonalization > f64::EPSILON
+            && norm_after_first_pass
+                <= DGKS_REORTHOGONALIZATION_THRESHOLD * norm_before_reorthogonalization
+        {
             for basis_vector in self.history.iter().chain(std::iter::once(&current)) {
                 let correction = inner(basis_vector, &applied);
                 for (value, basis_value) in applied.iter_mut().zip(basis_vector) {
@@ -1239,6 +1697,51 @@ where
     })
 }
 
+/// Full Lanczos basis plus the sorted eigensystem of its tridiagonal
+/// projection. This is the reusable native object behind compatibility
+/// interfaces which expose both Ritz data and later reconstruction.
+pub fn lanczos_ritz<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: LanczosOptions,
+) -> Result<LanczosRitzDecomposition>
+where
+    O: LinearOperator + ?Sized,
+{
+    let decomposition = lanczos_full(operator, initial, options)?;
+    let dimension = decomposition.diagonal.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(dimension, dimension);
+    for index in 0..dimension {
+        tridiagonal[(index, index)] = decomposition.diagonal[index];
+        if index + 1 < dimension {
+            tridiagonal[(index, index + 1)] = decomposition.off_diagonal[index];
+            tridiagonal[(index + 1, index)] = decomposition.off_diagonal[index];
+        }
+    }
+    let eigensystem = SymmetricEigen::new(tridiagonal);
+    let mut order = (0..dimension).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        eigensystem.eigenvalues[*left].total_cmp(&eigensystem.eigenvalues[*right])
+    });
+    let eigenvalues = order
+        .iter()
+        .map(|index| eigensystem.eigenvalues[*index])
+        .collect();
+    let eigenvectors = order
+        .iter()
+        .map(|column| {
+            (0..dimension)
+                .map(|row| eigensystem.eigenvectors[(row, *column)])
+                .collect()
+        })
+        .collect();
+    Ok(LanczosRitzDecomposition {
+        decomposition,
+        eigenvalues,
+        eigenvectors,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpmOptions {
     pub times: Vec<f64>,
@@ -1262,9 +1765,28 @@ impl From<ExpmOptions> for EvolutionOptions {
 
 struct LanczosProjection {
     initial_norm: f64,
-    basis: Vec<Vec<Complex64>>,
+    basis: ProjectedBasis,
+    residual_beta: f64,
     eigenvalues: Vec<f64>,
     eigenvectors: DMatrix<f64>,
+}
+
+enum ProjectedBasis {
+    Real(Vec<Vec<f64>>),
+    Complex(Vec<Vec<Complex64>>),
+}
+
+impl ProjectedBasis {
+    fn len(&self) -> usize {
+        match self {
+            Self::Real(basis) => basis.len(),
+            Self::Complex(basis) => basis.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub(crate) fn lanczos_spectral_measure(
@@ -1299,10 +1821,14 @@ fn lanczos_projection(
     if initial_norm <= f64::EPSILON {
         return Ok(LanczosProjection {
             initial_norm,
-            basis: Vec::new(),
+            basis: ProjectedBasis::Complex(Vec::new()),
+            residual_beta: 0.0,
             eigenvalues: Vec::new(),
             eigenvectors: DMatrix::zeros(0, 0),
         });
+    }
+    if operator.is_real() && initial.iter().all(|value| value.im == 0.0) {
+        return lanczos_projection_real(operator, initial, dimension);
     }
     let krylov_dimension = dimension.min(initial.len()).max(1);
     let mut first = initial.to_vec();
@@ -1313,6 +1839,7 @@ fn lanczos_projection(
     basis.push(first);
     let mut alphas = Vec::with_capacity(krylov_dimension);
     let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
+    let mut residual_beta = 0.0;
     let mut applied = vec![Complex64::new(0.0, 0.0); initial.len()];
 
     for iteration in 0..krylov_dimension {
@@ -1335,6 +1862,7 @@ fn lanczos_projection(
         // orthogonality, so avoiding O(m^2 n) reorthogonalization is essential
         // for the 100-step paper workflows.
         let beta = vector_norm(&applied);
+        residual_beta = beta;
         if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
             break;
         }
@@ -1357,21 +1885,85 @@ fn lanczos_projection(
     let decomposition = SymmetricEigen::new(tridiagonal);
     Ok(LanczosProjection {
         initial_norm,
-        basis,
+        basis: ProjectedBasis::Complex(basis),
+        residual_beta,
         eigenvalues: decomposition.eigenvalues.as_slice().to_vec(),
         eigenvectors: decomposition.eigenvectors,
     })
 }
 
-fn projected_exponential_action(
+fn lanczos_projection_real(
+    operator: &(impl LinearOperator + ?Sized),
+    initial: &[Complex64],
+    dimension: usize,
+) -> Result<LanczosProjection> {
+    let initial_norm = initial
+        .iter()
+        .map(|value| value.re * value.re)
+        .sum::<f64>()
+        .sqrt();
+    let krylov_dimension = dimension.min(initial.len()).max(1);
+    let mut basis = Vec::with_capacity(krylov_dimension);
+    basis.push(
+        initial
+            .iter()
+            .map(|value| value.re / initial_norm)
+            .collect::<Vec<_>>(),
+    );
+    let mut alphas = Vec::with_capacity(krylov_dimension);
+    let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
+    let mut residual_beta = 0.0;
+    let mut applied = vec![0.0; initial.len()];
+
+    for iteration in 0..krylov_dimension {
+        operator.apply_real(&basis[iteration], &mut applied)?;
+        let alpha = real_inner(&basis[iteration], &applied);
+        alphas.push(alpha);
+        for (value, basis_value) in applied.iter_mut().zip(&basis[iteration]) {
+            *value -= alpha * *basis_value;
+        }
+        if iteration > 0 {
+            let previous_beta = betas[iteration - 1];
+            for (value, basis_value) in applied.iter_mut().zip(&basis[iteration - 1]) {
+                *value -= previous_beta * *basis_value;
+            }
+        }
+        let beta = real_vector_norm(&applied);
+        residual_beta = beta;
+        if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
+            break;
+        }
+        betas.push(beta);
+        for value in &mut applied {
+            *value /= beta;
+        }
+        basis.push(applied.clone());
+    }
+
+    let size = basis.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = alphas[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = betas[index];
+            tridiagonal[(index + 1, index)] = betas[index];
+        }
+    }
+    let decomposition = SymmetricEigen::new(tridiagonal);
+    Ok(LanczosProjection {
+        initial_norm,
+        basis: ProjectedBasis::Real(basis),
+        residual_beta,
+        eigenvalues: decomposition.eigenvalues.as_slice().to_vec(),
+        eigenvectors: decomposition.eigenvectors,
+    })
+}
+
+fn projected_exponential_coefficients(
     projection: &LanczosProjection,
     interval: f64,
     hamiltonian: bool,
-    ambient_dimension: usize,
 ) -> Vec<Complex64> {
-    if projection.basis.is_empty() {
-        return vec![Complex64::new(0.0, 0.0); ambient_dimension];
-    }
     let size = projection.basis.len();
     let mut coefficients = vec![Complex64::new(0.0, 0.0); size];
     for eigen_index in 0..size {
@@ -1385,10 +1977,34 @@ fn projected_exponential_action(
             *coefficient += projection.eigenvectors[(basis_index, eigen_index)] * weight;
         }
     }
+    coefficients
+}
+
+fn projected_exponential_action_from_coefficients(
+    projection: &LanczosProjection,
+    coefficients: &[Complex64],
+    hamiltonian: bool,
+    ambient_dimension: usize,
+) -> Vec<Complex64> {
+    if projection.basis.is_empty() {
+        return vec![Complex64::new(0.0, 0.0); ambient_dimension];
+    }
     let mut output = vec![Complex64::new(0.0, 0.0); ambient_dimension];
-    for (coefficient, vector) in coefficients.iter().zip(&projection.basis) {
-        for (value, basis_value) in output.iter_mut().zip(vector) {
-            *value += *coefficient * *basis_value;
+    match &projection.basis {
+        ProjectedBasis::Real(basis) => {
+            for (coefficient, vector) in coefficients.iter().zip(basis) {
+                for (value, basis_value) in output.iter_mut().zip(vector) {
+                    value.re += coefficient.re * *basis_value;
+                    value.im += coefficient.im * *basis_value;
+                }
+            }
+        }
+        ProjectedBasis::Complex(basis) => {
+            for (coefficient, vector) in coefficients.iter().zip(basis) {
+                for (value, basis_value) in output.iter_mut().zip(vector) {
+                    *value += *coefficient * *basis_value;
+                }
+            }
         }
     }
     if hamiltonian {
@@ -1401,6 +2017,208 @@ fn projected_exponential_action(
         }
     }
     output
+}
+
+fn projected_exponential_action(
+    projection: &LanczosProjection,
+    interval: f64,
+    hamiltonian: bool,
+    ambient_dimension: usize,
+) -> Vec<Complex64> {
+    let coefficients = projected_exponential_coefficients(projection, interval, hamiltonian);
+    projected_exponential_action_from_coefficients(
+        projection,
+        &coefficients,
+        hamiltonian,
+        ambient_dimension,
+    )
+}
+
+fn projected_residual_amplitude(projection: &LanczosProjection, interval: f64) -> f64 {
+    let Some(last_index) = projection.basis.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let mut amplitude = Complex64::new(0.0, 0.0);
+    for eigen_index in 0..projection.eigenvalues.len() {
+        let phase = Complex64::new(0.0, -interval * projection.eigenvalues[eigen_index]).exp();
+        amplitude += projection.initial_norm
+            * projection.eigenvectors[(0, eigen_index)]
+            * projection.eigenvectors[(last_index, eigen_index)]
+            * phase;
+    }
+    amplitude.norm()
+}
+
+/// A posteriori Hermitian Krylov error estimate.
+///
+/// For `V_m exp(-i t T_m) e_1`, the residual norm is
+/// `beta_m |e_m^T exp(-i t T_m) e_1|`. Duhamel's formula bounds the state
+/// error by its time integral because the exact Hermitian propagator is
+/// unitary. The integral is evaluated entirely in the small projected space,
+/// so rejected trial intervals never materialize ambient-dimension vectors.
+fn projected_exponential_error_bound(
+    projection: &LanczosProjection,
+    interval: f64,
+    ambient_dimension: usize,
+) -> f64 {
+    let duration = interval.abs();
+    if duration <= f64::EPSILON
+        || projection.basis.is_empty()
+        || projection.basis.len() == ambient_dimension
+        || projection.residual_beta <= 1.0e-14
+    {
+        return 0.0;
+    }
+
+    let (minimum, maximum) = projection.eigenvalues.iter().copied().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+    );
+    let phase_span = duration * (maximum - minimum).max(0.0);
+    let oscillations = (phase_span / std::f64::consts::PI).ceil().min(60.0) as usize;
+    let mut intervals = (16 + 4 * oscillations).min(256);
+    if intervals % 2 != 0 {
+        intervals += 1;
+    }
+    let direction = interval.signum();
+    let step = duration / intervals as f64;
+    let mut integral = 0.0;
+    for index in 0..=intervals {
+        let weight = if index == 0 || index == intervals {
+            1.0
+        } else if index % 2 == 0 {
+            2.0
+        } else {
+            4.0
+        };
+        integral +=
+            weight * projected_residual_amplitude(projection, direction * step * index as f64);
+    }
+    // Simpson quadrature is highly accurate for the smooth projected
+    // residual. A modest safety factor protects the accept/reject boundary
+    // from quadrature and finite-precision Lanczos error.
+    1.25 * projection.residual_beta * step * integral / 3.0
+}
+
+fn evolve_hermitian_adaptive_grid(
+    operator: &(impl LinearOperator + ?Sized),
+    initial: &[Complex64],
+    options: &EvolutionOptions,
+) -> Result<(StateTrajectory, EvolutionDiagnostics)> {
+    let mut states = Vec::with_capacity(options.times.len());
+    let mut current_state = initial.to_vec();
+    let mut current_time = 0.0;
+    let mut output_index = 0;
+    let mut substeps = 0;
+    let mut diagnostics = EvolutionDiagnostics::default();
+    let local_tolerance = options.tolerance / options.times.len().max(1) as f64;
+
+    while output_index < options.times.len() {
+        let target_time = options.times[output_index];
+        if (target_time - current_time).abs() <= 16.0 * f64::EPSILON * target_time.abs().max(1.0) {
+            states.push(current_state.clone());
+            current_time = target_time;
+            output_index += 1;
+            continue;
+        }
+        if substeps >= options.max_substeps {
+            return Err(QmbedError::NonConvergence {
+                iterations: substeps,
+                residual: (target_time - current_time).abs(),
+            });
+        }
+
+        let projection = lanczos_projection(operator, &current_state, options.krylov_dimension)?;
+        diagnostics.lanczos_projections += 1;
+        diagnostics.matrix_vector_products += projection.basis.len();
+        if matches!(&projection.basis, ProjectedBasis::Real(_)) {
+            diagnostics.real_lanczos_projections += 1;
+            diagnostics.real_matrix_vector_products += projection.basis.len();
+        }
+        let scale = vector_norm(&current_state).max(1.0);
+        let threshold = local_tolerance * scale;
+
+        let mut accepted = Vec::new();
+        for &time in &options.times[output_index..] {
+            let interval = time - current_time;
+            let error =
+                projected_exponential_error_bound(&projection, interval, current_state.len());
+            diagnostics.maximum_estimated_error = diagnostics.maximum_estimated_error.max(error);
+            if error > threshold {
+                diagnostics.rejected_trial_intervals += 1;
+                break;
+            }
+            let candidate =
+                projected_exponential_action(&projection, interval, true, current_state.len());
+            accepted.push((time, candidate));
+        }
+        if !accepted.is_empty() {
+            for (_, candidate) in &accepted {
+                states.push(candidate.clone());
+            }
+            let (time, state) = accepted.pop().expect("accepted is nonempty");
+            current_time = time;
+            current_state = state;
+            output_index += accepted.len() + 1;
+            substeps += 1;
+            diagnostics.accepted_substeps += 1;
+            continue;
+        }
+
+        let target_interval = target_time - current_time;
+        let direction = target_interval.signum();
+        let minimum_interval = 16.0 * f64::EPSILON * target_time.abs().max(1.0);
+        let mut rejected_magnitude = target_interval.abs();
+        let mut accepted_magnitude = rejected_magnitude;
+        loop {
+            let interval = direction * accepted_magnitude;
+            let error =
+                projected_exponential_error_bound(&projection, interval, current_state.len());
+            diagnostics.maximum_estimated_error = diagnostics.maximum_estimated_error.max(error);
+            if error <= threshold || accepted_magnitude <= minimum_interval {
+                break;
+            }
+            diagnostics.rejected_trial_intervals += 1;
+            rejected_magnitude = accepted_magnitude;
+            accepted_magnitude *= 0.5;
+        }
+
+        // Halving finds a safe bracket but can undershoot the largest stable
+        // step by almost a factor of two. Refine only in projected space so a
+        // projection advances as far as its error budget permits.
+        if accepted_magnitude > minimum_interval && rejected_magnitude > accepted_magnitude {
+            for _ in 0..8 {
+                let trial_magnitude = 0.5 * (accepted_magnitude + rejected_magnitude);
+                let error = projected_exponential_error_bound(
+                    &projection,
+                    direction * trial_magnitude,
+                    current_state.len(),
+                );
+                diagnostics.maximum_estimated_error =
+                    diagnostics.maximum_estimated_error.max(error);
+                if error <= threshold {
+                    accepted_magnitude = trial_magnitude;
+                } else {
+                    diagnostics.rejected_trial_intervals += 1;
+                    rejected_magnitude = trial_magnitude;
+                }
+            }
+        }
+
+        let interval = direction * accepted_magnitude;
+        current_time += interval;
+        current_state =
+            projected_exponential_action(&projection, interval, true, current_state.len());
+        substeps += 1;
+        diagnostics.accepted_substeps += 1;
+    }
+    Ok((
+        StateTrajectory {
+            times: options.times.clone(),
+            states,
+        },
+        diagnostics,
+    ))
 }
 
 pub(crate) fn expm_action(
@@ -1446,69 +2264,22 @@ pub(crate) fn expm_action_complex(
     tolerance: f64,
     max_substeps: usize,
 ) -> Result<Vec<Complex64>> {
-    let shape = operator.shape();
-    if shape.0 != shape.1 || initial.len() != shape.0 {
-        return Err(QmbedError::DimensionMismatch(
-            "exponential action requires a square operator matching the state".into(),
-        ));
-    }
-    if !exponent.re.is_finite()
-        || !exponent.im.is_finite()
-        || krylov_dimension == 0
-        || !tolerance.is_finite()
-        || tolerance <= 0.0
-        || max_substeps == 0
-    {
-        return Err(QmbedError::InvalidOptions(
-            "invalid exponential coefficient or numerical controls".into(),
-        ));
-    }
-    if exponent.norm() <= f64::EPSILON {
-        return Ok(initial.to_vec());
-    }
-    let requested_steps = exponent.norm().ceil().max(1.0) as usize;
-    if requested_steps > max_substeps {
-        return Err(QmbedError::NonConvergence {
-            iterations: max_substeps,
-            residual: exponent.norm(),
-        });
-    }
-    let factor = exponent / requested_steps as f64;
-    let mut state = initial.to_vec();
-    let mut applied = vec![Complex64::new(0.0, 0.0); shape.0];
-    for _ in 0..requested_steps {
-        let mut sum = state.clone();
-        let mut term = state.clone();
-        for order in 1..=krylov_dimension {
-            operator.apply(&term, &mut applied)?;
-            let scale = factor / order as f64;
-            for (next, value) in term.iter_mut().zip(&applied) {
-                *next = scale * *value;
-            }
-            for (total, value) in sum.iter_mut().zip(&term) {
-                *total += *value;
-            }
-            if vector_norm(&term) <= tolerance * vector_norm(&sum).max(1.0) {
-                break;
-            }
-            if order == krylov_dimension {
-                return Err(QmbedError::NonConvergence {
-                    iterations: order,
-                    residual: vector_norm(&term),
-                });
-            }
-        }
-        state = sum;
-    }
-    Ok(state)
+    ExpmActionPlan::new(
+        operator,
+        exponent,
+        krylov_dimension,
+        tolerance,
+        max_substeps,
+    )?
+    .apply(operator, initial)
 }
 
 /// Time evolution on an arbitrary square stored or matrix-free operator.
-pub fn evolve<O>(
+pub fn evolve_with_diagnostics<O>(
     operator: &O,
     initial: &[Complex64],
     options: EvolutionOptions,
-) -> Result<StateTrajectory>
+) -> Result<(StateTrajectory, EvolutionDiagnostics)>
 where
     O: LinearOperator + ?Sized,
 {
@@ -1521,19 +2292,7 @@ where
     }
     let mut states = Vec::with_capacity(options.times.len());
     if options.hamiltonian {
-        let projection = lanczos_projection(operator, initial, options.krylov_dimension)?;
-        for &time in &options.times {
-            states.push(projected_exponential_action(
-                &projection,
-                time,
-                true,
-                initial.len(),
-            ));
-        }
-        return Ok(StateTrajectory {
-            times: options.times,
-            states,
-        });
+        return evolve_hermitian_adaptive_grid(operator, initial, &options);
     }
     let mut state = initial.to_vec();
     let mut previous_time = 0.0;
@@ -1542,14 +2301,29 @@ where
         states.push(state.clone());
         previous_time = time;
     }
-    Ok(StateTrajectory {
-        times: options.times,
-        states,
-    })
+    Ok((
+        StateTrajectory {
+            times: options.times,
+            states,
+        },
+        EvolutionDiagnostics::default(),
+    ))
 }
 
-/// Exponential action over a time grid. Hermitian Hamiltonians use one
-/// reusable Lanczos projection for the complete grid.
+/// Time evolution on an arbitrary square stored or matrix-free operator.
+pub fn evolve<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: EvolutionOptions,
+) -> Result<StateTrajectory>
+where
+    O: LinearOperator + ?Sized,
+{
+    Ok(evolve_with_diagnostics(operator, initial, options)?.0)
+}
+
+/// Exponential action over a time grid. Hermitian Hamiltonians reuse each
+/// residual-controlled Lanczos projection across the longest accepted prefix.
 pub fn expm_multiply<O>(
     operator: &O,
     initial: &[Complex64],
@@ -1705,51 +2479,307 @@ pub struct ThermalObservableIteration {
     pub identity: Vec<f64>,
 }
 
-fn lanczos_ritz_data<O>(
-    hamiltonian: &O,
-    initial: &[Complex64],
-    options: LanczosOptions,
-) -> Result<(LanczosDecomposition, SymmetricEigen<f64, nalgebra::Dyn>)>
-where
-    O: LinearOperator + ?Sized,
-{
-    let decomposition = lanczos_full(hamiltonian, initial, options)?;
-    let size = decomposition.diagonal.len();
-    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
-    for index in 0..size {
-        tridiagonal[(index, index)] = decomposition.diagonal[index];
-        if index + 1 < size {
-            tridiagonal[(index, index + 1)] = decomposition.off_diagonal[index];
-            tridiagonal[(index + 1, index)] = decomposition.off_diagonal[index];
-        }
-    }
-    Ok((decomposition, SymmetricEigen::new(tridiagonal)))
+/// Finite-temperature contraction applied to a precomputed Lanczos
+/// eigensystem and observable projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThermalLanczosMethod {
+    Ftlm,
+    Ltlm,
 }
 
-fn validate_thermal_observables(
-    observables: &[(String, &dyn LinearOperator)],
-    dimension: usize,
+/// Observable data after projecting the language- or backend-owned action
+/// into a Lanczos basis.
+///
+/// FTLM stores `m` overlaps `⟨q_i|A|q_0⟩`. LTLM stores the `m × m` matrix
+/// `⟨q_j|A|q_i⟩` in input-major order (`i * m + j`). This is the narrow
+/// interface needed by the thermal contraction and does not require Rust to
+/// own the original observable.
+#[derive(Clone, Debug)]
+pub struct ProjectedThermalObservable {
+    pub name: String,
+    pub matrix_elements: Vec<Complex64>,
+}
+
+fn validate_thermal_ritz_data(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<f64>],
+    observables: &[ProjectedThermalObservable],
     inverse_temperatures: &[f64],
+    method: ThermalLanczosMethod,
 ) -> Result<()> {
+    let dimension = eigenvalues.len();
+    if dimension == 0
+        || eigenvalues.iter().any(|value| !value.is_finite())
+        || eigenvectors.len() != dimension
+        || eigenvectors.iter().any(|vector| {
+            vector.len() != dimension || vector.iter().any(|value| !value.is_finite())
+        })
+    {
+        return Err(QmbedError::DimensionMismatch(
+            "thermal Lanczos contraction requires a finite square Ritz eigensystem".into(),
+        ));
+    }
     if observables.is_empty()
         || inverse_temperatures.is_empty()
-        || inverse_temperatures
-            .iter()
-            .any(|beta| !beta.is_finite() || *beta < 0.0)
+        || inverse_temperatures.iter().any(|beta| !beta.is_finite())
     {
         return Err(QmbedError::InvalidOptions(
             "thermal observables and inverse temperatures must be nonempty and valid".into(),
         ));
     }
     let mut names = std::collections::HashSet::new();
-    for (name, observable) in observables {
-        if name.is_empty() || !names.insert(name) || observable.shape() != (dimension, dimension) {
+    let expected = match method {
+        ThermalLanczosMethod::Ftlm => dimension,
+        ThermalLanczosMethod::Ltlm => dimension
+            .checked_mul(dimension)
+            .ok_or_else(|| QmbedError::DimensionMismatch("Lanczos dimension overflows".into()))?,
+    };
+    for observable in observables {
+        if observable.name.is_empty()
+            || !names.insert(observable.name.as_str())
+            || observable.matrix_elements.len() != expected
+            || observable
+                .matrix_elements
+                .iter()
+                .any(|value| !value.re.is_finite() || !value.im.is_finite())
+        {
             return Err(QmbedError::DimensionMismatch(
-                "thermal observables require unique names and matching square shapes".into(),
+                "thermal observables require unique names and matching finite projections".into(),
             ));
         }
     }
     Ok(())
+}
+
+fn ftlm_projected_contraction(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<f64>],
+    observables: &[ProjectedThermalObservable],
+    inverse_temperatures: &[f64],
+) -> ThermalObservableIteration {
+    let dimension = eigenvalues.len();
+    let coefficients = inverse_temperatures
+        .iter()
+        .map(|beta| {
+            (0..dimension)
+                .map(|row| {
+                    (0..dimension)
+                        .map(|eigen| {
+                            eigenvectors[eigen][row]
+                                * eigenvectors[eigen][0]
+                                * (-beta * eigenvalues[eigen]).exp()
+                        })
+                        .sum::<f64>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let identity = coefficients
+        .iter()
+        .map(|coefficient| coefficient[0])
+        .collect();
+    let values = observables
+        .iter()
+        .map(|observable| {
+            let estimates = coefficients
+                .iter()
+                .map(|coefficient| {
+                    observable
+                        .matrix_elements
+                        .iter()
+                        .zip(coefficient)
+                        .map(|(overlap, coefficient)| *overlap * *coefficient)
+                        .sum()
+                })
+                .collect();
+            (observable.name.clone(), estimates)
+        })
+        .collect();
+    ThermalObservableIteration {
+        inverse_temperatures: inverse_temperatures.to_vec(),
+        values,
+        identity,
+    }
+}
+
+fn ltlm_effective_dimension(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<f64>],
+    inverse_temperatures: &[f64],
+) -> usize {
+    let minimum_beta = inverse_temperatures
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let maximum_first_component = eigenvectors
+        .iter()
+        .map(|vector| vector[0].abs())
+        .fold(0.0_f64, f64::max);
+    eigenvalues
+        .iter()
+        .position(|energy| (-energy * minimum_beta).exp() * maximum_first_component < f64::EPSILON)
+        .unwrap_or(eigenvalues.len())
+}
+
+fn ltlm_projected_contraction(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<f64>],
+    observables: &[ProjectedThermalObservable],
+    inverse_temperatures: &[f64],
+) -> Result<ThermalObservableIteration> {
+    let full_dimension = eigenvalues.len();
+    let dimension = ltlm_effective_dimension(eigenvalues, eigenvectors, inverse_temperatures);
+    if dimension == 0 {
+        return Err(QmbedError::NonConvergence {
+            iterations: 0,
+            residual: 0.0,
+        });
+    }
+    let identity = inverse_temperatures
+        .iter()
+        .map(|beta| {
+            (0..dimension)
+                .map(|eigen| eigenvectors[eigen][0].powi(2) * (-beta * eigenvalues[eigen]).exp())
+                .sum()
+        })
+        .collect();
+    let mut values = std::collections::HashMap::new();
+    for observable in observables {
+        let mut transformed = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+        for left in 0..dimension {
+            for right in 0..dimension {
+                let mut value = Complex64::new(0.0, 0.0);
+                for input in 0..dimension {
+                    for bra in 0..dimension {
+                        value += eigenvectors[left][input]
+                            * observable.matrix_elements[input * full_dimension + bra]
+                            * eigenvectors[right][bra];
+                    }
+                }
+                transformed[left * dimension + right] = value;
+            }
+        }
+        let estimates = inverse_temperatures
+            .iter()
+            .map(|beta| {
+                let weights = (0..dimension)
+                    .map(|eigen| eigenvectors[eigen][0] * (-0.5 * beta * eigenvalues[eigen]).exp())
+                    .collect::<Vec<_>>();
+                let mut estimate = Complex64::new(0.0, 0.0);
+                for left in 0..dimension {
+                    for right in 0..dimension {
+                        estimate +=
+                            weights[left] * transformed[left * dimension + right] * weights[right];
+                    }
+                }
+                estimate
+            })
+            .collect();
+        values.insert(observable.name.clone(), estimates);
+    }
+    Ok(ThermalObservableIteration {
+        inverse_temperatures: inverse_temperatures.to_vec(),
+        values,
+        identity,
+    })
+}
+
+/// Contract projected observables with an existing Lanczos Ritz eigensystem.
+///
+/// `eigenvectors` are column-oriented, matching [`LanczosRitzDecomposition`].
+/// This function is useful at language boundaries where an observable may be
+/// callback-owned but its action can still be projected into the Krylov basis.
+pub fn thermal_observable_contraction(
+    method: ThermalLanczosMethod,
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<f64>],
+    observables: &[ProjectedThermalObservable],
+    inverse_temperatures: &[f64],
+) -> Result<ThermalObservableIteration> {
+    validate_thermal_ritz_data(
+        eigenvalues,
+        eigenvectors,
+        observables,
+        inverse_temperatures,
+        method,
+    )?;
+    match method {
+        ThermalLanczosMethod::Ftlm => Ok(ftlm_projected_contraction(
+            eigenvalues,
+            eigenvectors,
+            observables,
+            inverse_temperatures,
+        )),
+        ThermalLanczosMethod::Ltlm => {
+            ltlm_projected_contraction(eigenvalues, eigenvectors, observables, inverse_temperatures)
+        }
+    }
+}
+
+impl LanczosRitzDecomposition {
+    /// Apply observables to the stored Krylov basis and return only the
+    /// projected data required by the selected thermal contraction.
+    pub fn project_thermal_observables(
+        &self,
+        observables: &[(String, &dyn LinearOperator)],
+        method: ThermalLanczosMethod,
+    ) -> Result<Vec<ProjectedThermalObservable>> {
+        let dimension = self.decomposition.basis.first().map_or(0, Vec::len);
+        if observables.is_empty() {
+            return Err(QmbedError::InvalidOptions(
+                "thermal observables must be nonempty".into(),
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut projected = Vec::with_capacity(observables.len());
+        for (name, observable) in observables {
+            if name.is_empty()
+                || !names.insert(name.as_str())
+                || observable.shape() != (dimension, dimension)
+            {
+                return Err(QmbedError::DimensionMismatch(
+                    "thermal observables require unique names and matching square shapes".into(),
+                ));
+            }
+            let input_count = match method {
+                ThermalLanczosMethod::Ftlm => 1,
+                ThermalLanczosMethod::Ltlm => self.decomposition.basis.len(),
+            };
+            let mut matrix_elements =
+                Vec::with_capacity(input_count * self.decomposition.basis.len());
+            let mut applied = vec![Complex64::new(0.0, 0.0); dimension];
+            for input in 0..input_count {
+                observable.apply(&self.decomposition.basis[input], &mut applied)?;
+                matrix_elements.extend(
+                    self.decomposition
+                        .basis
+                        .iter()
+                        .map(|bra| inner(bra, &applied)),
+                );
+            }
+            projected.push(ProjectedThermalObservable {
+                name: name.clone(),
+                matrix_elements,
+            });
+        }
+        Ok(projected)
+    }
+
+    pub fn thermal_observable_iteration(
+        &self,
+        method: ThermalLanczosMethod,
+        observables: &[(String, &dyn LinearOperator)],
+        inverse_temperatures: &[f64],
+    ) -> Result<ThermalObservableIteration> {
+        let projected = self.project_thermal_observables(observables, method)?;
+        thermal_observable_contraction(
+            method,
+            &self.eigenvalues,
+            &self.eigenvectors,
+            &projected,
+            inverse_temperatures,
+        )
+    }
 }
 
 /// QuSpin-compatible one-sided FTLM observable estimates.
@@ -1763,52 +2793,12 @@ pub fn ftlm_observable_iteration<O>(
 where
     O: LinearOperator + ?Sized,
 {
-    validate_thermal_observables(observables, initial.len(), inverse_temperatures)?;
-    let (decomposition, ritz) = lanczos_ritz_data(hamiltonian, initial, options)?;
-    let size = decomposition.basis.len();
-    let identity = inverse_temperatures
-        .iter()
-        .map(|beta| {
-            (0..size)
-                .map(|eigen| {
-                    ritz.eigenvectors[(0, eigen)].powi(2) * (-beta * ritz.eigenvalues[eigen]).exp()
-                })
-                .sum()
-        })
-        .collect();
-    let mut values = std::collections::HashMap::new();
-    for (name, observable) in observables {
-        let mut applied = vec![Complex64::new(0.0, 0.0); initial.len()];
-        observable.apply(&decomposition.basis[0], &mut applied)?;
-        let overlaps: Vec<_> = decomposition
-            .basis
-            .iter()
-            .map(|vector| inner(vector, &applied))
-            .collect();
-        let estimates = inverse_temperatures
-            .iter()
-            .map(|beta| {
-                (0..size)
-                    .map(|row| {
-                        let coefficient = (0..size)
-                            .map(|eigen| {
-                                ritz.eigenvectors[(row, eigen)]
-                                    * ritz.eigenvectors[(0, eigen)]
-                                    * (-beta * ritz.eigenvalues[eigen]).exp()
-                            })
-                            .sum::<f64>();
-                        overlaps[row] * coefficient
-                    })
-                    .sum()
-            })
-            .collect();
-        values.insert(name.clone(), estimates);
-    }
-    Ok(ThermalObservableIteration {
-        inverse_temperatures: inverse_temperatures.to_vec(),
-        values,
-        identity,
-    })
+    let decomposition = lanczos_ritz(hamiltonian, initial, options)?;
+    decomposition.thermal_observable_iteration(
+        ThermalLanczosMethod::Ftlm,
+        observables,
+        inverse_temperatures,
+    )
 }
 
 /// Symmetric low-temperature Lanczos observable estimates.
@@ -1822,63 +2812,12 @@ pub fn ltlm_observable_iteration<O>(
 where
     O: LinearOperator + ?Sized,
 {
-    validate_thermal_observables(observables, initial.len(), inverse_temperatures)?;
-    let (decomposition, ritz) = lanczos_ritz_data(hamiltonian, initial, options)?;
-    let size = decomposition.basis.len();
-    let identity = inverse_temperatures
-        .iter()
-        .map(|beta| {
-            (0..size)
-                .map(|eigen| {
-                    ritz.eigenvectors[(0, eigen)].powi(2) * (-beta * ritz.eigenvalues[eigen]).exp()
-                })
-                .sum()
-        })
-        .collect();
-    let mut values = std::collections::HashMap::new();
-    for (name, observable) in observables {
-        let mut matrix_elements = vec![Complex64::new(0.0, 0.0); size * size];
-        let mut applied = vec![Complex64::new(0.0, 0.0); initial.len()];
-        for row in 0..size {
-            observable.apply(&decomposition.basis[row], &mut applied)?;
-            for column in 0..size {
-                matrix_elements[row * size + column] =
-                    inner(&decomposition.basis[column], &applied);
-            }
-        }
-        let estimates = inverse_temperatures
-            .iter()
-            .map(|beta| {
-                let weights: Vec<_> = (0..size)
-                    .map(|eigen| {
-                        ritz.eigenvectors[(0, eigen)]
-                            * (-0.5 * beta * ritz.eigenvalues[eigen]).exp()
-                    })
-                    .collect();
-                let mut estimate = Complex64::new(0.0, 0.0);
-                for left in 0..size {
-                    for right in 0..size {
-                        let mut projected = Complex64::new(0.0, 0.0);
-                        for row in 0..size {
-                            for column in 0..size {
-                                projected += ritz.eigenvectors[(row, left)]
-                                    * matrix_elements[row * size + column]
-                                    * ritz.eigenvectors[(column, right)];
-                            }
-                        }
-                        estimate += weights[left] * projected * weights[right];
-                    }
-                }
-                estimate
-            })
-            .collect();
-        values.insert(name.clone(), estimates);
-    }
-    Ok(ThermalObservableIteration {
-        inverse_temperatures: inverse_temperatures.to_vec(),
-        values,
-        identity,
-    })
+    let decomposition = lanczos_ritz(hamiltonian, initial, options)?;
+    decomposition.thermal_observable_iteration(
+        ThermalLanczosMethod::Ltlm,
+        observables,
+        inverse_temperatures,
+    )
 }
 
 pub fn linear_combination_qt(
@@ -1980,8 +2919,8 @@ where
     let mut step = direction * interval.abs().min(0.1);
     let mut time = initial_time;
     let mut state = initial.to_vec();
-    let initial_norm = vector_norm(initial);
     let mut steps = 0;
+    let interval_scale = interval.abs().max(1.0);
     while direction * (target_time - time) > 16.0 * f64::EPSILON * target_time.abs().max(1.0) {
         if steps >= options.max_substeps {
             return Err(QmbedError::NonConvergence {
@@ -2008,17 +2947,14 @@ where
             .sum::<f64>()
             .sqrt();
         let scale = vector_norm(&two_halves).max(1.0);
-        let threshold = options.tolerance * scale;
+        // Treat `tolerance` as an interval-level budget rather than allowing
+        // every accepted RK step to spend the full requested error. The
+        // step/interval fraction makes accumulated long-time error track the
+        // public tolerance while retaining the usual relative state scaling.
+        let threshold =
+            options.tolerance * scale * (step.abs() / interval_scale).clamp(f64::EPSILON, 1.0);
         if error <= threshold || step.abs() <= f64::EPSILON * time.abs().max(1.0) {
             state = two_halves;
-            if options.hamiltonian && initial_norm > f64::EPSILON {
-                let norm = vector_norm(&state);
-                if norm > f64::EPSILON && norm.is_finite() {
-                    for value in &mut state {
-                        *value *= initial_norm / norm;
-                    }
-                }
-            }
             time += step;
             steps += 1;
             let growth = if error <= f64::EPSILON {
@@ -2044,7 +2980,30 @@ pub fn evolve_time_dependent<O>(
 where
     O: TimeDependentOperator + ?Sized,
 {
+    evolve_time_dependent_from(operator, initial, 0.0, options)
+}
+
+/// Evolve an explicitly time-dependent operator from an arbitrary absolute
+/// start time.
+///
+/// Unlike shifting the output grid to zero in a language adapter, this keeps
+/// the times observed by the operator callback in the caller's physical time
+/// coordinate.
+pub fn evolve_time_dependent_from<O>(
+    operator: &O,
+    initial: &[Complex64],
+    initial_time: f64,
+    options: EvolutionOptions,
+) -> Result<StateTrajectory>
+where
+    O: TimeDependentOperator + ?Sized,
+{
     options.validate()?;
+    if !initial_time.is_finite() || options.times[0] < initial_time {
+        return Err(QmbedError::InvalidOptions(
+            "initial time must be finite and no later than the first output time".into(),
+        ));
+    }
     let shape = operator.shape();
     if shape.0 != shape.1 || initial.len() != shape.0 {
         return Err(QmbedError::DimensionMismatch(
@@ -2053,7 +3012,8 @@ where
     }
     let mut states = Vec::with_capacity(options.times.len());
     let mut state = initial.to_vec();
-    let mut previous_time = 0.0;
+    let requested_norm = vector_norm(initial);
+    let mut previous_time = initial_time;
     for &time in &options.times {
         state = adaptive_time_interval(
             operator,
@@ -2062,6 +3022,18 @@ where
             time - previous_time,
             &options,
         )?;
+        if options.hamiltonian && requested_norm > f64::EPSILON {
+            let norm = vector_norm(&state);
+            if norm <= f64::EPSILON || !norm.is_finite() {
+                return Err(QmbedError::NonConvergence {
+                    iterations: options.max_substeps,
+                    residual: norm,
+                });
+            }
+            for value in &mut state {
+                *value *= requested_norm / norm;
+            }
+        }
         states.push(state.clone());
         previous_time = time;
     }
@@ -2112,6 +3084,19 @@ pub fn evolve_time_dependent_batch<O>(
 where
     O: TimeDependentOperator + ?Sized,
 {
+    evolve_time_dependent_batch_from(operator, initial_columns, 0.0, options)
+}
+
+/// Batched counterpart of [`evolve_time_dependent_from`].
+pub fn evolve_time_dependent_batch_from<O>(
+    operator: &O,
+    initial_columns: &[Vec<Complex64>],
+    initial_time: f64,
+    options: EvolutionOptions,
+) -> Result<StateBatchTrajectory>
+where
+    O: TimeDependentOperator + ?Sized,
+{
     if initial_columns.is_empty() {
         return Err(QmbedError::InvalidOptions(
             "a state batch must contain at least one column".into(),
@@ -2119,7 +3104,12 @@ where
     }
     let mut by_column = Vec::with_capacity(initial_columns.len());
     for initial in initial_columns {
-        by_column.push(evolve_time_dependent(operator, initial, options.clone())?);
+        by_column.push(evolve_time_dependent_from(
+            operator,
+            initial,
+            initial_time,
+            options.clone(),
+        )?);
     }
     let states = (0..options.times.len())
         .map(|time_index| {
@@ -2309,4 +3299,94 @@ where
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Complex64, ProjectedBasis, dgks_reorthogonalize_complex, dgks_reorthogonalize_real,
+        lanczos_projection, projected_exponential_action, projected_exponential_error_bound,
+    };
+    use crate::Result;
+    use crate::operator::{LinearOperator, MatrixFormat, Operator};
+
+    struct ComplexView<'a>(&'a Operator);
+
+    impl LinearOperator for ComplexView<'_> {
+        fn shape(&self) -> (usize, usize) {
+            self.0.shape()
+        }
+
+        fn format(&self) -> MatrixFormat {
+            self.0.format()
+        }
+
+        fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+            self.0.apply(input, output)
+        }
+    }
+
+    #[test]
+    fn dgks_second_pass_is_conditional_for_real_and_complex_vectors() {
+        let real_basis = vec![vec![1.0, 0.0]];
+        let mut contaminated_real = vec![1.0, 1.0e-12];
+        let (_, repeated_real) = dgks_reorthogonalize_real(&real_basis, &mut contaminated_real);
+        assert!(repeated_real);
+        let mut orthogonal_real = vec![0.0, 1.0];
+        let (_, repeated_real) = dgks_reorthogonalize_real(&real_basis, &mut orthogonal_real);
+        assert!(!repeated_real);
+
+        let complex_basis = vec![vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)]];
+        let mut contaminated_complex = vec![Complex64::new(0.0, 1.0), Complex64::new(1.0e-12, 0.0)];
+        let (_, repeated_complex) =
+            dgks_reorthogonalize_complex(&complex_basis, &mut contaminated_complex);
+        assert!(repeated_complex);
+        let mut orthogonal_complex = vec![Complex64::new(0.0, 0.0), Complex64::new(0.0, 1.0)];
+        let (_, repeated_complex) =
+            dgks_reorthogonalize_complex(&complex_basis, &mut orthogonal_complex);
+        assert!(!repeated_complex);
+    }
+
+    #[test]
+    fn real_and_complex_projected_bases_define_the_same_krylov_action() {
+        let operator = Operator::from_triplets(
+            4,
+            4,
+            [
+                (0, 0, Complex64::new(-1.0, 0.0)),
+                (0, 1, Complex64::new(0.5, 0.0)),
+                (1, 0, Complex64::new(0.5, 0.0)),
+                (1, 1, Complex64::new(0.25, 0.0)),
+                (1, 2, Complex64::new(-0.7, 0.0)),
+                (2, 1, Complex64::new(-0.7, 0.0)),
+                (2, 3, Complex64::new(0.3, 0.0)),
+                (3, 2, Complex64::new(0.3, 0.0)),
+            ],
+            MatrixFormat::Csc,
+        )
+        .unwrap();
+        let initial = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(-0.5, 0.0),
+            Complex64::new(0.25, 0.0),
+            Complex64::new(0.75, 0.0),
+        ];
+        let real = lanczos_projection(&operator, &initial, 4).unwrap();
+        let complex = lanczos_projection(&ComplexView(&operator), &initial, 4).unwrap();
+        assert!(matches!(&real.basis, ProjectedBasis::Real(_)));
+        assert!(matches!(&complex.basis, ProjectedBasis::Complex(_)));
+
+        for interval in [0.1, 1.7] {
+            let real_state = projected_exponential_action(&real, interval, true, initial.len());
+            let complex_state =
+                projected_exponential_action(&complex, interval, true, initial.len());
+            for (real_value, complex_value) in real_state.iter().zip(complex_state) {
+                assert!((*real_value - complex_value).norm() < 1.0e-12);
+            }
+            let real_error = projected_exponential_error_bound(&real, interval, initial.len());
+            let complex_error =
+                projected_exponential_error_bound(&complex, interval, initial.len());
+            assert!((real_error - complex_error).abs() < 1.0e-12);
+        }
+    }
 }

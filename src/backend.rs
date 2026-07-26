@@ -4,10 +4,10 @@
 //! module owns conversions into third-party dense and sparse kernels so solver
 //! algorithms do not depend directly on a concrete linear-algebra crate.
 
-use faer::Mat;
 use faer::linalg::solvers::Solve;
 use faer::sparse::{SparseColMat, Triplet};
-use nalgebra::{DMatrix, SymmetricEigen, linalg::Schur};
+use faer::{Mat, Side};
+use nalgebra::{DMatrix, SVD as NalgebraSvd, SymmetricEigen};
 use num_complex::Complex64;
 
 use crate::{QmbedError, Result};
@@ -37,55 +37,121 @@ fn validate_square_dense(values: &[Complex64], dimension: usize) -> Result<()> {
     Ok(())
 }
 
+/// Singular values of a row-major dense matrix in nonincreasing order.
+pub(crate) fn singular_values(
+    values: &[Complex64],
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f64>> {
+    if values.len() != rows.saturating_mul(columns) {
+        return Err(QmbedError::DimensionMismatch(format!(
+            "dense backend expected {} values for a {rows}x{columns} matrix, got {}",
+            rows.saturating_mul(columns),
+            values.len()
+        )));
+    }
+    let matrix =
+        Mat::<Complex64>::from_fn(rows, columns, |row, column| values[row * columns + column]);
+    if let Ok(decomposition) = matrix.thin_svd() {
+        let singular_values = (0..rows.min(columns))
+            .map(|index| decomposition.S()[index].re)
+            .collect::<Vec<_>>();
+        if singular_values.iter().all(|value| value.is_finite()) {
+            return Ok(singular_values);
+        }
+    }
+
+    let matrix = DMatrix::<Complex64>::from_row_slice(rows, columns, values);
+    let max_iterations = rows
+        .min(columns)
+        .saturating_mul(rows.max(columns))
+        .saturating_mul(64)
+        .max(1_024);
+    let decomposition =
+        NalgebraSvd::try_new(matrix, false, false, 64.0 * f64::EPSILON, max_iterations)
+            .ok_or_else(|| {
+                QmbedError::UnsupportedBackend(
+                    "singular-value decomposition failed in both backends".into(),
+                )
+            })?;
+    let singular_values = decomposition
+        .singular_values
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    if singular_values.iter().any(|value| !value.is_finite()) {
+        return Err(QmbedError::UnsupportedBackend(
+            "singular-value decomposition produced non-finite values".into(),
+        ));
+    }
+    Ok(singular_values)
+}
+
 /// Complete eigendecomposition of a row-major Hermitian matrix.
 pub(crate) fn hermitian_eigenpairs(
     values: &[Complex64],
     dimension: usize,
 ) -> Result<HermitianEigensystem> {
     validate_square_dense(values, dimension)?;
-    let is_real = values.iter().all(|value| value.im.abs() <= 1.0e-14);
-    if is_real {
-        let matrix = DMatrix::<f64>::from_fn(dimension, dimension, |row, column| {
-            values[row * dimension + column].re
-        });
-        let decomposition = SymmetricEigen::new(matrix);
-        let mut eigenpairs: Vec<_> = (0..dimension)
-            .map(|column| {
-                (
-                    decomposition.eigenvalues[column],
-                    (0..dimension)
-                        .map(|row| Complex64::new(decomposition.eigenvectors[(row, column)], 0.0))
-                        .collect(),
-                )
-            })
-            .collect();
-        eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
-        let (eigenvalues, eigenvectors) = eigenpairs.into_iter().unzip();
-        return Ok(HermitianEigensystem {
-            eigenvalues,
-            eigenvectors,
-        });
-    }
-
-    let matrix = DMatrix::<Complex64>::from_fn(dimension, dimension, |row, column| {
+    let matrix = Mat::<Complex64>::from_fn(dimension, dimension, |row, column| {
         values[row * dimension + column]
     });
-    let (vectors, triangular) = Schur::new(matrix).unpack();
-    let mut eigenpairs = Vec::with_capacity(dimension);
-    for column in 0..dimension {
-        let value = triangular[(column, column)];
-        if value.im.abs() > 1.0e-10 {
-            return Err(QmbedError::NonHermitian);
+    match matrix.self_adjoint_eigen(Side::Lower) {
+        Ok(decomposition) => Ok(HermitianEigensystem {
+            eigenvalues: (0..dimension)
+                .map(|index| decomposition.S()[index].re)
+                .collect(),
+            eigenvectors: (0..dimension)
+                .map(|column| {
+                    (0..dimension)
+                        .map(|row| decomposition.U()[(row, column)])
+                        .collect()
+                })
+                .collect(),
+        }),
+        Err(primary_error) => {
+            // Rank-deficient reduced density matrices with large degenerate
+            // null spaces can exhaust one backend's QR budget even though the
+            // Hermitian problem is well conditioned. Keep the backend
+            // boundary resilient by retrying with an independent
+            // tridiagonal/QR implementation rather than leaking a crate-
+            // specific convergence failure into every higher-level solver.
+            let matrix = DMatrix::<Complex64>::from_row_slice(dimension, dimension, values);
+            let max_iterations = dimension
+                .saturating_mul(dimension)
+                .saturating_mul(64)
+                .max(1_024);
+            let decomposition =
+                SymmetricEigen::try_new(matrix, 64.0 * f64::EPSILON, max_iterations).ok_or_else(
+                    || {
+                        QmbedError::UnsupportedBackend(format!(
+                            "self-adjoint eigendecomposition failed in both backends; \
+                     primary error: {primary_error:?}"
+                        ))
+                    },
+                )?;
+            let mut order: Vec<_> = (0..dimension).collect();
+            order.sort_by(|&left, &right| {
+                decomposition.eigenvalues[left]
+                    .total_cmp(&decomposition.eigenvalues[right])
+                    .then_with(|| left.cmp(&right))
+            });
+            Ok(HermitianEigensystem {
+                eigenvalues: order
+                    .iter()
+                    .map(|&index| decomposition.eigenvalues[index])
+                    .collect(),
+                eigenvectors: order
+                    .iter()
+                    .map(|&column| {
+                        (0..dimension)
+                            .map(|row| decomposition.eigenvectors[(row, column)])
+                            .collect()
+                    })
+                    .collect(),
+            })
         }
-        let vector = (0..dimension).map(|row| vectors[(row, column)]).collect();
-        eigenpairs.push((value.re, vector));
     }
-    eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let (eigenvalues, eigenvectors) = eigenpairs.into_iter().unzip();
-    Ok(HermitianEigensystem {
-        eigenvalues,
-        eigenvectors,
-    })
 }
 
 /// Complete right eigendecomposition of a row-major complex matrix.
@@ -373,6 +439,33 @@ mod tests {
                 .iter()
                 .all(|value| (value.norm() - 1.0).abs() < 1.0e-12)
         );
+
+        let dimension = 5;
+        let mut hermitian = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+        for row in 0..dimension {
+            hermitian[row * dimension + row] = Complex64::new(row as f64 - 1.5, 0.0);
+            for column in 0..row {
+                let value = Complex64::new(
+                    (row + column + 1) as f64 / 7.0,
+                    (row as f64 - column as f64) / 11.0,
+                );
+                hermitian[row * dimension + column] = value;
+                hermitian[column * dimension + row] = value.conj();
+            }
+        }
+        let result = hermitian_eigenpairs(&hermitian, dimension).unwrap();
+        for (&eigenvalue, eigenvector) in result.eigenvalues.iter().zip(&result.eigenvectors) {
+            let residual = (0..dimension)
+                .map(|row| {
+                    let applied = (0..dimension)
+                        .map(|column| hermitian[row * dimension + column] * eigenvector[column])
+                        .sum::<Complex64>();
+                    (applied - eigenvalue * eigenvector[row]).norm_sqr()
+                })
+                .sum::<f64>()
+                .sqrt();
+            assert!(residual < 1.0e-12, "Hermitian residual was {residual}");
+        }
     }
 
     #[test]

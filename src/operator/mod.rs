@@ -43,13 +43,15 @@ impl LocalOperator {
 
 /// Typed ordered product of local actions.
 ///
-/// `split` identifies the boundary between the two species of a spinful
-/// fermion basis. All other basis families use an unsplit product.
+/// `splits` identify factor boundaries. A single split retains the traditional
+/// spinful-fermion meaning; multiple (including repeated) boundaries describe
+/// arbitrary tensor products with empty factor actions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpProduct {
     local: SmallVec<[LocalOperator; 8]>,
     symbols: SmallVec<[char; 8]>,
     split: Option<usize>,
+    splits: SmallVec<[usize; 4]>,
     label: String,
 }
 
@@ -72,6 +74,16 @@ impl OpProduct {
         local: impl IntoIterator<Item = LocalOperator>,
         split: Option<usize>,
     ) -> Result<Self> {
+        Self::with_splits(local, split)
+    }
+
+    /// Construct an operator product with any number of ordered factor
+    /// boundaries. Duplicate boundaries preserve empty tensor factors such as
+    /// the middle factor in `x||z`.
+    pub fn with_splits(
+        local: impl IntoIterator<Item = LocalOperator>,
+        splits: impl IntoIterator<Item = usize>,
+    ) -> Result<Self> {
         let local: SmallVec<[LocalOperator; 8]> = local.into_iter().collect();
         if local.is_empty() {
             return Err(QmbedError::InvalidOperator(
@@ -83,26 +95,32 @@ impl OpProduct {
                 "the species separator is not a local operator".into(),
             ));
         }
-        if split.is_some_and(|boundary| boundary > local.len()) {
+        let splits: SmallVec<[usize; 4]> = splits.into_iter().collect();
+        if splits.iter().any(|&boundary| boundary > local.len())
+            || splits.windows(2).any(|pair| pair[0] > pair[1])
+        {
             return Err(QmbedError::InvalidOperator(
-                "spinful operator split exceeds product arity".into(),
+                "operator factor boundaries must be ordered within the product arity".into(),
             ));
         }
         let symbols: SmallVec<[char; 8]> = local.iter().map(|operator| operator.symbol()).collect();
-        let mut label = String::with_capacity(symbols.len() + usize::from(split.is_some()));
-        for (position, symbol) in symbols.iter().copied().enumerate() {
-            if split == Some(position) {
+        let mut label = String::with_capacity(symbols.len() + splits.len());
+        let mut boundary = 0;
+        for position in 0..=symbols.len() {
+            while splits.get(boundary) == Some(&position) {
                 label.push('|');
+                boundary += 1;
             }
-            label.push(symbol);
+            if let Some(symbol) = symbols.get(position) {
+                label.push(*symbol);
+            }
         }
-        if split == Some(symbols.len()) {
-            label.push('|');
-        }
+        let split = (splits.len() == 1).then(|| splits[0]);
         Ok(Self {
             local,
             symbols,
             split,
+            splits,
             label,
         })
     }
@@ -113,6 +131,10 @@ impl OpProduct {
 
     pub const fn split(&self) -> Option<usize> {
         self.split
+    }
+
+    pub fn splits(&self) -> &[usize] {
+        &self.splits
     }
 
     pub fn label(&self) -> &str {
@@ -1001,6 +1023,22 @@ impl Operator {
         )
     }
 
+    /// Project a square operator into the column space of `projector`.
+    ///
+    /// For a projector-like rectangular matrix `P` with shape `(N, M)`, this
+    /// returns `P† self P` with shape `(M, M)`. The operation intentionally
+    /// accepts any rectangular linear map; callers that require an isometry
+    /// may validate `P†P = I` separately.
+    pub fn projected_by(&self, projector: &Self) -> Result<Self> {
+        if self.shape.0 != self.shape.1 || projector.shape.0 != self.shape.0 {
+            return Err(QmbedError::DimensionMismatch(
+                "operator projection requires a square source and matching projector rows".into(),
+            ));
+        }
+        let applied = self.product(projector)?;
+        projector.adjoint()?.product(&applied)
+    }
+
     pub fn pow(&self, exponent: u32) -> Result<Self> {
         if self.shape.0 != self.shape.1 {
             return Err(QmbedError::DimensionMismatch(
@@ -1128,6 +1166,75 @@ impl Operator {
         tolerance: f64,
     ) -> bool {
         (value - self.value_at(column, row).conj()).norm() <= tolerance
+    }
+
+    fn apply_real_coefficients(&self, input: &[Complex64], output: &mut [Complex64]) {
+        match &self.storage {
+            Storage::Dense(values) => {
+                for row in 0..self.shape.0 {
+                    let target = &mut output[row];
+                    for column in 0..self.shape.1 {
+                        let coefficient = values[row * self.shape.1 + column].re;
+                        target.re += coefficient * input[column].re;
+                        target.im += coefficient * input[column].im;
+                    }
+                }
+            }
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                for column in 0..self.shape.1 {
+                    let input_value = input[column];
+                    for position in column_offsets[column]..column_offsets[column + 1] {
+                        let target = &mut output[row_indices[position]];
+                        let coefficient = values[position].re;
+                        target.re += coefficient * input_value.re;
+                        target.im += coefficient * input_value.im;
+                    }
+                }
+            }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                for row in 0..self.shape.0 {
+                    let target = &mut output[row];
+                    for position in row_offsets[row]..row_offsets[row + 1] {
+                        let input_value = input[column_indices[position]];
+                        let coefficient = values[position].re;
+                        target.re += coefficient * input_value.re;
+                        target.im += coefficient * input_value.im;
+                    }
+                }
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                for (diagonal, &offset) in offsets.iter().enumerate() {
+                    for row in 0..self.shape.0 {
+                        let Some(column) = row.checked_add_signed(-offset) else {
+                            continue;
+                        };
+                        if column < self.shape.1 {
+                            let input_value = input[column];
+                            let coefficient = values_by_row[diagonal * self.shape.0 + row].re;
+                            output[row].re += coefficient * input_value.re;
+                            output[row].im += coefficient * input_value.im;
+                        }
+                    }
+                }
+            }
+            Storage::MatrixFree(entries) => {
+                for entry in entries {
+                    output[entry.row].re += entry.value.re * input[entry.column].re;
+                    output[entry.row].im += entry.value.re * input[entry.column].im;
+                }
+            }
+        }
     }
 
     pub fn is_hermitian(&self, tolerance: f64) -> bool {
@@ -1307,6 +1414,10 @@ impl LinearOperator for Operator {
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         check_apply_shape(self.shape, input, output)?;
         output.fill(Complex64::new(0.0, 0.0));
+        if self.real {
+            self.apply_real_coefficients(input, output);
+            return Ok(());
+        }
         match &self.storage {
             Storage::Dense(values) => {
                 for row in 0..self.shape.0 {
@@ -1765,6 +1876,89 @@ where
     checks: AssemblyChecks,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ParticleConservationComponent {
+    /// Cartesian operators share one normalization within a concrete basis,
+    /// but that normalization can differ from explicit ladder operators.
+    /// Keeping the degree in the key permits exact `xx + yy` cancellation
+    /// without assuming a particular spin normalization.
+    cartesian_degree: usize,
+    operator: String,
+    sites: Vec<usize>,
+}
+
+fn definite_number_change_components(operator: &str) -> Result<Vec<(usize, String, Complex64)>> {
+    let mut components = vec![(0_usize, String::new(), Complex64::new(1.0, 0.0))];
+    for symbol in operator.chars() {
+        match symbol {
+            'x' | 'y' => {
+                let mut expanded = Vec::with_capacity(components.len().saturating_mul(2));
+                for (degree, prefix, coefficient) in components {
+                    let mut raised = prefix.clone();
+                    raised.push('+');
+                    let mut lowered = prefix;
+                    lowered.push('-');
+                    let (raise_phase, lower_phase) = if symbol == 'x' {
+                        (Complex64::new(1.0, 0.0), Complex64::new(1.0, 0.0))
+                    } else {
+                        (Complex64::new(0.0, -1.0), Complex64::new(0.0, 1.0))
+                    };
+                    expanded.push((degree + 1, raised, coefficient * raise_phase));
+                    expanded.push((degree + 1, lowered, coefficient * lower_phase));
+                }
+                components = expanded;
+            }
+            'I' | 'n' | 'z' | '+' | '-' | '|' => {
+                for (_, prefix, _) in &mut components {
+                    prefix.push(symbol);
+                }
+            }
+            _ => return Err(QmbedError::InvalidOperator(operator.into())),
+        }
+    }
+    Ok(components)
+}
+
+/// Check additive-sector conservation for a complete operator sum.
+///
+/// Cartesian products are first decomposed into definite raising/lowering
+/// components. Coefficients are accumulated for identical spatial actions
+/// before sector closure is tested, so cancellations such as `xx + yy` are
+/// recognized. The Cartesian degree remains part of the canonical key because
+/// a basis may normalize `x/y` differently from explicit `+/-` symbols.
+pub fn operator_sum_preserves_particle_sector<B>(basis: &B, terms: &[OperatorTerm]) -> Result<bool>
+where
+    B: Basis,
+{
+    let mut components = HashMap::<ParticleConservationComponent, Complex64>::new();
+    for term in terms {
+        for coupling in term.couplings() {
+            for (cartesian_degree, operator, coefficient) in
+                definite_number_change_components(term.operator())?
+            {
+                *components
+                    .entry(ParticleConservationComponent {
+                        cartesian_degree,
+                        operator,
+                        sites: coupling.sites.clone(),
+                    })
+                    .or_insert(Complex64::new(0.0, 0.0)) += coupling.coefficient * coefficient;
+            }
+        }
+    }
+    for (component, coefficient) in components {
+        if coefficient.norm() > f64::EPSILON
+            && !basis.operator_preserves_particle_sector_on_sites(
+                &component.operator,
+                &component.sites,
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl<'a, BasisType> OperatorBuilder<'a, BasisType, BasisType>
 where
     BasisType: Basis,
@@ -1810,21 +2004,13 @@ where
 
     pub fn build(self, format: MatrixFormat) -> Result<Operator> {
         let shape = (self.target.len(), self.source.len());
-        if self.checks.particle_conservation {
-            for term in &self.terms {
-                if !self
-                    .source
-                    .operator_preserves_particle_sector(term.operator())?
-                    || !self
-                        .target
-                        .operator_preserves_particle_sector(term.operator())?
-                {
-                    return Err(QmbedError::InvalidSector(format!(
-                        "operator {:?} does not preserve the selected particle sector",
-                        term.operator()
-                    )));
-                }
-            }
+        if self.checks.particle_conservation
+            && (!operator_sum_preserves_particle_sector(self.source, &self.terms)?
+                || !operator_sum_preserves_particle_sector(self.target, &self.terms)?)
+        {
+            return Err(QmbedError::InvalidSector(
+                "operator sum does not preserve the selected particle sector".into(),
+            ));
         }
         // Local actions are generated one source column at a time. Preserve
         // that structure instead of hashing every `(row, column)` pair into a
@@ -2495,11 +2681,16 @@ impl QuantumOperator {
             })
     }
 
-    pub fn evaluate(
+    /// Resolve named parameters into the stable component order returned by
+    /// [`Self::component_names`].
+    ///
+    /// This is the allocation-light coefficient boundary used by dynamic
+    /// frontends: names are validated once at the edge, while repeated
+    /// operator applications consume a compact coefficient slice.
+    pub fn resolve_coefficients(
         &self,
         parameters: &HashMap<String, Complex64>,
-        format: MatrixFormat,
-    ) -> Result<Operator> {
+    ) -> Result<Vec<Complex64>> {
         if let Some(name) = parameters.keys().find(|name| {
             !self
                 .components
@@ -2510,24 +2701,83 @@ impl QuantumOperator {
                 "unknown operator parameter {name:?}"
             )));
         }
-        let mut entries = Vec::new();
-        for component in &self.components {
-            let coefficient = parameters
-                .get(&component.name)
-                .copied()
-                .or(component.default)
-                .ok_or_else(|| {
-                    QmbedError::InvalidOptions(format!(
-                        "missing required operator parameter {:?}",
+        self.components
+            .iter()
+            .map(|component| {
+                let coefficient = parameters
+                    .get(&component.name)
+                    .copied()
+                    .or(component.default)
+                    .ok_or_else(|| {
+                        QmbedError::InvalidOptions(format!(
+                            "missing required operator parameter {:?}",
+                            component.name
+                        ))
+                    })?;
+                if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+                    return Err(QmbedError::InvalidOptions(format!(
+                        "operator parameter {:?} must be finite",
                         component.name
-                    ))
-                })?;
+                    )));
+                }
+                Ok(coefficient)
+            })
+            .collect()
+    }
+
+    /// Apply a compact ordered coefficient vector without materializing the
+    /// linear combination.
+    pub fn apply_coefficients(
+        &self,
+        coefficients: &[Complex64],
+        input: &[Complex64],
+        output: &mut [Complex64],
+    ) -> Result<()> {
+        if coefficients.len() != self.components.len() {
+            return Err(QmbedError::DimensionMismatch(format!(
+                "received {} operator coefficients for {} components",
+                coefficients.len(),
+                self.components.len()
+            )));
+        }
+        check_apply_shape(self.shape, input, output)?;
+        output.fill(Complex64::new(0.0, 0.0));
+        let mut contribution = vec![Complex64::new(0.0, 0.0); output.len()];
+        for (component, coefficient) in self.components.iter().zip(coefficients) {
             if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
                 return Err(QmbedError::InvalidOptions(format!(
                     "operator parameter {:?} must be finite",
                     component.name
                 )));
             }
+            component.operator.apply(input, &mut contribution)?;
+            for (value, addition) in output.iter_mut().zip(&contribution) {
+                *value += *coefficient * *addition;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply one named member of the family without assembling a temporary
+    /// sparse matrix.
+    pub fn apply(
+        &self,
+        parameters: &HashMap<String, Complex64>,
+        input: &[Complex64],
+        output: &mut [Complex64],
+    ) -> Result<()> {
+        let coefficients = self.resolve_coefficients(parameters)?;
+        self.apply_coefficients(&coefficients, input, output)
+    }
+
+    pub fn evaluate(
+        &self,
+        parameters: &HashMap<String, Complex64>,
+        format: MatrixFormat,
+    ) -> Result<Operator> {
+        let coefficients = self.resolve_coefficients(parameters)?;
+        let mut entries = Vec::new();
+        for (component, coefficient) in self.components.iter().zip(coefficients) {
             entries.extend(
                 component
                     .operator
@@ -2816,6 +3066,7 @@ pub struct ExpOp {
     krylov_dimension: usize,
     tolerance: f64,
     max_substeps: usize,
+    plan: crate::solve::ExpmActionPlan,
 }
 
 impl std::fmt::Debug for ExpOp {
@@ -2856,12 +3107,20 @@ impl ExpOp {
                 "invalid ExpOp coefficient or numerical controls".into(),
             ));
         }
+        let plan = crate::solve::ExpmActionPlan::new(
+            operator.as_ref(),
+            exponent,
+            krylov_dimension,
+            tolerance,
+            max_substeps,
+        )?;
         Ok(Self {
             operator,
             exponent,
             krylov_dimension,
             tolerance,
             max_substeps,
+            plan,
         })
     }
 
@@ -2879,6 +3138,13 @@ impl ExpOp {
                 "ExpOp coefficient must be finite".into(),
             ));
         }
+        self.plan = crate::solve::ExpmActionPlan::new(
+            self.operator.as_ref(),
+            exponent,
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )?;
         self.exponent = exponent;
         Ok(())
     }
@@ -2981,14 +3247,7 @@ impl LinearOperator for ExpOp {
 
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         check_apply_shape(self.shape(), input, output)?;
-        let result = crate::solve::expm_action_complex(
-            self.operator.as_ref(),
-            input,
-            self.exponent,
-            self.krylov_dimension,
-            self.tolerance,
-            self.max_substeps,
-        )?;
+        let result = self.plan.apply(self.operator.as_ref(), input)?;
         output.copy_from_slice(&result);
         Ok(())
     }
