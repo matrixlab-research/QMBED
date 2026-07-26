@@ -544,6 +544,29 @@ fn residual_norm(
         .sqrt())
 }
 
+fn rayleigh_value_and_residual(
+    operator: &(impl LinearOperator + ?Sized),
+    vector: &[Complex64],
+) -> Result<(f64, f64)> {
+    let mut applied = vec![Complex64::new(0.0, 0.0); vector.len()];
+    operator.apply(vector, &mut applied)?;
+    let norm_squared = inner(vector, vector).re;
+    if !norm_squared.is_finite() || norm_squared <= f64::EPSILON {
+        return Err(QmbedError::NonConvergence {
+            iterations: 0,
+            residual: norm_squared.sqrt(),
+        });
+    }
+    let eigenvalue = inner(vector, &applied).re / norm_squared;
+    let residual = applied
+        .iter()
+        .zip(vector)
+        .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
+        .sum::<f64>()
+        .sqrt();
+    Ok((eigenvalue, residual))
+}
+
 fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
     left.iter()
         .zip(right)
@@ -2080,16 +2103,20 @@ where
         }
         _ => select_indices(&values, options.target, options.eigenpairs),
     };
-    let eigenvalues: Vec<_> = indices.iter().map(|&index| values[index]).collect();
     let eigenvectors: Vec<_> = indices
         .iter()
         .map(|&index| vectors[index].clone())
         .collect();
-    let residuals = eigenvalues
+    // Use the selected dense eigenvectors to refine each value with its
+    // Rayleigh quotient. This shares the operator applications already needed
+    // for residuals and avoids backend/platform rounding differences at tight
+    // compatibility tolerances.
+    let refined = eigenvectors
         .iter()
-        .zip(&eigenvectors)
-        .map(|(&value, vector)| residual_norm(operator, value, vector))
+        .map(|vector| rayleigh_value_and_residual(operator, vector))
         .collect::<Result<Vec<_>>>()?;
+    let eigenvalues = refined.iter().map(|&(value, _)| value).collect();
+    let residuals = refined.iter().map(|&(_, residual)| residual).collect();
     Ok(Eigensystem {
         eigenvalues,
         eigenvectors,
