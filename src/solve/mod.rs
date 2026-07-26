@@ -348,6 +348,7 @@ pub struct EigshOptions {
 const GUARANTEED_DENSE_EIGSH_CROSSOVER: usize = 128;
 const AUTOMATIC_DENSE_EIGSH_CROSSOVER: usize = 256;
 const FULL_KRYLOV_DENSE_FALLBACK: usize = 2_048;
+const TRIDIAGONAL_LANCZOS_WINDOW: usize = 96;
 
 fn use_dense_eigsh(dimension: usize, options: &EigshOptions) -> bool {
     dimension <= GUARANTEED_DENSE_EIGSH_CROSSOVER
@@ -406,9 +407,9 @@ pub struct Eigensystem {
 /// Reusable state for a sequence of related Hermitian eigenproblems.
 ///
 /// The workspace keeps the complete converged invariant subspace from the
-/// previous solve.  Passing it to [`eigsh_with_workspace`] gives a parameter
-/// scan a thick initial subspace without coupling the solver to any particular
-/// Hamiltonian family.
+/// previous solve. [`eigsh_with_workspace`] preserves it as a thick initial
+/// subspace for restarted windows and combines all of its vectors into a
+/// balanced warm start when the cheaper tridiagonal Lanczos path applies.
 #[derive(Clone, Debug, Default)]
 pub struct EigshWorkspace {
     dimension: usize,
@@ -613,6 +614,27 @@ fn normalize(vector: &mut [Complex64]) -> Result<()> {
         *value /= norm;
     }
     Ok(())
+}
+
+fn balanced_subspace_start(initial_subspace: &[Vec<Complex64>]) -> Result<Vec<Complex64>> {
+    let dimension = initial_subspace
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| QmbedError::InvalidOptions("initial subspace must not be empty".into()))?;
+    let mut combined = vec![Complex64::new(0.0, 0.0); dimension];
+    let count = initial_subspace.len() as f64;
+    for (index, vector) in initial_subspace.iter().enumerate() {
+        let phase = std::f64::consts::TAU * index as f64 / count;
+        let coefficient = Complex64::from_polar(count.sqrt().recip(), phase);
+        for (value, component) in combined.iter_mut().zip(vector) {
+            *value += coefficient * *component;
+        }
+    }
+    if normalize(&mut combined).is_err() {
+        combined.clone_from(&initial_subspace[0]);
+        normalize(&mut combined)?;
+    }
+    Ok(combined)
 }
 
 fn deterministic_start(dimension: usize, seed: u64) -> Result<Vec<Complex64>> {
@@ -2190,7 +2212,7 @@ where
     // multi-vector starts use the restarted backend below.
     if options
         .krylov_dimension
-        .is_some_and(|dimension| dimension >= 96)
+        .is_some_and(|dimension| dimension >= TRIDIAGONAL_LANCZOS_WINDOW)
         && initial_subspace.is_none_or(|vectors| vectors.len() <= 1)
     {
         let initial = initial_subspace
@@ -2306,7 +2328,16 @@ where
 {
     let dimension = operator.shape().0;
     let result = if workspace.dimension == dimension && !workspace.initial_subspace.is_empty() {
-        eigsh_with_initial_subspace(operator, options, &workspace.initial_subspace)?
+        if options
+            .krylov_dimension
+            .is_none_or(|size| size >= TRIDIAGONAL_LANCZOS_WINDOW)
+            && workspace.initial_subspace.len() > 1
+        {
+            let initial = balanced_subspace_start(&workspace.initial_subspace)?;
+            eigsh_with_initial(operator, options, &initial)?
+        } else {
+            eigsh_with_initial_subspace(operator, options, &workspace.initial_subspace)?
+        }
     } else {
         eigsh(operator, options)?
     };
