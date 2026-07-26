@@ -67,7 +67,7 @@ jobs:
           cargo doc --no-deps
           mkdir -p site/rust/api
           cp -R target/doc/. site/rust/api/
-          cp docs/rustdoc-index.html site/rust/api/index.html
+          cp ci/rustdoc-index.html site/rust/api/index.html
       - name: Instantiate Julia documentation environment
         run: julia --project=bindings/julia/docs -e 'using Pkg; Pkg.develop(path="bindings/julia"); Pkg.instantiate()'
       - name: Build Julia API from source docstrings

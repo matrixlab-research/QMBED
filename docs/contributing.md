@@ -20,7 +20,7 @@ python -m mkdocs build --strict --site-dir site
 cargo doc --no-deps
 mkdir -p site/rust/api
 cp -R target/doc/. site/rust/api/
-cp docs/rustdoc-index.html site/rust/api/index.html
+cp ci/rustdoc-index.html site/rust/api/index.html
 ```
 
 ## Julia API
