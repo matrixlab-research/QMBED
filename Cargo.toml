@@ -10,7 +10,12 @@ readme = "README.md"
 keywords = ["quantum", "exact-diag", "sparse", "physics"]
 categories = ["science", "mathematics"]
 
+[features]
+default = []
+chainrules = ["dep:chainrules-core"]
+
 [dependencies]
+chainrules-core = { version = "0.2", optional = true, features = ["num-complex"] }
 faer = { version = "0.24.4", default-features = false, features = ["std", "linalg"] }
 nalgebra = "0.33"
 num-complex = "0.4"

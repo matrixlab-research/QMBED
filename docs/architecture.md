@@ -27,6 +27,28 @@ cache is selected because a basis supplies a finite symmetry action, and a
 fixed sparse pattern is reused because a parameterized family shares its
 nonzero structure. No Ising-, Hubbard-, or PXP-specific path is required.
 
+## Differentiation boundary
+
+AD rules sit on the same scientific narrow waist:
+
+```text
+parameter schema + QuantumOperator + state
+                    │
+             native operation rule
+             ├─ exact JVP
+             ├─ one-shot VJP
+             └─ spectral rule + diagnostics
+                    │
+       optional ChainRules protocol adapter
+```
+
+Sparse assembly and Lanczos iterations are not traced instruction by
+instruction. The operator-action rule uses the runtime's native forward and
+adjoint kernels. The ground-state energy rule uses one converged eigenpair and
+component expectations, and refuses to hide an unresolved degeneracy.
+ChainRules adapters translate the tested native rule rather than defining a
+second derivative implementation.
+
 ## Execution narrow waist
 
 `Runtime` owns vector storage and coarse operations such as apply, `axpy`,

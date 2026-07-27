@@ -3,6 +3,8 @@
 
 mod backend;
 
+/// Rust-native automatic-differentiation primitives and optional rule adapters.
+pub mod ad;
 /// Versioned dense and sparse operator serialization.
 pub mod archive;
 /// Hilbert-space bases, sectors, symmetries, and projectors.

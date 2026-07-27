@@ -40,6 +40,7 @@ assert!(result.converged);
 | `runtime` | Vector ownership and coarse execution primitives |
 | `interop` | Reusable owned models for language frontends |
 | `archive` | Versioned operator archives and ordered portable basis manifests |
+| `ad` | Native JVP/VJP rules, spectral diagnostics, optional ChainRules adapter |
 
 Rust exposes one native vocabulary. There is no Rust compatibility namespace
 or second set of migration aliases. The Python package separately provides its
@@ -53,6 +54,8 @@ versioned QuSpin-compatible import surface.
 | Repeated parameter scan | `QuantumOperator` → `QuantumOperatorPlan` |
 | Selected spectrum | `eigsh` + `EigshOptions` |
 | Related selected spectra | `eigsh_with_workspace` + `EigshWorkspace` |
+| Differentiable operator action | `ad::apply_jvp` / `ad::apply_vjp` |
+| Ground-state energy gradient | `ad::ground_state_energy_gradient` |
 | State evolution | `evolve` + `EvolutionOptions` |
 | Selected Floquet spectrum | `Floquet::selected_eigensystem` + `FloquetSpectrumOptions` |
 | Wide-sector entanglement | `entanglement_entropy_sector` |
@@ -70,5 +73,6 @@ pattern and `EigshWorkspace` to carry the converged subspace between solves.
 These are generic operator and solver facilities, not model-specific paths.
 
 See [API stability](api-stability.md) for the naming and evolution policy, and
+see [Rust-native AD](ad.md) for derivative semantics and current gaps. See
 the repository's `examples/native_workflows.rs` for parameter scans, symmetry
 projection, time evolution, Floquet analysis, custom bases, and wide states.
