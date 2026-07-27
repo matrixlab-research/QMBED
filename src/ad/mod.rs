@@ -1,7 +1,7 @@
 //! Rust-native differentiation primitives for QMBED scientific operations.
 //!
 //! The native layer owns the mathematical derivative semantics. Optional
-//! adapters such as [`chainrules`] only translate these tested primitives into
+//! adapters such as the optional `chainrules` module only translate these tested primitives into
 //! another protocol; they do not reimplement the derivatives.
 
 use std::collections::HashSet;
