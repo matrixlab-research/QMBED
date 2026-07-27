@@ -155,6 +155,25 @@ where
     fn apply_on(&self, runtime: &R, input: &R::Buffer, output: &mut R::Buffer) -> Result<()>;
 }
 
+/// Runtime-aware adjoint action for reverse-mode scientific rules.
+///
+/// This stays separate from [`RuntimeLinearOperator`] so existing execution
+/// backends remain source-compatible. A GPU or distributed backend implements
+/// this trait with its native adjoint kernel; the CPU blanket implementation
+/// delegates to [`LinearOperator::apply_adjoint`].
+pub trait RuntimeAdjointLinearOperator<R>: RuntimeLinearOperator<R>
+where
+    R: Runtime,
+{
+    /// Compute `output = A† * input` in runtime-owned storage.
+    fn apply_adjoint_on(
+        &self,
+        runtime: &R,
+        input: &R::Buffer,
+        output: &mut R::Buffer,
+    ) -> Result<()>;
+}
+
 /// Host-resident complex vector used by [`CpuRuntime`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuBuffer {
@@ -345,6 +364,20 @@ where
         output: &mut CpuBuffer,
     ) -> Result<()> {
         self.apply(input.as_slice(), output.as_mut_slice())
+    }
+}
+
+impl<O> RuntimeAdjointLinearOperator<CpuRuntime> for O
+where
+    O: LinearOperator + ?Sized,
+{
+    fn apply_adjoint_on(
+        &self,
+        _runtime: &CpuRuntime,
+        input: &CpuBuffer,
+        output: &mut CpuBuffer,
+    ) -> Result<()> {
+        self.apply_adjoint(input.as_slice(), output.as_mut_slice())
     }
 }
 

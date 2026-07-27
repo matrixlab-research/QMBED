@@ -87,12 +87,22 @@ for the canonical names and extension rules.
 - Matrix-free selected Floquet quasienergies, sector-native wide-state
   entanglement contractions, and portable ordered basis manifests.
 - Reusable parameter-scan operator plans and shared symmetry-orbit caches.
+- Rust-native exact JVP/VJP rules for parameterized operator actions and
+  gap-aware Hellmann--Feynman ground-state energy gradients; an optional
+  `chainrules` feature adapts the same rules to `chainrules-core 0.2`.
 
 The four fixed-width state types (`U256`, `U1024`, `U4096`, and `U16384`) are
 independent of the small-system `u128` path. Fixed-particle enumeration scales
 with the requested sector instead of scanning the full parent Hilbert space.
 See the [capability guide](https://matrixlab-research.github.io/QMBED/capabilities/)
 for module-level details and current boundaries.
+
+Native AD is operation based: iterative solvers and sparse assembly are not
+traced instruction by instruction. See the
+[AD guide](https://matrixlab-research.github.io/QMBED/rust/ad/) for formulas,
+diagnostics, examples, and explicit gaps. The benchmark repository separately
+checks gradients against finite differences and reports both end-to-end time
+and eigensolve counts across real ED workflows.
 
 ## Architecture
 
