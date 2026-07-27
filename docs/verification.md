@@ -13,8 +13,14 @@ QMBED separates four questions that are often conflated:
 |---|---|
 | `CI` | Rust formatting, Clippy, unit/integration tests, Rust 1.85 MSRV, macOS/Windows compilation, public-API semver checks, crates.io dry-run, and paper-scale visible contracts |
 | `language-bindings` | C ABI, Python native and compatibility tests, Julia tests |
+| `Python platform wheels` | Platform-wheel build, bundled-library discovery, and numerical smoke tests on Linux, macOS, and Windows |
 | `documentation` | strict MkDocs, rustdoc, Documenter, and assembled-site links |
 | `release` | synchronized versions, packages, bindings, and tagged release gate |
+
+Before a tag is created, `Prepare Julia native artifacts` builds the shared
+library on the supported native runners and opens the checked
+`Artifacts.toml` PR. The full sequence is documented in
+[Release process](releasing.md).
 
 The badges in the project README point directly to these workflows. A green
 badge means the corresponding workflow passed on `main`; it is not a broader

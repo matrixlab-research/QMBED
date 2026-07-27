@@ -1,0 +1,62 @@
+name: Python platform wheels
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/wheels.yml"
+      - "bindings/capi/**"
+      - "bindings/python/**"
+      - "src/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/wheels.yml"
+      - "bindings/capi/**"
+      - "bindings/python/**"
+      - "src/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: ${{ matrix.label }} wheel
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-24.04
+          - label: Linux aarch64
+            runner: ubuntu-24.04-arm
+          - label: macOS aarch64
+            runner: macos-15
+          - label: macOS x86_64
+            runner: macos-15-intel
+          - label: Windows x86_64
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/capi
+          shared-key: python-wheel-${{ runner.os }}-${{ runner.arch }}
+      - uses: pypa/cibuildwheel@v4.1.0
+        with:
+          extras: uv
+          package-dir: bindings/python
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: cp312-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ runner.os }}-${{ runner.arch }}
+          path: wheelhouse/*.whl

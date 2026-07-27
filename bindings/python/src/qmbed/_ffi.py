@@ -110,10 +110,28 @@ def _library_name() -> str:
     return "libqmbed_capi.so"
 
 
+def _bundled_library_path() -> Path | None:
+    package = Path(__file__).resolve().parent
+    if os.name == "nt":
+        patterns = ("_native*.pyd", "_native*.dll")
+    elif sys.platform == "darwin":
+        patterns = ("_native*.so", "_native*.dylib")
+    else:
+        patterns = ("_native*.so",)
+    for pattern in patterns:
+        candidates = sorted(package.glob(pattern))
+        if candidates:
+            return candidates[0]
+    return None
+
+
 def _library_path() -> Path:
     configured = os.environ.get("QMBED_LIBRARY_PATH")
     if configured:
         return Path(configured).expanduser().resolve()
+    bundled = _bundled_library_path()
+    if bundled is not None:
+        return bundled
     repository = Path(__file__).resolve().parents[4]
     for profile in ("release", "debug"):
         candidate = (
@@ -127,8 +145,8 @@ def _library_path() -> Path:
         if candidate.exists():
             return candidate
     raise QmbedError(
-        "QMBED native library not found; set QMBED_LIBRARY_PATH or build "
-        "bindings/capi with cargo"
+        "QMBED native library not found in the installed package; reinstall a "
+        "platform wheel, set QMBED_LIBRARY_PATH, or build bindings/capi with cargo"
     )
 
 

@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   gate:
@@ -24,6 +24,8 @@ jobs:
           version: "1.10"
       - name: Check release versions
         run: python ci/check_versions.py --tag "$GITHUB_REF_NAME"
+      - name: Require prepared Julia artifacts
+        run: test -f bindings/julia/Artifacts.toml
       - name: Test and package the Rust core
         run: |
           cargo fmt --check
@@ -38,17 +40,96 @@ jobs:
         env:
           PYTHONPATH: bindings/python/src
           QMBED_LIBRARY_PATH: bindings/capi/target/release/libqmbed_capi.so
-        run: python -m unittest discover -s bindings/python/tests -v
+        run: |
+          python -m pip install "numba>=0.59" "numpy>=1.24" "scipy>=1.10"
+          python -m unittest discover -s bindings/python/tests -v
       - name: Test Julia
-        env:
-          QMBED_LIBRARY_PATH: bindings/capi/target/release/libqmbed_capi.so
         run: julia --project=bindings/julia -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
-      - name: Publish the Rust crate
-        if: env.CARGO_REGISTRY_TOKEN != ''
+
+  publish-rust:
+    name: Publish crates.io package
+    needs: [gate, wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Publish Rust crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
-      - name: Create GitHub release
+
+  wheels:
+    name: ${{ matrix.label }} wheels
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-24.04
+          - label: Linux aarch64
+            runner: ubuntu-24.04-arm
+          - label: macOS aarch64
+            runner: macos-15
+          - label: macOS x86_64
+            runner: macos-15-intel
+          - label: Windows x86_64
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/capi
+          shared-key: release-wheel-${{ runner.os }}-${{ runner.arch }}
+      - uses: pypa/cibuildwheel@v4.1.0
+        with:
+          extras: uv
+          package-dir: bindings/python
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheel-${{ runner.os }}-${{ runner.arch }}
+          path: wheelhouse/*.whl
+
+  publish-python:
+    name: Publish PyPI package
+    needs: wheels
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/qmbed/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-wheel-*
+          path: wheelhouse
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse/
+
+  github-release:
+    name: Create GitHub release
+    needs: [publish-rust, publish-python, wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-wheel-*
+          path: wheelhouse
+          merge-multiple: true
+      - name: Create GitHub release with Python wheels
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --generate-notes
+          --verify-tag
+          wheelhouse/*.whl
