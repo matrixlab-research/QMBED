@@ -1,9 +1,8 @@
 # Get started
 
-QMBED 0.1 is distributed from the GitHub repository. Rust can depend on the
-release tag directly. Python and Julia currently use a source checkout and the
-shared C library; they are not yet published to PyPI or the Julia General
-registry.
+QMBED 0.2 is published on crates.io and PyPI. The Julia package currently uses
+a source checkout while its initial General-registry submission is pending.
+All three interfaces execute the same Rust implementation.
 
 ## Prerequisites
 
@@ -13,11 +12,11 @@ registry.
 
 ## Rust
 
-Add the release tag to `Cargo.toml`:
+Add the crates.io release to `Cargo.toml`:
 
 ```toml
 [dependencies]
-qmbed = { git = "https://github.com/matrixlab-research/QMBED", tag = "v0.1.0" }
+qmbed = "0.2.0"
 ```
 
 The [Rust guide](rust/index.md) gives a complete low-energy spectrum example.
@@ -36,6 +35,12 @@ The source-tree layouts used below find this library automatically. Set
 `QMBED_LIBRARY_PATH` only when the library is moved elsewhere.
 
 ## Python
+
+```bash
+python -m pip install "qmbed==0.2.0"
+```
+
+For an editable source checkout:
 
 ```bash
 python -m pip install -e "bindings/python[test]"

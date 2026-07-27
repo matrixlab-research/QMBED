@@ -15,8 +15,10 @@ solver implementation.
 
 Before creating the first public registry release:
 
-1. Create a crates.io API token and save it as the
-   `CARGO_REGISTRY_TOKEN` GitHub Actions secret.
+1. After the one-time bootstrap publish, configure the crates.io trusted
+   publisher for `matrixlab-research/QMBED`, workflow `release.yml`, and revoke
+   the bootstrap token. The release job exchanges GitHub OIDC for a short-lived
+   token and stores no crates.io secret.
 2. Configure a PyPI trusted publisher for
    `matrixlab-research/QMBED`, workflow `release.yml`, environment `pypi`.
    The release job uses GitHub OIDC and does not store a PyPI password.

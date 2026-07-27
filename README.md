@@ -8,6 +8,8 @@
 [![Documentation](https://github.com/matrixlab-research/QMBED/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED/actions/workflows/docs.yml)
 [![Paper workflows](https://github.com/matrixlab-research/QMBED-benchmark/actions/workflows/rust-contract.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QMBED-benchmark/actions/workflows/rust-contract.yml)
 [![Release](https://img.shields.io/github/v/release/matrixlab-research/QMBED)](https://github.com/matrixlab-research/QMBED/releases)
+[![crates.io](https://img.shields.io/crates/v/qmbed)](https://crates.io/crates/qmbed)
+[![PyPI](https://img.shields.io/pypi/v/qmbed)](https://pypi.org/project/qmbed/)
 [![License](https://img.shields.io/github/license/matrixlab-research/QMBED)](https://github.com/matrixlab-research/QMBED/blob/main/LICENSE)
 
 QMBED is a Rust-native exact-diagonalization toolkit for quantum many-body
@@ -35,11 +37,11 @@ builders over `qmbed-capi`; they do not reimplement assembly or solvers.
 
 ## Rust quick start
 
-The current release can be used directly from Git:
+Install the current release from crates.io:
 
 ```toml
 [dependencies]
-qmbed = { git = "https://github.com/matrixlab-research/QMBED", tag = "v0.1.0" }
+qmbed = "0.2.0"
 ```
 
 ```rust
@@ -59,10 +61,11 @@ let low_energy = eigsh(&hamiltonian, EigshOptions::smallest_algebraic(4))?;
 # Ok::<(), qmbed::QmbedError>(())
 ```
 
-Python and Julia source-install instructions and equivalent examples are in
-the [getting-started guide](https://matrixlab-research.github.io/QMBED/getting-started/).
-The language packages are not yet published to PyPI or the Julia General
-registry.
+Python 3.10–3.14 wheels are available from PyPI with
+`python -m pip install "qmbed==0.2.0"`. Julia source-install instructions and
+equivalent examples are in the
+[getting-started guide](https://matrixlab-research.github.io/QMBED/getting-started/)
+while the initial General-registry submission is pending.
 
 Rust intentionally has no migration namespace or duplicate compatibility
 aliases. See the
