@@ -47,6 +47,20 @@ All forms implement or adapt to one rectangular `LinearOperator` interface.
 - diagonal ensembles and level statistics;
 - state/subspace tracking and Lindblad generators.
 
+## Automatic differentiation
+
+- exact runtime-generic JVP and one-shot VJP for `A(θ)x`;
+- real and complex parameter domains with stable named schemas;
+- gap-aware Hellmann--Feynman gradients for isolated ground-state energies;
+- residual, spectral-gap, action-count, and recomputation diagnostics;
+- optional `chainrules-core 0.2` JVP/VJP adapters that call the native rules.
+
+The current AD surface does not yet cover eigenvector gauges, degenerate
+eigenspaces, time evolution, thermal traces, Floquet maps, or response
+functions. Those workflows require their own operation-level rules; passing
+the implemented ground-state benchmarks is not evidence that these gaps are
+closed.
+
 ## Current execution boundary
 
 The built-in runtime is single-rank CPU. Independent vector batches can use

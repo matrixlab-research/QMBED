@@ -280,6 +280,31 @@ fn ground_state_energy_gradient_matches_central_finite_difference() {
     }
 }
 
+#[test]
+fn ground_state_energy_gradient_marks_an_unresolved_degeneracy() {
+    let diagonal = |values: [f64; 4]| {
+        let mut matrix = vec![Complex64::new(0.0, 0.0); 16];
+        for (index, value) in values.into_iter().enumerate() {
+            matrix[4 * index + index] = Complex64::new(value, 0.0);
+        }
+        Operator::from_dense(4, 4, matrix).unwrap()
+    };
+    let operator = QuantumOperator::new([
+        QuantumComponent::required("degenerate", diagonal([0.0, 0.0, 1.0, 2.0])),
+        QuantumComponent::required("identity", diagonal([1.0, 1.0, 1.0, 1.0])),
+    ])
+    .unwrap();
+    let parameters = ParameterValues::real(&operator, [1.0, 0.2]).unwrap();
+    let result = ground_state_energy_gradient(
+        &operator,
+        &parameters,
+        EigshOptions::smallest_algebraic(2),
+        &mut EigshWorkspace::new(),
+    )
+    .unwrap();
+    assert_eq!(result.diagnostics.status, GradientStatus::NonDifferentiable);
+}
+
 #[cfg(feature = "chainrules")]
 #[test]
 fn chainrules_adapter_observes_the_native_jvp_and_vjp() {
@@ -356,4 +381,55 @@ fn chainrules_adapter_observes_the_native_jvp_and_vjp() {
         native_cotangents.parameters.values(),
         1.0e-12,
     );
+}
+
+#[cfg(feature = "chainrules")]
+#[test]
+fn chainrules_ground_energy_rule_reuses_the_native_gradient() {
+    use chainrules_core::{JvpRule, Pullback, VjpRule};
+    use qmbed::ad::chainrules::GroundStateEnergyRule;
+
+    let diagonal = |values: [f64; 4]| {
+        let mut matrix = vec![Complex64::new(0.0, 0.0); 16];
+        for (index, value) in values.into_iter().enumerate() {
+            matrix[4 * index + index] = Complex64::new(value, 0.0);
+        }
+        Operator::from_dense(4, 4, matrix).unwrap()
+    };
+    let operator = QuantumOperator::new([
+        QuantumComponent::required("field", diagonal([-0.5, 0.3, 0.7, 1.1])),
+        QuantumComponent::required("base", diagonal([0.0, 1.0, 2.0, 3.0])),
+    ])
+    .unwrap();
+    let parameters = ParameterValues::real(&operator, [0.8, 1.0]).unwrap();
+    let direction = parameters
+        .direction([Complex64::new(0.4, 0.0), Complex64::new(-0.2, 0.0)])
+        .unwrap();
+    let rule = GroundStateEnergyRule {
+        operator: &operator,
+        options: EigshOptions::smallest_algebraic(2),
+    };
+    let native = ground_state_energy_gradient(
+        &operator,
+        &parameters,
+        EigshOptions::smallest_algebraic(2),
+        &mut EigshWorkspace::new(),
+    )
+    .unwrap();
+    let (energy, directional) = rule.jvp(&parameters, &direction).unwrap();
+    assert_abs_diff_eq!(energy, native.energy, epsilon = 1.0e-12);
+    let expected_directional: f64 = native
+        .gradient
+        .values()
+        .iter()
+        .zip(direction.values())
+        .map(|(gradient, direction)| (direction.conj() * gradient).re)
+        .sum();
+    assert_abs_diff_eq!(directional, expected_directional, epsilon = 1.0e-12);
+
+    let (_, pullback) = rule.vjp(&parameters).unwrap();
+    let scaled = pullback.apply(0.25).unwrap();
+    for (actual, expected) in scaled.values().iter().zip(native.gradient.values()) {
+        assert_complex_close(*actual, 0.25 * *expected, 1.0e-12);
+    }
 }

@@ -693,14 +693,17 @@ fn validate_operator_schema(
 /// `chainrules-core 0.2` adapters for the Rust-native operator rules.
 #[cfg(feature = "chainrules")]
 pub mod chainrules {
+    use std::sync::Arc;
+
     use chainrules_core::{Differentiable, JvpRule, Pullback, VjpRule};
 
     use super::{
-        ApplyCotangents, ApplyPullback, ParameterDirection, ParameterGradient, ParameterValues,
-        apply_jvp, apply_vjp,
+        ApplyCotangents, ApplyPullback, GradientStatus, ParameterDirection, ParameterGradient,
+        ParameterValues, apply_jvp, apply_vjp, ground_state_energy_gradient,
     };
     use crate::operator::{Operator, QuantumOperator};
     use crate::runtime::{Runtime, RuntimeAdjointLinearOperator, RuntimeLinearOperator};
+    use crate::solve::{EigshOptions, EigshWorkspace};
     use crate::{QmbedError, Result};
 
     impl Differentiable for ParameterValues {
@@ -830,6 +833,107 @@ pub mod chainrules {
             let (value, pullback) =
                 apply_vjp(self.runtime, self.operator, args.parameters, args.state)?;
             Ok((State(value), RulePullback { inner: pullback }))
+        }
+    }
+
+    /// ChainRules protocol object for an isolated ground-state energy.
+    pub struct GroundStateEnergyRule<'a> {
+        /// Real-parameter Hermitian operator family.
+        pub operator: &'a QuantumOperator,
+        /// Solver and convergence controls, including two or more eigenpairs.
+        pub options: EigshOptions,
+    }
+
+    /// One-shot scalar-energy pullback owning the computed gradient.
+    pub struct GroundStateEnergyPullback {
+        gradient: ParameterGradient,
+    }
+
+    impl Pullback<f64, ParameterGradient> for GroundStateEnergyPullback {
+        type Error = QmbedError;
+
+        fn apply(self, cotangent: f64) -> Result<ParameterGradient> {
+            if !cotangent.is_finite() {
+                return Err(QmbedError::InvalidOptions(
+                    "ground-state energy cotangent must be finite".into(),
+                ));
+            }
+            Ok(ParameterGradient::new(
+                Arc::clone(self.gradient.schema()),
+                self.gradient
+                    .values()
+                    .iter()
+                    .map(|value| cotangent * *value)
+                    .collect(),
+            ))
+        }
+    }
+
+    impl JvpRule<ParameterValues> for GroundStateEnergyRule<'_> {
+        type Output = f64;
+        type Error = QmbedError;
+
+        fn jvp(
+            &self,
+            parameters: &ParameterValues,
+            tangent: &ParameterDirection,
+        ) -> Result<(f64, f64)> {
+            if parameters.schema().as_ref() != tangent.schema().as_ref() {
+                return Err(QmbedError::InvalidOptions(
+                    "ground-state tangent uses a different parameter schema".into(),
+                ));
+            }
+            let result = ground_state_energy_gradient(
+                self.operator,
+                parameters,
+                self.options.clone(),
+                &mut EigshWorkspace::new(),
+            )?;
+            if result.diagnostics.status != GradientStatus::Reliable {
+                return Err(QmbedError::InvalidOptions(format!(
+                    "ground-state derivative is not reliable: {:?}",
+                    result.diagnostics
+                )));
+            }
+            let directional = result
+                .gradient
+                .values()
+                .iter()
+                .zip(tangent.values())
+                .map(|(gradient, direction)| (direction.conj() * gradient).re)
+                .sum();
+            Ok((result.energy, directional))
+        }
+    }
+
+    impl VjpRule<ParameterValues> for GroundStateEnergyRule<'_> {
+        type Output = f64;
+        type Error = QmbedError;
+        type Pullback<'a>
+            = GroundStateEnergyPullback
+        where
+            Self: 'a,
+            ParameterValues: 'a;
+
+        fn vjp<'a>(&'a self, parameters: &'a ParameterValues) -> Result<(f64, Self::Pullback<'a>)> {
+            let result = ground_state_energy_gradient(
+                self.operator,
+                parameters,
+                self.options.clone(),
+                &mut EigshWorkspace::new(),
+            )?;
+            if result.diagnostics.status != GradientStatus::Reliable {
+                return Err(QmbedError::InvalidOptions(format!(
+                    "ground-state derivative is not reliable: {:?}",
+                    result.diagnostics
+                )));
+            }
+            Ok((
+                result.energy,
+                GroundStateEnergyPullback {
+                    gradient: result.gradient,
+                },
+            ))
         }
     }
 }

@@ -11,7 +11,7 @@ execution.
 |---|---|---|
 | `A(θ)x` | exact JVP and one-shot VJP | dimensions, domains, action counts |
 | isolated ground-state energy | Hellmann--Feynman gradient | residual, spectral gap, solver iterations |
-| ChainRules.rs | optional `chainrules-core 0.2` adapter | runs the native JVP/VJP, no duplicate derivative |
+| ChainRules.rs | optional `chainrules-core 0.2` adapters for operator action and ground-state energy | runs the native rules, no duplicate derivative |
 
 Rules for eigenvectors, degenerate eigenspaces, time evolution, thermal traces,
 and response functions remain explicit capability gaps. In particular, QMBED
