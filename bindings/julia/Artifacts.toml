@@ -1,0 +1,47 @@
+[[qmbed_capi]]
+arch = "aarch64"
+git-tree-sha1 = "31716338e8604996a0996f4d400bb1e1b64aaa82"
+lazy = true
+os = "macos"
+
+    [[qmbed_capi.download]]
+    sha256 = "b5fccc02ee3ebbec09a183e27e2ad890a65478312fe760166134418555d5348b"
+    url = "https://github.com/matrixlab-research/QMBED/releases/download/artifacts-v0.2.0/qmbed-capi-v0.2.0-aarch64-apple-darwin.tar.gz"
+[[qmbed_capi]]
+arch = "aarch64"
+git-tree-sha1 = "10744a771d6eb898cdc879c7ad764c86b2dbed64"
+lazy = true
+libc = "glibc"
+os = "linux"
+
+    [[qmbed_capi.download]]
+    sha256 = "b9ed84861863962d6cb386a9213da3fcc212d6bea81827f210d681d5394a3dd4"
+    url = "https://github.com/matrixlab-research/QMBED/releases/download/artifacts-v0.2.0/qmbed-capi-v0.2.0-aarch64-unknown-linux-gnu.tar.gz"
+[[qmbed_capi]]
+arch = "x86_64"
+git-tree-sha1 = "d7757728af13326bd3d206a26245ed2838a7f9a8"
+lazy = true
+os = "macos"
+
+    [[qmbed_capi.download]]
+    sha256 = "8c3450d78b3b1bd76783fe54b1968fa4bda11504e4db77c0592d81a1d8cbc1a8"
+    url = "https://github.com/matrixlab-research/QMBED/releases/download/artifacts-v0.2.0/qmbed-capi-v0.2.0-x86_64-apple-darwin.tar.gz"
+[[qmbed_capi]]
+arch = "x86_64"
+git-tree-sha1 = "730b7b7fb7f279cdc9f505471b869e7c970e12ad"
+lazy = true
+os = "windows"
+
+    [[qmbed_capi.download]]
+    sha256 = "86d9901fd717e5cf7a489e403a4645f14e51653b23aacdd78d99692e875975f5"
+    url = "https://github.com/matrixlab-research/QMBED/releases/download/artifacts-v0.2.0/qmbed-capi-v0.2.0-x86_64-pc-windows-msvc.tar.gz"
+[[qmbed_capi]]
+arch = "x86_64"
+git-tree-sha1 = "a7ee30d75d28f708f9ec36704e8f6c1bc28e39c3"
+lazy = true
+libc = "glibc"
+os = "linux"
+
+    [[qmbed_capi.download]]
+    sha256 = "b5ea1a7fcc06a9709a612bf8bdd5652fe21e6e1d7877129d02e43a244023b96f"
+    url = "https://github.com/matrixlab-research/QMBED/releases/download/artifacts-v0.2.0/qmbed-capi-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
