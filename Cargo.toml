@@ -7,7 +7,7 @@ license = "MIT"
 description = "QMBED: Rust-native quantum many-body exact diagonalization"
 repository = "https://github.com/matrixlab-research/QMBED"
 readme = "README.md"
-keywords = ["quantum", "exact-diagonalization", "sparse", "physics"]
+keywords = ["quantum", "exact-diag", "sparse", "physics"]
 categories = ["science", "mathematics"]
 
 [dependencies]
